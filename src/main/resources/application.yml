@@ -1,0 +1,23 @@
+server:
+  port: 8082
+spring:
+  ai:
+    mcp:
+      client:
+        streamable-http:
+          connections:
+            robot-mcp:
+              url: http://127.0.0.1:8081/mcp
+              request-timeout: 30s  # 单次工具调用最长等30秒
+    openai:
+      api-key: sk-5f0c105555904aec8c86953f3a91a528
+      base-url: https://api.deepseek.com
+      chat:
+        options:
+          model: deepseek-v4-pro
+
+logging:
+  level:
+    org.springframework.ai.mcp: WARN
+    io.modelcontextprotocol: WARN
+    org.springframework.web: WARN
