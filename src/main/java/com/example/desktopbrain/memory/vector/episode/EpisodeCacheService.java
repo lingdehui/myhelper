@@ -36,6 +36,7 @@ public class EpisodeCacheService {
     private final WebClient qdrant;
     private final EmbeddingService embeddingService;
     private final ReflectService reflectService;
+    private final UnitLearner unitLearner;
     private final ObjectMapper objectMapper;
 
     @Value("${qdrant.episodes-collection:episodes}")
@@ -62,10 +63,12 @@ public class EpisodeCacheService {
 
     public EpisodeCacheService(WebClient qdrantWebClient,
                                 EmbeddingService embeddingService,
-                                ReflectService reflectService) {
+                                ReflectService reflectService,
+                                UnitLearner unitLearner) {
         this.qdrant = qdrantWebClient;
         this.embeddingService = embeddingService;
         this.reflectService = reflectService;
+        this.unitLearner = unitLearner;
         this.objectMapper = new ObjectMapper();
     }
 
@@ -227,13 +230,21 @@ public class EpisodeCacheService {
                 if (current.isEmpty()) return;
                 Episode ep = current.get();
 
+                // AI 提取变量签名 + 模板化 toolCalls（用户设计：args 具体值→$varName）
+                // 失败时 fallback 原样保留，不影响主流程
+                ReflectService.SignatureExtraction extraction =
+                        reflectService.extractSignature(ep.userInput(), toolCalls);
+                List<ToolCallLog> templatedToolCalls = extraction.templatedToolCalls();
+                Map<String, String> signature = extraction.signature();
+
                 int newSuccess = ep.successCount() + 1;
                 int failure = ep.failureCount();
                 double newStability = (double) newSuccess / (newSuccess + failure);
                 boolean canScript = newSuccess >= scriptSuccessThreshold && newStability > 0.9;
 
                 Map<String, Object> update = new LinkedHashMap<>();
-                update.put("toolCalls", toolCalls);
+                update.put("toolCalls", templatedToolCalls);
+                update.put("signature", signature);
                 update.put("aiResponse", truncate(aiResponse, 500));
                 update.put("successLesson", successLesson);
                 update.put("successCount", newSuccess);
@@ -246,7 +257,11 @@ public class EpisodeCacheService {
                 System.out.println("✅ DRAFT→ACTIVE（id=" + episodeId.substring(0, 8)
                         + "..., success=" + newSuccess + ", stability=" + String.format("%.2f", newStability)
                         + (canScript ? ", 🚀可脚本化" : "")
-                        + (successLesson != null ? ", 经验: " + truncate(successLesson, 40) : "") + "）");
+                        + (successLesson != null ? ", 经验: " + truncate(successLesson, 40) : "")
+                        + (!signature.isEmpty() ? ", 变量: " + signature.keySet() : "") + "）");
+
+                // 异步触发通用步骤提取（"越用越聪明"：积累 episode 后自动发现可复用 ATOMIC）
+                unitLearner.learnAsync();
             } catch (Exception e) {
                 System.err.println("❌ DRAFT→ACTIVE 失败: " + e.getMessage());
             }

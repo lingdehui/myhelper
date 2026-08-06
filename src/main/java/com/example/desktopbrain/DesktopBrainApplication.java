@@ -1,5 +1,6 @@
 package com.example.desktopbrain;
 
+import com.example.desktopbrain.autogen.GeneratedToolRegistry;
 import com.example.desktopbrain.dialog.DialogStateMachine;
 import com.example.desktopbrain.dialog.SpeechAssembler;
 import com.example.desktopbrain.memory.vector.episode.Episode;
@@ -33,6 +34,7 @@ import org.springframework.context.annotation.ComponentScan;
 import javax.sound.sampled.*;
 import java.io.ByteArrayOutputStream;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
@@ -58,11 +60,13 @@ public class DesktopBrainApplication {
     private final AtomicLong aiTurnId = new AtomicLong(0);
     private volatile long currentAiTurnId = -1;
     private volatile int silenceCount = 0;
+    private volatile boolean lastWasFuzzyListening = false;  // 上次是否在模糊监听
     private volatile ToolPlanner toolPlanner;
     private volatile PlanMatcher planMatcher;
     private volatile ReflectService reflectService;
     private volatile PlanExecutor planExecutor;
     private volatile VoiceprintService voiceprintService;
+    private volatile GeneratedToolRegistry generatedToolRegistry;
 
     // ========== 补充信息 ==========
     private volatile String lastUserInput = "";        // 最近一次用户输入
@@ -95,6 +99,7 @@ public class DesktopBrainApplication {
                                  PlanExecutor planExecutor,
                                  HaToolService haToolService,
                                  VoiceprintService voiceprintService,
+                                 GeneratedToolRegistry generatedToolRegistry,
                                  DialogStateMachine dialogStateMachine,
                                  SpeechAssembler speechAssembler) {
         return args -> {
@@ -115,6 +120,7 @@ public class DesktopBrainApplication {
             this.reflectService = reflectService;
             this.planExecutor = planExecutor;
             this.voiceprintService = voiceprintService;
+            this.generatedToolRegistry = generatedToolRegistry;
             this.dialogStateMachine = dialogStateMachine;
             this.speechAssembler = speechAssembler;
 
@@ -140,6 +146,14 @@ public class DesktopBrainApplication {
             System.out.println("💡 语音模式：说 '停' 中断，说 '退出' 结束");
             System.out.println("📊 技能数: " + skillConfig.getSkillNames().size() + " 个");
             System.out.println("🔧 工具数: MCP " + mcpCount + " + 本地 " + localCount + " = " + allToolCallbacks.length + " 个");
+
+            // 异步同步工具分类到 Qdrant（启动时 AI 扫描所有工具自动分组归类）
+            Thread categorySyncThread = new Thread(() -> {
+                int catCount = toolPlanner.syncCategories(allToolCallbacks);
+                if (catCount > 0) System.out.println("📁 工具分类已同步: " + catCount + " 类");
+            }, "category-sync");
+            categorySyncThread.setDaemon(true);
+            categorySyncThread.start();
 
             // 启动后台录音线程
             Thread recorderThread = new Thread(() -> startBackgroundRecording(localASR, vadService, ttsService), "bg-recorder");
@@ -370,9 +384,14 @@ public class DesktopBrainApplication {
                 // ========== IDLE 状态：模糊监听，只检测唤醒词 ==========
                 if (state == DialogStateMachine.State.IDLE) {
                     if (text == null) {
-                        System.out.print("\r💤 模糊监听中...");
+                        // 只在状态变化时打印一次
+                        if (!lastWasFuzzyListening) {
+                            System.out.print("\r💤 模糊监听中...");
+                            lastWasFuzzyListening = true;
+                        }
                         continue;
                     }
+                    lastWasFuzzyListening = false;  // 检测到语音，重置状态
                     if (text.contains(WAKE_WORD)) {
                         dialogStateMachine.transitionTo(DialogStateMachine.State.LISTENING);
                         mode = Mode.VOICE_DIALOG;
@@ -701,8 +720,13 @@ public class DesktopBrainApplication {
 
         // 2. 工具规划（三层缓存）
         ToolPlanner.PlanResult plan = toolPlanner.plan(userInput, tools);
-        plan.missingDescriptions().forEach(desc ->
-                System.out.println("⚠️ 缺少工具: " + desc + "（可补写本地 @Tool）"));
+        // 工具缺失 → 异步触发生成新工具（不阻塞当前请求，生成完提醒重启）
+        if (!plan.missingDescriptions().isEmpty()) {
+            for (String desc : plan.missingDescriptions()) {
+                System.out.println("⚠️ 缺少工具: " + desc + "（尝试让 AI 自动生成）");
+                triggerToolGeneration(desc, ttsService);
+            }
+        }
 
         // 3. 命中缓存 → 走缓存逻辑；未命中 → 新规划
         if (plan.fromCache() && plan.episode() != null) {
@@ -718,6 +742,32 @@ public class DesktopBrainApplication {
             currentAiTurnId = -1;
             silenceCount = 0;
         }
+    }
+
+    /**
+     * 异步触发生成新工具（用户设计："工具缺失→自己写工具→提醒重启"）。
+     *
+     * <p>不阻塞当前请求执行（当前请求用兜底工具继续跑），生成完成后 TTS 提醒用户重启生效。
+     * 生成流程：AI 生成源码 → 编译验证 → 持久化到 generated 目录（带编译错误重试）。</p>
+     */
+    private void triggerToolGeneration(String description, TtsService ttsService) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                System.out.println("🔧 开始自动生成工具: " + description);
+                GeneratedToolRegistry.GenerationOutcome outcome =
+                        generatedToolRegistry.generateAndPersist(description);
+                if (outcome.success()) {
+                    String msg = "检测到缺失能力，已自动生成新工具" + outcome.className() + "，重启后生效";
+                    System.out.println("✅ " + msg);
+                    ttsService.speakAsync(msg);
+                } else {
+                    System.out.println("⚠️ 工具自动生成失败: " + outcome.message());
+                    ttsService.speakAsync("工具自动生成失败，" + outcome.message());
+                }
+            } catch (Exception e) {
+                System.err.println("❌ 工具生成异步任务异常: " + e.getMessage());
+            }
+        });
     }
 
     // ========== 缓存命中处理 ==========

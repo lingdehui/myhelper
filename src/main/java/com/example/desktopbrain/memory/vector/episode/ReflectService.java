@@ -5,6 +5,7 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 反思服务（ExpeL/MUSE 的 Reflect 环节）。
@@ -45,6 +46,124 @@ public class ReflectService {
      * @param isPlanIssue 是否是计划逻辑问题（true=惩罚计划 / false=环境问题不惩罚）
      */
     public record FailureAnalysis(String lesson, boolean isPlanIssue) {}
+
+    /**
+     * 变量签名提取结果。
+     *
+     * @param signature          变量名 → 来源描述（"user_input" 表示从用户输入提取）
+     * @param templatedToolCalls args 已模板化（具体值→$varName）的 toolCalls
+     */
+    public record SignatureExtraction(
+            Map<String, String> signature,
+            List<ToolCallLog> templatedToolCalls
+    ) {
+        /** 提取失败的空结果（不模板化，原样保留 toolCalls） */
+        public static SignatureExtraction fallback(List<ToolCallLog> original) {
+            return new SignatureExtraction(Map.of(), original);
+        }
+    }
+
+    /**
+     * 提取变量签名 + 模板化 toolCalls 的 args。
+     *
+     * <p>用户核心设计："存 episode 时 AI 把 toolCalls 的 args 模板化（'张三'→'$contact'），
+     * 并提取 signature（变量名列表）。执行时 AI 提取变量值，PlanExecutor 做变量替换"。</p>
+     *
+     * <p>此方法让 AI 分析执行轨迹，找出 args 里的具体值（如联系人名、消息内容），
+     * 替换为 $变量名 占位符，并记录变量来源。这样下次"发微信给李四"命中 episode 时，
+     * PlanMatcher 提取 contact=李四，PlanExecutor 把 $contact 替换成李四。</p>
+     *
+     * @param userInput 用户原话
+     * @param toolCalls 执行轨迹（args 是具体值）
+     * @return 提取结果（signature + 模板化后的 toolCalls）；AI 失败时 fallback 原样返回
+     */
+    @SuppressWarnings("unchecked")
+    public SignatureExtraction extractSignature(String userInput, List<ToolCallLog> toolCalls) {
+        if (toolCalls == null || toolCalls.isEmpty()) {
+            return SignatureExtraction.fallback(toolCalls);
+        }
+
+        StringBuilder stepsDesc = new StringBuilder();
+        for (int i = 0; i < toolCalls.size(); i++) {
+            ToolCallLog step = toolCalls.get(i);
+            stepsDesc.append(i).append(". ").append(step.toolName())
+                    .append(" args=").append(truncate(step.args(), 200)).append("\n");
+        }
+
+        String prompt = """
+                分析以下工具调用轨迹，把 args 里的具体值替换为变量占位符，并提取变量签名。
+
+                用户原话: %s
+                工具调用轨迹:
+                %s
+
+                规则:
+                - 把 args 里来自用户输入的具体值（如联系人名、消息内容、文件路径）替换为 $变量名
+                - 变量名用小驼峰英文（如 contact, message, filePath）
+                - 不来自用户输入的固定值（如固定的快捷键、路径分隔符）不要替换
+                - signature 记录每个变量的来源描述
+
+                返回严格 JSON（不要 markdown 标记）:
+                {
+                  "variables": [{"name":"contact","source":"用户输入的联系人名"}],
+                  "steps": [{"index":0,"args":"{\"name\":\"$contact\"}"}]
+                }
+                """.formatted(userInput, stepsDesc);
+
+        try {
+            String response = chatClient.prompt().user(prompt).call().content();
+            return parseSignatureExtraction(response, toolCalls);
+        } catch (Exception e) {
+            System.err.println("⚠️ 签名提取失败，原样保留 toolCalls: " + e.getMessage());
+            return SignatureExtraction.fallback(toolCalls);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private SignatureExtraction parseSignatureExtraction(String response, List<ToolCallLog> original) {
+        if (response == null || response.isBlank()) {
+            return SignatureExtraction.fallback(original);
+        }
+        String json = response.trim();
+        if (json.startsWith("```")) {
+            json = json.replaceAll("^```\\w*\\n?", "").replaceAll("\\n?```$", "").trim();
+        }
+        try {
+            Map<String, Object> parsed = objectMapper.readValue(json, Map.class);
+
+            // 解析 signature
+            Map<String, String> signature = new java.util.LinkedHashMap<>();
+            List<Map<String, Object>> vars = (List<Map<String, Object>>) parsed.getOrDefault("variables", List.of());
+            for (Map<String, Object> v : vars) {
+                String name = String.valueOf(v.get("name"));
+                String source = String.valueOf(v.getOrDefault("source", "user_input"));
+                signature.put(name, source);
+            }
+
+            // 解析模板化后的 args，重建 toolCalls
+            Map<Integer, String> templatedArgs = new java.util.HashMap<>();
+            List<Map<String, Object>> steps = (List<Map<String, Object>>) parsed.getOrDefault("steps", List.of());
+            for (Map<String, Object> s : steps) {
+                int index = ((Number) s.get("index")).intValue();
+                String args = String.valueOf(s.get("args"));
+                templatedArgs.put(index, args);
+            }
+
+            List<ToolCallLog> templated = new java.util.ArrayList<>();
+            for (int i = 0; i < original.size(); i++) {
+                ToolCallLog orig = original.get(i);
+                String newArgs = templatedArgs.getOrDefault(i, orig.args());
+                templated.add(new ToolCallLog(orig.toolName(), newArgs,
+                        orig.result(), orig.success(), orig.durationMs()));
+            }
+
+            System.out.println("✅ 提取变量签名: " + signature.keySet());
+            return new SignatureExtraction(signature, templated);
+        } catch (Exception e) {
+            System.err.println("⚠️ 签名 JSON 解析失败: " + e.getMessage());
+            return SignatureExtraction.fallback(original);
+        }
+    }
 
     /**
      * 成功反思：AI 总结关键成功经验。

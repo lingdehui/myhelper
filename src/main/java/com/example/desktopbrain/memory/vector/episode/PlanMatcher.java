@@ -56,6 +56,8 @@ public class PlanMatcher {
     /**
      * AI 判断 episode 是否适用于当前输入，提取变量值。
      *
+     * <p>ATOMIC 通用步骤：直接适用（无需变量匹配，步骤即开即用）。</p>
+     *
      * @param userInput 用户原话
      * @param episode   命中的候选 episode
      * @return 匹配结果；AI 调用失败时返回 notApplicable（降级到新规划）
@@ -63,6 +65,13 @@ public class PlanMatcher {
     public MatchResult match(String userInput, Episode episode) {
         if (episode.toolCalls() == null || episode.toolCalls().isEmpty()) {
             return MatchResult.notApplicable("计划没有可执行步骤");
+        }
+
+        // ATOMIC 通用步骤：直接适用，不需要 AI 判断变量
+        if (episode.unitType() == Episode.UnitType.ATOMIC && episode.isGeneric()) {
+            String reason = "ATOMIC 通用步骤: " + episode.userInput();
+            System.out.println("🧩 ATOMIC 通用步骤直接适用: " + reason);
+            return MatchResult.applicable(Map.of(), reason);
         }
 
         // 构造步骤描述

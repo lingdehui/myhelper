@@ -1,5 +1,7 @@
 package com.example.desktopbrain.service;
 
+import com.example.desktopbrain.memory.vector.category.ToolCategoryService;
+import com.example.desktopbrain.memory.vector.category.ToolCategoryService.CategoryMatch;
 import com.example.desktopbrain.memory.vector.episode.Episode;
 import com.example.desktopbrain.memory.vector.episode.EpisodeCacheService;
 import com.example.desktopbrain.memory.vector.episode.ToolCallLog;
@@ -51,11 +53,20 @@ public class ToolPlanner {
 
     private final ChatClient chatClient;
     private final EpisodeCacheService episodeCacheService;
+    private final ToolCategoryService categoryService;
     private static final int FAILURE_THRESHOLD = 3;
 
     /** 脚本化阈值：与 EpisodeCacheService 保持一致，successCount≥此值 且 stability>0.9 时 canScript=true */
     @Value("${qdrant.episode.script-success-threshold:5}")
     private int scriptSuccessThreshold;
+
+    /** 工具分类搜索 Top-K */
+    @Value("${qdrant.category.top-k:5}")
+    private int categoryTopK;
+
+    /** 工具分类最低相似度阈值 */
+    @Value("${qdrant.category.min-score:0.3}")
+    private double categoryMinScore;
 
     /** 缓存条目：方案 + episodeId + episode引用 + 连续失败次数 */
     private static class CacheEntry {
@@ -76,33 +87,20 @@ public class ToolPlanner {
 
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
 
-    private static final List<Category> CATEGORIES = List.of(
-        new Category("1", "窗口管理", "聚焦/列表/最小化/最大化/恢复/窗口位置",
-            new String[]{"focusWindow", "listWindows", "getActiveWindowTitle",
-                "minimizeWindow", "maximizeWindow", "restoreWindow", "getWindowBounds"}),
-        new Category("2", "鼠标操作", "移动/左击/双击/右击/中击/滚动/拖拽",
-            new String[]{"mouseMove", "getMousePosition", "leftClick", "doubleClick",
-                "rightClick", "middleClick", "mouseScroll", "mouseDrag", "scrollUntilPixelColor"}),
-        new Category("3", "键盘输入", "打字/按键/组合键/粘贴输入",
-            new String[]{"typeText", "typeTextViaClipboard", "pressKey", "pressKeyCombination"}),
-        new Category("4", "屏幕OCR", "全屏/区域/窗口/显示器 文字识别+点击",
-            new String[]{"ocrScreen", "ocrRegion", "ocrMonitor", "ocrWindow",
-                "findTextOnScreen", "clickTextOnScreen"}),
-        new Category("5", "UI元素", "查找控件/列出交互元素/树结构/读取文本/展开折叠",
-            new String[]{"findElement", "isElementPresent", "waitForElement", "listInteractiveElements",
-                "dumpWindowTree", "getFocusedElement", "getElementAtPoint",
-                "getTextContent", "expandElement", "collapseElement"}),
-        new Category("6", "像素监控", "像素颜色/等待变化/等待稳定/显示器列表",
-            new String[]{"findPixelColor", "waitForPixelColor", "findPixelInRegion",
-                "waitForScreenChange", "waitForScreenStable", "listMonitors"}),
-        new Category("7", "剪贴板", "读取/设置剪贴板文本",
-            new String[]{"getClipboard", "setClipboard"}),
-        new Category("8", "联系人匹配", "模糊匹配微信好友名字（拼音/编辑距离）",
-            new String[]{"findFriend"}),
-        new Category("9", "技能查询", "列出本地技能列表",
-            new String[]{"listLocalSkills"}),
-        new Category("10", "通用", "暂停/延时",
-            new String[]{"sleep"})
+    /** 兜底分类：Qdrant 不可用时的最低保障（覆盖最常用的基础操作） */
+    private static final List<FallbackCategory> FALLBACK_CATEGORIES = List.of(
+        new FallbackCategory("1", "窗口与鼠标", "窗口管理+鼠标操作",
+            new String[]{"focusWindow","listWindows","getActiveWindowTitle","getMousePosition",
+                "mouseMove","leftClick","doubleClick","rightClick","middleClick","mouseScroll"}),
+        new FallbackCategory("2", "键盘与输入", "打字/按键/粘贴",
+            new String[]{"typeText","typeTextViaClipboard","pressKey","pressKeyCombination"}),
+        new FallbackCategory("3", "屏幕识别", "OCR文字识别+像素监控",
+            new String[]{"ocrScreen","ocrRegion","findTextOnScreen","clickTextOnScreen",
+                "findPixelColor","waitForPixelColor"}),
+        new FallbackCategory("4", "UI与剪贴板", "查找控件+剪贴板",
+            new String[]{"findElement","getTextContent","getClipboard","setClipboard"}),
+        new FallbackCategory("5", "联系人", "匹配微信好友+技能查询",
+            new String[]{"findFriend","listLocalSkills"})
     );
 
     private static final List<String> FALLBACK_TOOLS = List.of(
@@ -112,11 +110,14 @@ public class ToolPlanner {
             "mouseMove", "mouseScroll", "clickTextOnScreen", "findTextOnScreen"
     );
 
-    public ToolPlanner(ChatClient.Builder chatClientBuilder, EpisodeCacheService episodeCacheService) {
+    public ToolPlanner(ChatClient.Builder chatClientBuilder,
+                        EpisodeCacheService episodeCacheService,
+                        ToolCategoryService categoryService) {
         this.chatClient = chatClientBuilder
                 .defaultSystem("你是工具规划器，根据用户请求选择所需的能力分类，只返回编号。")
                 .build();
         this.episodeCacheService = episodeCacheService;
+        this.categoryService = categoryService;
     }
 
     /**
@@ -142,7 +143,7 @@ public class ToolPlanner {
         }
     }
 
-    private record Category(String id, String name, String desc, String[] tools) {}
+    private record FallbackCategory(String id, String name, String desc, String[] tools) {}
 
     /**
      * 正常规划：三层缓存查询（内存 → Episode → AI 规划）。
@@ -269,7 +270,7 @@ public class ToolPlanner {
         return doPlan(userInput, allTools, failureReason);
     }
 
-    // ========== DRAFT 生命周期委托（决策4：立即创建draft，成功转active，失败也保存步骤） ==========
+    // ========== DRAFT 生命周期委托 ==========
 
     /**
      * 执行前创建 DRAFT episode（委托 EpisodeCacheService.createDraft）。
@@ -324,18 +325,122 @@ public class ToolPlanner {
                 + (successLesson != null ? ", 经验: " + truncate(successLesson, 40) : "") + "）");
     }
 
-    /** 内部：调 AI 规划 */
+    /**
+     * 同步工具分类（启动时 / 工具变化时调用）。
+     *
+     * <p>委托 ToolCategoryService.syncCategories()，所有工具（MCP+本地+生成的）传入 AI 分组归类。
+     * 应在所有 ToolCallback 就绪后调用一次。</p>
+     *
+     * @param allTools 所有可用工具
+     * @return 分类数量
+     */
+    public int syncCategories(ToolCallback[] allTools) {
+        return categoryService.syncCategories(allTools);
+    }
+
+    /** 内部：调 AI 规划（优先 Qdrant 动态分类，降级兜底） */
     private PlanResult doPlan(String userInput, ToolCallback[] allTools, String failureReason) {
-        StringBuilder categoryList = new StringBuilder();
-        for (Category cat : CATEGORIES) {
-            categoryList.append(cat.id).append(". ")
-                    .append(cat.name).append(": ")
-                    .append(cat.desc).append("\n");
+        // === 优先：Qdrant 向量搜索动态分类 ===
+        List<CategoryMatch> dynamicCats = categoryService.searchCategories(
+                userInput, categoryTopK, categoryMinScore);
+
+        if (!dynamicCats.isEmpty()) {
+            return planWithCategories(dynamicCats, userInput, allTools, failureReason);
         }
 
-        String prompt;
+        // === 降级：兜底硬编码分类（Qdrant 不可用或无匹配 时保证基本可用） ===
+        System.out.println("⚠️ Qdrant 分类无匹配，使用兜底分类");
+        return planWithFallback(userInput, allTools, failureReason);
+    }
+
+    /**
+     * 用 Qdrant 动态分类执行规划。
+     */
+    private PlanResult planWithCategories(List<CategoryMatch> categories, String userInput,
+                                           ToolCallback[] allTools, String failureReason) {
+        // 构造分类列表供 AI 选择编号
+        StringBuilder catList = new StringBuilder();
+        for (int i = 0; i < categories.size(); i++) {
+            CategoryMatch cm = categories.get(i);
+            catList.append(i + 1).append(". ")
+                    .append(cm.name()).append("（").append(cm.tools().size()).append("个工具）: ")
+                    .append(cm.description()).append("\n");
+        }
+
+        // 收集去重后的所有工具名
+        Set<String> allCatTools = new LinkedHashSet<>();
+        for (CategoryMatch cm : categories) {
+            allCatTools.addAll(cm.tools());
+        }
+
+        String prompt = buildPlanPrompt(catList.toString(), userInput, failureReason);
+        String planResponse;
+        try {
+            planResponse = chatClient.prompt().user(prompt).call().content();
+        } catch (Exception e) {
+            System.out.println("⚠️ 规划失败，使用兜底工具: " + e.getMessage());
+            return PlanResult.ofAIPlan(new ArrayList<>(FALLBACK_TOOLS), List.of());
+        }
+
+        return parsePlanResponse(planResponse, categories, allCatTools, allTools);
+    }
+
+    /**
+     * 用兜底硬编码分类降级规划（Qdrant 不可用时）。
+     */
+    private PlanResult planWithFallback(String userInput, ToolCallback[] allTools,
+                                         String failureReason) {
+        StringBuilder catList = new StringBuilder();
+        for (FallbackCategory cat : FALLBACK_CATEGORIES) {
+            catList.append(cat.id).append(". ")
+                    .append(cat.name).append(": ").append(cat.desc).append("\n");
+        }
+
+        Set<String> allCatTools = new LinkedHashSet<>();
+        for (FallbackCategory cat : FALLBACK_CATEGORIES) {
+            allCatTools.addAll(Arrays.asList(cat.tools));
+        }
+
+        String prompt = buildPlanPrompt(catList.toString(), userInput, failureReason);
+        String planResponse;
+        try {
+            planResponse = chatClient.prompt().user(prompt).call().content();
+        } catch (Exception e) {
+            System.out.println("⚠️ 规划失败，使用兜底工具: " + e.getMessage());
+            return PlanResult.ofAIPlan(new ArrayList<>(FALLBACK_TOOLS), List.of());
+        }
+
+        if (planResponse == null) {
+            return PlanResult.ofAIPlan(new ArrayList<>(FALLBACK_TOOLS), List.of());
+        }
+
+        Set<String> neededTools = new LinkedHashSet<>();
+        List<String> missing = new ArrayList<>();
+
+        for (String part : planResponse.split("[,，\n]")) {
+            String trimmed = part.trim().replaceAll("^\\d+[.\\)]\\s*", "");
+            if (trimmed.toUpperCase().startsWith("MISSING:")) {
+                missing.add(trimmed.substring("MISSING:".length()).trim());
+                continue;
+            }
+            for (FallbackCategory cat : FALLBACK_CATEGORIES) {
+                if (cat.id.equals(trimmed)) {
+                    neededTools.addAll(Arrays.asList(cat.tools));
+                    break;
+                }
+            }
+        }
+
+        if (neededTools.isEmpty()) neededTools.addAll(FALLBACK_TOOLS);
+        Set<String> existing = collectExisting(allTools);
+        neededTools.retainAll(existing);
+        return PlanResult.ofAIPlan(new ArrayList<>(neededTools), missing);
+    }
+
+    /** 构造规划 prompt */
+    private static String buildPlanPrompt(String categoryList, String userInput, String failureReason) {
         if (failureReason != null) {
-            prompt = """
+            return """
                     上次方案执行失败，请根据失败原因重新选择能力分类。
 
                     可用分类:
@@ -348,62 +453,62 @@ public class ToolPlanner {
                     - 避开导致失败的工具，换用其他分类
                     - 如果某能力不存在，用 MISSING: 描述 说明
                     """.formatted(categoryList, userInput, failureReason);
-        } else {
-            prompt = """
-                    根据用户请求，选择需要的能力分类。
-
-                    可用分类:
-                    %s
-                    用户请求: %s
-
-                    规则:
-                    - 返回需要的分类编号，逗号分隔，不要多余内容
-                    - 只选确实需要的，不要全选
-                    - 如果某项能力在分类中完全不存在，用 MISSING: 描述 说明
-                    - 工具可能未安装（如OCR）仍可选，执行时再处理
-                    - 示例: 1,3,8
-                    - 示例: 1,3,8, MISSING: 文件压缩工具
-                    """.formatted(categoryList, userInput);
         }
+        return """
+                根据用户请求，选择需要的能力分类。
 
-        String planResponse;
-        try {
-            planResponse = chatClient.prompt().user(prompt).call().content();
-        } catch (Exception e) {
-            System.out.println("⚠️ 规划失败，使用兜底工具: " + e.getMessage());
+                可用分类:
+                %s
+                用户请求: %s
+
+                规则:
+                - 返回需要的分类编号，逗号分隔，不要多余内容
+                - 只选确实需要的，不要全选
+                - 如果某项能力在分类中完全不存在，用 MISSING: 描述 说明
+                - 示例: 1,3,8
+                - 示例: 1,3,8, MISSING: 文件压缩工具
+                """.formatted(categoryList, userInput);
+    }
+
+    /** 解析 AI 分类编号响应为工具列表 */
+    private PlanResult parsePlanResponse(String planResponse, List<CategoryMatch> categories,
+                                          Set<String> allCatTools, ToolCallback[] allTools) {
+        if (planResponse == null) {
             return PlanResult.ofAIPlan(new ArrayList<>(FALLBACK_TOOLS), List.of());
         }
 
         Set<String> neededTools = new LinkedHashSet<>();
         List<String> missing = new ArrayList<>();
 
-        if (planResponse != null) {
-            for (String part : planResponse.split("[,，\n]")) {
-                String trimmed = part.trim().replaceAll("^\\d+[.\\)]\\s*", "");
-                if (trimmed.toUpperCase().startsWith("MISSING:")) {
-                    missing.add(trimmed.substring("MISSING:".length()).trim());
-                    continue;
+        for (String part : planResponse.split("[,，\n]")) {
+            String trimmed = part.trim().replaceAll("^\\d+[.\\)]\\s*", "");
+            if (trimmed.toUpperCase().startsWith("MISSING:")) {
+                missing.add(trimmed.substring("MISSING:".length()).trim());
+                continue;
+            }
+            // 匹配编号（1-based index）
+            try {
+                int idx = Integer.parseInt(trimmed) - 1;
+                if (idx >= 0 && idx < categories.size()) {
+                    neededTools.addAll(categories.get(idx).tools());
                 }
-                for (Category cat : CATEGORIES) {
-                    if (cat.id.equals(trimmed)) {
-                        neededTools.addAll(Arrays.asList(cat.tools));
-                        break;
-                    }
-                }
+            } catch (NumberFormatException ignored) {
+                // 非编号文本，忽略
             }
         }
 
-        if (neededTools.isEmpty()) {
-            neededTools.addAll(FALLBACK_TOOLS);
-        }
+        if (neededTools.isEmpty()) neededTools.addAll(FALLBACK_TOOLS);
 
-        Set<String> existing = new HashSet<>();
-        for (ToolCallback tc : allTools) {
-            existing.add(tc.getToolDefinition().name());
-        }
+        Set<String> existing = collectExisting(allTools);
         neededTools.retainAll(existing);
 
         return PlanResult.ofAIPlan(new ArrayList<>(neededTools), missing);
+    }
+
+    private static Set<String> collectExisting(ToolCallback[] allTools) {
+        Set<String> existing = new HashSet<>();
+        for (ToolCallback tc : allTools) existing.add(tc.getToolDefinition().name());
+        return existing;
     }
 
     private static String normalizeKey(String input) {

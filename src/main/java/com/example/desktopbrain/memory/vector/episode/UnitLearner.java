@@ -1,0 +1,358 @@
+package com.example.desktopbrain.memory.vector.episode;
+
+import com.example.desktopbrain.memory.vector.EmbeddingService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * 通用步骤提取器（"越用越聪明"的关键——自动发现可复用的 ATOMIC 子步骤）。
+ *
+ * <h3>用户核心设计</h3>
+ * <blockquote>
+ * "如果说某一步很通用就可以提出来...步骤的概念其实就是小计划...取最稳定的为大"
+ * </blockquote>
+ *
+ * <p>当系统积累足够多的 COMPOSITE episode（完整执行计划）后，UnitLearner 自动扫描
+ * 发现其中重复出现的公共工具调用子序列，将其提取为 ATOMIC 通用步骤。被≥3个
+ * COMPOSITE 引用的子序列自动标记 isGeneric=true，成为可被 PlanMatcher 检索复用的
+ * 独立构建块。</p>
+ *
+ * <h3>提取算法（异步后台执行）</h3>
+ * <ol>
+ *   <li>从 Qdrant 获取所有 ACTIVE COMPOSITE episode</li>
+ *   <li>对每组 episode 找最长公共工具名子序列（LCS，长度≥2）</li>
+ *   <li>子序列出现在≥3个不同 episode → 提取为 ATOMIC</li>
+ *   <li>去重：已有相同工具序列的 ATOMIC 则跳过</li>
+ *   <li>新 ATOMIC：embed(步骤描述) → 写入 Qdrant episodes collection</li>
+ * </ol>
+ *
+ * <h3>触发时机</h3>
+ * <ul>
+ *   <li>每次 episode activateDraft 成功后异步触发（渐进式积累）</li>
+ *   <li>避免启动时全量扫描（首次数据少，浪费资源）</li>
+ * </ul>
+ */
+@Service
+public class UnitLearner {
+
+    private final WebClient qdrant;
+    private final EmbeddingService embeddingService;
+    private final ObjectMapper objectMapper;
+
+    @Value("${qdrant.episodes-collection:episodes}")
+    private String collectionName;
+
+    /** 提取阈值：至少被 N 个不同 COMPOSITE 引用才标记为通用 */
+    @Value("${qdrant.episode.generic-threshold:3}")
+    private int genericThreshold;
+
+    /** 最小子序列长度（少于2步不值得提取） */
+    private static final int MIN_SUBSEQ_LEN = 2;
+
+    public UnitLearner(WebClient qdrantWebClient, EmbeddingService embeddingService) {
+        this.qdrant = qdrantWebClient;
+        this.embeddingService = embeddingService;
+        this.objectMapper = new ObjectMapper();
+    }
+
+    /**
+     * 异步触发通用步骤提取（DRAFT→ACTIVE 成功后调用）。
+     *
+     * <p>异步执行，失败不抛异常，不影响主流程。</p>
+     */
+    public void learnAsync() {
+        CompletableFuture.runAsync(this::extractCommonSteps);
+    }
+
+    /**
+     * 核心提取逻辑：扫描所有 ACTIVE COMPOSITE → 找公共子序列 → 创建 ATOMIC。
+     */
+    void extractCommonSteps() {
+        try {
+            // 1. 获取所有 ACTIVE COMPOSITE episode
+            List<Episode> composites = fetchActiveComposites();
+            if (composites.size() < genericThreshold) return;
+
+            // 2. 收集已有的 ATOMIC 工具序列（用于去重）
+            Set<String> existingAtomics = fetchExistingAtomicSequences();
+
+            // 3. 构建工具名子序列频率统计
+            //    key = toolName1|toolName2|... → set of episodeIds
+            Map<String, Set<String>> subseqFreq = new LinkedHashMap<>();
+            for (Episode ep : composites) {
+                List<ToolCallLog> tc = ep.toolCalls();
+                if (tc == null || tc.size() < MIN_SUBSEQ_LEN) continue;
+                List<String> names = tc.stream().map(ToolCallLog::toolName).toList();
+
+                // 枚举所有长度≥MIN_SUBSEQ_LEN 的连续子序列
+                for (int len = MIN_SUBSEQ_LEN; len <= names.size(); len++) {
+                    for (int start = 0; start + len <= names.size(); start++) {
+                        String key = String.join("|", names.subList(start, start + len));
+                        subseqFreq.computeIfAbsent(key, k -> new LinkedHashSet<>())
+                                .add(ep.id());
+                    }
+                }
+            }
+
+            // 4. 过滤：出现≥threshold 次 且 不是已有 ATOMIC
+            int created = 0;
+            for (Map.Entry<String, Set<String>> entry : subseqFreq.entrySet()) {
+                if (entry.getValue().size() < genericThreshold) continue;
+                if (existingAtomics.contains(entry.getKey())) continue;
+
+                // 取第一个 episode 的对应子序列的 toolCalls 作为模板
+                Episode refComposites = composites.stream()
+                        .filter(e -> entry.getValue().contains(e.id()))
+                        .findFirst().orElse(null);
+                if (refComposites == null) continue;
+
+                List<ToolCallLog> subCalls = extractSubCalls(refComposites.toolCalls(), entry.getKey());
+                if (subCalls.isEmpty()) continue;
+
+                // 创建 ATOMIC episode
+                createAtomicEpisode(entry.getKey(), subCalls,
+                        new ArrayList<>(entry.getValue()));
+                created++;
+            }
+
+            if (created > 0) {
+                System.out.println("🧩 UnitLearner 提取 " + created + " 个通用 ATOMIC 步骤");
+            }
+
+        } catch (Exception e) {
+            System.err.println("⚠️ UnitLearner 提取失败: " + e.getMessage());
+        }
+    }
+
+    // ========== Qdrant 查询 ==========
+
+    @SuppressWarnings("unchecked")
+    private List<Episode> fetchActiveComposites() {
+        List<Episode> result = new ArrayList<>();
+        try {
+            String offset = null;
+            while (true) {
+                Map<String, Object> scrollBody = new LinkedHashMap<>();
+                scrollBody.put("limit", 100);
+                scrollBody.put("with_payload", true);
+                scrollBody.put("with_vector", false);
+                Map<String, Object> filter = Map.of("must", List.of(
+                        Map.of("key", "status", "match", Map.of("value", "ACTIVE")),
+                        Map.of("key", "unitType", "match", Map.of("value", "COMPOSITE")),
+                        Map.of("key", "archived", "equals", false)
+                ));
+                scrollBody.put("filter", filter);
+                if (offset != null) scrollBody.put("offset", offset);
+
+                Map<String, Object> response = qdrant.post()
+                        .uri("/collections/" + collectionName + "/points/scroll")
+                        .header("Content-Type", "application/json")
+                        .bodyValue(scrollBody)
+                        .retrieve()
+                        .bodyToMono(Map.class)
+                        .block();
+
+                if (response == null) break;
+
+                Map<String, Object> r = (Map<String, Object>) response.get("result");
+                if (r == null) break;
+
+                List<Map<String, Object>> points =
+                        (List<Map<String, Object>>) r.getOrDefault("points", List.of());
+                if (points.isEmpty()) break;
+
+                for (Map<String, Object> point : points) {
+                    Episode ep = deserializeEpisode(point);
+                    if (ep != null && ep.toolCalls() != null && !ep.toolCalls().isEmpty()) {
+                        result.add(ep);
+                    }
+                }
+
+                offset = (String) r.get("next_page_offset");
+                if (offset == null || offset.isEmpty()) break;
+            }
+        } catch (Exception e) {
+            System.err.println("⚠️ UnitLearner 查询 ACTIVE episode 失败: " + e.getMessage());
+        }
+        return result;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Set<String> fetchExistingAtomicSequences() {
+        Set<String> sequences = new HashSet<>();
+        try {
+            List<Episode> atomics = fetchAtomics();
+            for (Episode ep : atomics) {
+                if (ep.toolCalls() != null) {
+                    List<String> names = ep.toolCalls().stream()
+                            .map(ToolCallLog::toolName).toList();
+                    sequences.add(String.join("|", names));
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("⚠️ UnitLearner 查询已有 ATOMIC 失败: " + e.getMessage());
+        }
+        return sequences;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Episode> fetchAtomics() {
+        List<Episode> result = new ArrayList<>();
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("limit", 200);
+            body.put("with_payload", true);
+            body.put("with_vector", false);
+            Map<String, Object> filter = Map.of("must", List.of(
+                    Map.of("key", "unitType", "match", Map.of("value", "ATOMIC")),
+                    Map.of("key", "archived", "equals", false)
+            ));
+            body.put("filter", filter);
+
+            Map<String, Object> response = qdrant.post()
+                    .uri("/collections/" + collectionName + "/points/scroll")
+                    .header("Content-Type", "application/json")
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response != null && response.containsKey("result")) {
+                Map<String, Object> r = (Map<String, Object>) response.get("result");
+                List<Map<String, Object>> points =
+                        (List<Map<String, Object>>) r.getOrDefault("points", List.of());
+                for (Map<String, Object> point : points) {
+                    Episode ep = deserializeEpisode(point);
+                    if (ep != null) result.add(ep);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("⚠️ UnitLearner 查询 ATOMIC 失败: " + e.getMessage());
+        }
+        return result;
+    }
+
+    // ========== ATOMIC 创建 ==========
+
+    /**
+     * 创建一个 ATOMIC 通用步骤 episode。
+     *
+     * @param toolKey   工具名序列（"toolA|toolB|..."），用于生成描述
+     * @param subCalls  对应的 toolCalls 子序列
+     * @param parentIds 引用此步骤的 COMPOSITE episode id 列表
+     */
+    private void createAtomicEpisode(String toolKey, List<ToolCallLog> subCalls,
+                                      List<String> parentIds) {
+        try {
+            String episodeId = UUID.randomUUID().toString();
+            long timestamp = System.currentTimeMillis();
+
+            // 生成描述
+            List<String> toolNames = List.of(toolKey.split("\\|"));
+            String description = String.join("→", toolNames);
+
+            // embedding：用工具名序列作为文本
+            List<Float> vector = embeddingService.embed(description);
+
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("id", episodeId);
+            payload.put("userInput", description); // userInput 存描述
+            payload.put("selectedToolNames", toolNames);
+            payload.put("missingDescriptions", List.of());
+            payload.put("toolCalls", subCalls);
+            payload.put("aiResponse", null);
+            payload.put("successLesson", "通用步骤: " + description);
+            payload.put("failureLesson", null);
+            payload.put("signature", Map.of());
+            payload.put("unitType", Episode.UnitType.ATOMIC.name());
+            payload.put("isGeneric", true);
+            payload.put("parentIds", parentIds);
+            payload.put("successCount", 0);
+            payload.put("failureCount", 0);
+            payload.put("archived", false);
+            payload.put("timestamp", timestamp);
+            payload.put("stability", 0.5); // ATOMIC 初始稳定度中等（尚未单独验证）
+            payload.put("status", Episode.EpisodeStatus.ACTIVE.name());
+            payload.put("canScript", false); // ATOMIC 不单独脚本化
+            payload.put("failedStepIndex", -1);
+
+            upsertPoint(episodeId, vector, payload);
+            System.out.println("🧩 新增 ATOMIC: " + description
+                    + " (被 " + parentIds.size() + " 个计划引用)");
+        } catch (Exception e) {
+            System.err.println("⚠️ ATOMIC 创建失败: " + e.getMessage());
+        }
+    }
+
+    private void upsertPoint(String id, List<Float> vector, Map<String, Object> payload) {
+        try {
+            Map<String, Object> point = new LinkedHashMap<>();
+            point.put("id", id);
+            point.put("vector", vector);
+            point.put("payload", payload);
+
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("points", List.of(point));
+
+            qdrant.put()
+                    .uri("/collections/" + collectionName + "/points?wait=true")
+                    .header("Content-Type", "application/json")
+                    .bodyValue(body)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+        } catch (Exception e) {
+            System.err.println("❌ ATOMIC upsert 失败: " + e.getMessage());
+        }
+    }
+
+    // ========== 工具方法 ==========
+
+    /** 从 episode 的 toolCalls 中按工具名序列提取子 toolCalls */
+    private static List<ToolCallLog> extractSubCalls(List<ToolCallLog> fullTc, String toolKey) {
+        List<String> target = List.of(toolKey.split("\\|"));
+        List<String> names = fullTc.stream().map(ToolCallLog::toolName).toList();
+
+        // 找第一个匹配位置
+        for (int start = 0; start + target.size() <= names.size(); start++) {
+            boolean match = true;
+            for (int i = 0; i < target.size(); i++) {
+                if (!target.get(i).equals(names.get(start + i))) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return fullTc.subList(start, start + target.size());
+            }
+        }
+        return List.of();
+    }
+
+    @SuppressWarnings("unchecked")
+    private Episode deserializeEpisode(Map<String, Object> point) {
+        try {
+            Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+            if (payload == null) return null;
+            String id = String.valueOf(point.get("id"));
+            payload.put("id", id);
+            payload.putIfAbsent("successLesson", null);
+            payload.putIfAbsent("failureLesson", null);
+            payload.putIfAbsent("signature", Map.of());
+            payload.putIfAbsent("unitType", Episode.UnitType.COMPOSITE.name());
+            payload.putIfAbsent("isGeneric", false);
+            payload.putIfAbsent("parentIds", List.of());
+            payload.putIfAbsent("status", Episode.EpisodeStatus.ACTIVE.name());
+            payload.putIfAbsent("canScript", false);
+            payload.putIfAbsent("failedStepIndex", -1);
+            return objectMapper.convertValue(payload, Episode.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+}
