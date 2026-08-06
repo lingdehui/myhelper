@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 @SpringBootApplication
-@ComponentScan(basePackages = {"com.example.tools.windows", "com.example.desktopbrain.service"})
+@ComponentScan(basePackages = {"com.example.tools.windows", "com.example.desktopbrain.service", "com.example.desktopbrain.memory"})
 public class DesktopBrainApplication {
 
     // ========== 配置 ==========

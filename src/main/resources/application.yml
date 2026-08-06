@@ -8,16 +8,34 @@ spring:
           connections:
             robot-mcp:
               url: http://127.0.0.1:8081/mcp
-              request-timeout: 30s  # 单次工具调用最长等30秒
+              request-timeout: 30s
     openai:
       api-key: sk-5f0c105555904aec8c86953f3a91a528
       base-url: https://api.deepseek.com
       chat:
         options:
           model: deepseek-v4-pro
+  # ===== Neo4j 知识图谱 =====
+  neo4j:
+    uri: bolt://localhost:7687
+    authentication:
+      username: neo4j
+      password: neo4j123
+
+# ===== Qdrant 向量数据库 =====
+qdrant:
+  host: localhost
+  port: 6333
+  collection: desktop-memory
+  vector-size: 768
+
+# ===== Ollama 嵌入模型 =====
+embedding:
+  model: nomic-embed-text
 
 logging:
   level:
     org.springframework.ai.mcp: WARN
     io.modelcontextprotocol: WARN
     org.springframework.web: WARN
+    org.neo4j: WARN
