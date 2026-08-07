@@ -1,7 +1,10 @@
 package com.example.desktopbrain.service;
 
+import com.example.desktopbrain.common.AiResponseUtils;
+import com.example.desktopbrain.common.PromptLoader;
+import com.example.desktopbrain.config.DesktopBrainProperties;
+import com.example.desktopbrain.memory.graph.RuleNode;
 import com.example.desktopbrain.memory.vector.category.ToolCategoryService;
-import com.example.desktopbrain.memory.vector.category.ToolCategoryService.CategoryMatch;
 import com.example.desktopbrain.memory.vector.episode.Episode;
 import com.example.desktopbrain.memory.vector.episode.EpisodeCacheService;
 import com.example.desktopbrain.memory.vector.episode.ToolCallLog;
@@ -11,7 +14,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 三阶段工具规划器（升级版：三层缓存 + Episode 经验学习）。
@@ -22,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <h3>三层缓存查询逻辑</h3>
  * <pre>
  * plan(userInput, allTools):
- *   [Layer 1] 内存缓存（ConcurrentHashMap，key=normalizeKey(userInput)）
+ *   [Layer 1] 内存缓存（ConcurrentHashMap，key=AiResponseUtils.normalizeKey(userInput)）
  *             命中 → 返回 PlanResult(fromCache=true, episodeId=entry.episodeId)
  *             不查 Qdrant，避免重复 embed（200-500ms）
  *   [Layer 2] Episode 向量检索（Qdrant episodes collection）
@@ -54,19 +56,13 @@ public class ToolPlanner {
     private final ChatClient chatClient;
     private final EpisodeCacheService episodeCacheService;
     private final ToolCategoryService categoryService;
-    private static final int FAILURE_THRESHOLD = 3;
+    private final RuleInductionService ruleInductionService;
+    private final DesktopBrainProperties props;
+    private final PromptLoader promptLoader;
 
     /** 脚本化阈值：与 EpisodeCacheService 保持一致，successCount≥此值 且 stability>0.9 时 canScript=true */
     @Value("${qdrant.episode.script-success-threshold:5}")
     private int scriptSuccessThreshold;
-
-    /** 工具分类搜索 Top-K */
-    @Value("${qdrant.category.top-k:5}")
-    private int categoryTopK;
-
-    /** 工具分类最低相似度阈值 */
-    @Value("${qdrant.category.min-score:0.3}")
-    private double categoryMinScore;
 
     /** 缓存条目：方案 + episodeId + episode引用 + 连续失败次数 */
     private static class CacheEntry {
@@ -74,7 +70,7 @@ public class ToolPlanner {
         final List<String> missingDescriptions;
         final String episodeId;  // 关联的 Qdrant episode id（可能为 null）
         volatile Episode episode;   // episode 引用（含 successLesson/failureLesson，可能为 null）；volatile 因 onCacheHitSuccess 会更新 canScript
-        int failureCount;
+        volatile int failureCount;     // volatile：onCacheHitSuccess 和 onCacheHitFailure 可能并发
         CacheEntry(List<String> selectedToolNames, List<String> missingDescriptions,
                    String episodeId, Episode episode) {
             this.selectedToolNames = selectedToolNames;
@@ -85,39 +81,28 @@ public class ToolPlanner {
         }
     }
 
-    private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
-
-    /** 兜底分类：Qdrant 不可用时的最低保障（覆盖最常用的基础操作） */
-    private static final List<FallbackCategory> FALLBACK_CATEGORIES = List.of(
-        new FallbackCategory("1", "窗口与鼠标", "窗口管理+鼠标操作",
-            new String[]{"focusWindow","listWindows","getActiveWindowTitle","getMousePosition",
-                "mouseMove","leftClick","doubleClick","rightClick","middleClick","mouseScroll"}),
-        new FallbackCategory("2", "键盘与输入", "打字/按键/粘贴",
-            new String[]{"typeText","typeTextViaClipboard","pressKey","pressKeyCombination"}),
-        new FallbackCategory("3", "屏幕识别", "OCR文字识别+像素监控",
-            new String[]{"ocrScreen","ocrRegion","findTextOnScreen","clickTextOnScreen",
-                "findPixelColor","waitForPixelColor"}),
-        new FallbackCategory("4", "UI与剪贴板", "查找控件+剪贴板",
-            new String[]{"findElement","getTextContent","getClipboard","setClipboard"}),
-        new FallbackCategory("5", "联系人", "匹配微信好友+技能查询",
-            new String[]{"findFriend","listLocalSkills"})
-    );
-
-    private static final List<String> FALLBACK_TOOLS = List.of(
-            "sleep", "listWindows", "getActiveWindowTitle", "getMousePosition",
-            "focusWindow", "leftClick", "doubleClick", "rightClick",
-            "typeText", "typeTextViaClipboard", "pressKey", "pressKeyCombination",
-            "mouseMove", "mouseScroll", "clickTextOnScreen", "findTextOnScreen"
-    );
+    private final Map<String, CacheEntry> cache = Collections.synchronizedMap(
+            new LinkedHashMap<>(200, 0.75f, true) {  // access-order LRU
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
+                    return size() > props.toolPlanner().maxCacheSize();
+                }
+            });
 
     public ToolPlanner(ChatClient.Builder chatClientBuilder,
                         EpisodeCacheService episodeCacheService,
-                        ToolCategoryService categoryService) {
+                        ToolCategoryService categoryService,
+                        RuleInductionService ruleInductionService,
+                        DesktopBrainProperties props,
+                        PromptLoader promptLoader) {
         this.chatClient = chatClientBuilder
                 .defaultSystem("你是工具规划器，根据用户请求选择所需的能力分类，只返回编号。")
                 .build();
         this.episodeCacheService = episodeCacheService;
         this.categoryService = categoryService;
+        this.ruleInductionService = ruleInductionService;
+        this.props = props;
+        this.promptLoader = promptLoader;
     }
 
     /**
@@ -129,21 +114,26 @@ public class ToolPlanner {
      * @param episodeId           关联的 Episode id（内存命中或 Episode 命中时非 null；AI 规划时为 null）
      * @param episode             命中的完整 Episode（含 successLesson/failureLesson/toolCalls）；
      *                            AI 规划时为 null。调用方可据此增强 prompt（参考计划+经验提示）
+     * @param failureWarnings     历史失败警告列表（向量检索匹配的 FailurePattern），用于注入 AI prompt 避坑
      */
     public record PlanResult(
             List<String> selectedToolNames,
             List<String> missingDescriptions,
             boolean fromCache,
             String episodeId,
-            Episode episode
+            Episode episode,
+            List<EpisodeCacheService.FailureSearchResult> failureWarnings
     ) {
-        /** AI 规划的便捷工厂（episode=null） */
+        /** AI 规划的便捷工厂（episode=null, failureWarnings=empty） */
         public static PlanResult ofAIPlan(List<String> tools, List<String> missing) {
-            return new PlanResult(tools, missing, false, null, null);
+            return new PlanResult(tools, missing, false, null, null, List.of());
+        }
+        /** 带失败警告的 AI 规划工厂 */
+        public static PlanResult ofAIPlan(List<String> tools, List<String> missing,
+                                           List<EpisodeCacheService.FailureSearchResult> warnings) {
+            return new PlanResult(tools, missing, false, null, null, warnings);
         }
     }
-
-    private record FallbackCategory(String id, String name, String desc, String[] tools) {}
 
     /**
      * 正常规划：三层缓存查询（内存 → Episode → AI 规划）。
@@ -152,19 +142,29 @@ public class ToolPlanner {
      * 调用方（DesktopBrainApplication）可据此让 AI 判断可用性 + 带参考计划执行。</p>
      */
     public PlanResult plan(String userInput, ToolCallback[] allTools) {
-        String key = normalizeKey(userInput);
+        String key = AiResponseUtils.normalizeKey(userInput);
 
         // ===== Layer 1: 内存缓存（精确匹配，最快）=====
         CacheEntry entry = cache.get(key);
         if (entry != null) {
-            System.out.println("💾 命中内存缓存（失败计数: " + entry.failureCount + "/" + FAILURE_THRESHOLD
+            System.out.println("💾 命中内存缓存（失败计数: " + entry.failureCount + "/" + props.toolPlanner().failureThreshold()
                     + (entry.episodeId != null ? ", episode=" + entry.episodeId.substring(0, 8) + "..." : "") + "）");
+            // L1 命中但仍检索失败警告（轻量，不额外 embed）
+            List<EpisodeCacheService.FailureSearchResult> warnL1 = episodeCacheService.searchFailurePatterns(userInput, 3);
             return new PlanResult(entry.selectedToolNames, entry.missingDescriptions,
-                    true, entry.episodeId, entry.episode);
+                    true, entry.episodeId, entry.episode, warnL1);
         }
 
-        // ===== Layer 2: Episode 向量检索（语义匹配，跨重启持久化）=====
+        // ===== Layer 2: Episode 向量检索 + 失败模式并行检索 =====
         Optional<Episode> ep = episodeCacheService.findSimilarEpisode(userInput);
+        List<EpisodeCacheService.FailureSearchResult> warnings = episodeCacheService.searchFailurePatterns(userInput, 3);
+
+        if (!warnings.isEmpty()) {
+            System.out.println("⚠️ 发现 " + warnings.size() + " 条相关失败警告: "
+                    + warnings.stream().map(w -> w.type() + "(" + String.format("%.0f%%", w.score() * 100) + ")")
+                    .reduce((a, b) -> a + ", " + b).orElse(""));
+        }
+
         if (ep.isPresent()) {
             Episode episode = ep.get();
             // 回填内存缓存（带 episode 引用，含 lesson），下次相同输入直接内存命中
@@ -173,11 +173,11 @@ public class ToolPlanner {
             System.out.println("💾 命中 Episode 缓存（稳定度: " + String.format("%.2f", episode.computedStability())
                     + ", episode=" + episode.id().substring(0, 8) + "...）");
             return new PlanResult(episode.selectedToolNames(), episode.missingDescriptions(),
-                    true, episode.id(), episode);
+                    true, episode.id(), episode, warnings);
         }
 
         // ===== Layer 3: AI 规划 =====
-        return doPlan(userInput, allTools, null);
+        return doPlan(userInput, allTools, null, warnings);
     }
 
     /**
@@ -200,7 +200,7 @@ public class ToolPlanner {
      */
     public boolean onCacheHitFailure(String userInput, PlanResult plan,
                                       String failureLesson, boolean isPlanIssue) {
-        String key = normalizeKey(userInput);
+        String key = AiResponseUtils.normalizeKey(userInput);
         CacheEntry entry = cache.get(key);
 
         // 异步更新 Episode（带归因：计划问题才 failureCount+1，环境问题只存 lesson）
@@ -217,12 +217,12 @@ public class ToolPlanner {
             return true;
         }
         entry.failureCount++;
-        if (entry.failureCount >= FAILURE_THRESHOLD) {
+        if (entry.failureCount >= props.toolPlanner().failureThreshold()) {
             cache.remove(key);
-            System.out.println("🗑️ 缓存连续失败 " + FAILURE_THRESHOLD + " 次（计划问题），已清除旧方案");
+            System.out.println("🗑️ 缓存连续失败 " + props.toolPlanner().failureThreshold() + " 次（计划问题），已清除旧方案");
             return true;
         }
-        System.out.println("⚠️ 缓存方案失败（计划问题，第 " + entry.failureCount + " 次/" + FAILURE_THRESHOLD + "），保留缓存，本次重新规划");
+        System.out.println("⚠️ 缓存方案失败（计划问题，第 " + entry.failureCount + " 次/" + props.toolPlanner().failureThreshold() + "），保留缓存，本次重新规划");
         return false;
     }
 
@@ -239,7 +239,7 @@ public class ToolPlanner {
      * @param plan      当前命中的 PlanResult（用 plan.episodeId() 调 Episode 成功计数）
      */
     public void onCacheHitSuccess(String userInput, PlanResult plan) {
-        String key = normalizeKey(userInput);
+        String key = AiResponseUtils.normalizeKey(userInput);
         CacheEntry entry = cache.get(key);
         if (entry != null) {
             if (entry.failureCount > 0) entry.failureCount = 0;
@@ -248,7 +248,7 @@ public class ToolPlanner {
                 Episode old = entry.episode;
                 int newSuccess = old.successCount() + 1;
                 int failure = old.failureCount();
-                double newStability = (newSuccess + failure) == 0 ? 0.0 : (double) newSuccess / (newSuccess + failure);
+                double newStability = Episode.calcStability(newSuccess, failure);
                 boolean wasScriptable = old.canScript();
                 boolean canScript = newSuccess >= scriptSuccessThreshold && newStability > 0.9;
                 entry.episode = new Episode(
@@ -256,7 +256,7 @@ public class ToolPlanner {
                         old.toolCalls(), old.aiResponse(), old.successLesson(), old.failureLesson(),
                         old.signature(), old.unitType(), old.isGeneric(), old.parentIds(),
                         newSuccess, failure, old.archived(), old.timestamp(), newStability,
-                        old.status(), canScript, old.failedStepIndex());
+                        old.status(), canScript, old.failedStepIndex(), old.explorationType(), old.explorationSummary());
                 if (canScript && !wasScriptable) {
                     System.out.println("🚀 内存缓存 episode 升级为可脚本化（id=" + old.id().substring(0, 8) + "...）");
                 }
@@ -267,7 +267,8 @@ public class ToolPlanner {
 
     /** 重新规划（带失败原因，不走缓存） */
     public PlanResult replan(String userInput, ToolCallback[] allTools, String failureReason) {
-        return doPlan(userInput, allTools, failureReason);
+        List<EpisodeCacheService.FailureSearchResult> warnings = episodeCacheService.searchFailurePatterns(userInput, 3);
+        return doPlan(userInput, allTools, failureReason, warnings);
     }
 
     // ========== DRAFT 生命周期委托 ==========
@@ -298,6 +299,12 @@ public class ToolPlanner {
         episodeCacheService.failDraft(episodeId, toolCallLogs, failureLesson, failedStepIndex);
     }
 
+    /** 从失败执行中提取可复用步骤链 */
+    public void saveSalvageableChains(String userInput, List<ToolCallLog> toolCalls,
+                                       List<List<Integer>> chains, String draftId) {
+        episodeCacheService.saveSalvageableAtomicChains(userInput, toolCalls, chains, draftId);
+    }
+
     /**
      * 写入新方案到内存缓存（首次规划成功 + draft 转 active 后调用）。
      *
@@ -314,15 +321,15 @@ public class ToolPlanner {
     public void cacheToMemory(String userInput, PlanResult plan, String episodeId,
                                List<ToolCallLog> toolCallLogs, String aiResponse, String successLesson) {
         Episode memEpisode = new Episode(episodeId, userInput, plan.selectedToolNames(),
-                plan.missingDescriptions(), toolCallLogs, truncate(aiResponse, 500),
+                plan.missingDescriptions(), toolCallLogs, AiResponseUtils.truncate(aiResponse, 500),
                 successLesson, null, Map.of(), Episode.UnitType.COMPOSITE, false, List.of(),
                 1, 0, false, System.currentTimeMillis(), 1.0,
-                Episode.EpisodeStatus.ACTIVE, false, -1);
-        cache.put(normalizeKey(userInput), new CacheEntry(
+                Episode.EpisodeStatus.ACTIVE, false, -1, null, null);
+        cache.put(AiResponseUtils.normalizeKey(userInput), new CacheEntry(
                 plan.selectedToolNames(), plan.missingDescriptions(), episodeId, memEpisode));
         System.out.println("💾 已写入内存缓存（" + plan.selectedToolNames().size()
                 + " 个工具，episode=" + episodeId.substring(0, 8) + "..."
-                + (successLesson != null ? ", 经验: " + truncate(successLesson, 40) : "") + "）");
+                + (successLesson != null ? ", 经验: " + AiResponseUtils.truncate(successLesson, 40) : "") + "）");
     }
 
     /**
@@ -338,189 +345,179 @@ public class ToolPlanner {
         return categoryService.syncCategories(allTools);
     }
 
-    /** 内部：调 AI 规划（优先 Qdrant 动态分类，降级兜底） */
-    private PlanResult doPlan(String userInput, ToolCallback[] allTools, String failureReason) {
-        // === 优先：Qdrant 向量搜索动态分类 ===
-        List<CategoryMatch> dynamicCats = categoryService.searchCategories(
-                userInput, categoryTopK, categoryMinScore);
-
-        if (!dynamicCats.isEmpty()) {
-            return planWithCategories(dynamicCats, userInput, allTools, failureReason);
+    /** 内部：调 AI 规划（让 AI 从完整工具列表中直接选工具名） */
+    private PlanResult doPlan(String userInput, ToolCallback[] allTools, String failureReason,
+                               List<EpisodeCacheService.FailureSearchResult> warnings) {
+        // 构建完整工具列表（工具名 + 简短描述）
+        StringBuilder toolList = new StringBuilder();
+        for (ToolCallback tc : allTools) {
+            String name = tc.getToolDefinition().name();
+            String desc = tc.getToolDefinition().description();
+            toolList.append("- ").append(name);
+            if (desc != null && !desc.isBlank()) {
+                toolList.append(": ").append(AiResponseUtils.truncateNotNull(desc, 60));
+            }
+            toolList.append("\n");
         }
 
-        // === 降级：兜底硬编码分类（Qdrant 不可用或无匹配 时保证基本可用） ===
-        System.out.println("⚠️ Qdrant 分类无匹配，使用兜底分类");
-        return planWithFallback(userInput, allTools, failureReason);
-    }
-
-    /**
-     * 用 Qdrant 动态分类执行规划。
-     */
-    private PlanResult planWithCategories(List<CategoryMatch> categories, String userInput,
-                                           ToolCallback[] allTools, String failureReason) {
-        // 构造分类列表供 AI 选择编号
-        StringBuilder catList = new StringBuilder();
-        for (int i = 0; i < categories.size(); i++) {
-            CategoryMatch cm = categories.get(i);
-            catList.append(i + 1).append(". ")
-                    .append(cm.name()).append("（").append(cm.tools().size()).append("个工具）: ")
-                    .append(cm.description()).append("\n");
+        String prompt;
+        if (failureReason != null) {
+            prompt = promptLoader.getReplanning().formatted(toolList, userInput, failureReason);
+        } else {
+            prompt = promptLoader.getPlanning().formatted(toolList, userInput);
         }
 
-        // 收集去重后的所有工具名
-        Set<String> allCatTools = new LinkedHashSet<>();
-        for (CategoryMatch cm : categories) {
-            allCatTools.addAll(cm.tools());
+        // 注入历史失败警告到 AI 规划 prompt
+        if (warnings != null && !warnings.isEmpty()) {
+            StringBuilder warnBlock = new StringBuilder("\n\n--- ⚠️ 历史失败警告（请避免以下做法） ---\n");
+            for (int i = 0; i < warnings.size(); i++) {
+                var w = warnings.get(i);
+                warnBlock.append((i + 1)).append(". ").append(w.type())
+                        .append("（失败 ").append(w.count()).append(" 次, 相似度 ").append(String.format("%.0f%%", w.score() * 100)).append("）\n")
+                        .append("   描述: ").append(w.description()).append("\n");
+                if (w.mitigation() != null && !w.mitigation().isBlank()) {
+                    warnBlock.append("   建议: ").append(w.mitigation()).append("\n");
+                }
+            }
+            prompt += warnBlock.toString();
         }
 
-        String prompt = buildPlanPrompt(catList.toString(), userInput, failureReason);
+        // 注入归纳的通用规则到 AI 规划 prompt
+        List<RuleNode> activeRules = ruleInductionService.getActiveRules();
+        if (!activeRules.isEmpty()) {
+            StringBuilder ruleBlock = new StringBuilder("\n\n--- 📜 已知规则（请遵循） ---\n");
+            for (int i = 0; i < Math.min(activeRules.size(), 10); i++) {
+                var r = activeRules.get(i);
+                ruleBlock.append((i + 1)).append(". ").append(r.getSummary())
+                        .append("（置信度: ").append(String.format("%.0f%%", r.getConfidence() * 100)).append("）\n");
+            }
+            prompt += ruleBlock.toString();
+        }
+
         String planResponse;
         try {
             planResponse = chatClient.prompt().user(prompt).call().content();
         } catch (Exception e) {
             System.out.println("⚠️ 规划失败，使用兜底工具: " + e.getMessage());
-            return PlanResult.ofAIPlan(new ArrayList<>(FALLBACK_TOOLS), List.of());
+            return PlanResult.ofAIPlan(new ArrayList<>(props.toolPlanner().fallbackTools()), List.of());
         }
 
-        return parsePlanResponse(planResponse, categories, allCatTools, allTools);
+        return parseToolNames(planResponse, allTools);
     }
 
-    /**
-     * 用兜底硬编码分类降级规划（Qdrant 不可用时）。
-     */
-    private PlanResult planWithFallback(String userInput, ToolCallback[] allTools,
-                                         String failureReason) {
-        StringBuilder catList = new StringBuilder();
-        for (FallbackCategory cat : FALLBACK_CATEGORIES) {
-            catList.append(cat.id).append(". ")
-                    .append(cat.name).append(": ").append(cat.desc).append("\n");
+    /** 解析 AI 返回的工具名 → 精确匹配 → 模糊/关键词兜底 → MISSING */
+    private PlanResult parseToolNames(String response, ToolCallback[] allTools) {
+        if (response == null) {
+            return PlanResult.ofAIPlan(new ArrayList<>(props.toolPlanner().fallbackTools()), List.of());
         }
 
-        Set<String> allCatTools = new LinkedHashSet<>();
-        for (FallbackCategory cat : FALLBACK_CATEGORIES) {
-            allCatTools.addAll(Arrays.asList(cat.tools));
-        }
-
-        String prompt = buildPlanPrompt(catList.toString(), userInput, failureReason);
-        String planResponse;
-        try {
-            planResponse = chatClient.prompt().user(prompt).call().content();
-        } catch (Exception e) {
-            System.out.println("⚠️ 规划失败，使用兜底工具: " + e.getMessage());
-            return PlanResult.ofAIPlan(new ArrayList<>(FALLBACK_TOOLS), List.of());
-        }
-
-        if (planResponse == null) {
-            return PlanResult.ofAIPlan(new ArrayList<>(FALLBACK_TOOLS), List.of());
-        }
-
+        Set<String> knownNames = collectExisting(allTools);
         Set<String> neededTools = new LinkedHashSet<>();
         List<String> missing = new ArrayList<>();
 
-        for (String part : planResponse.split("[,，\n]")) {
-            String trimmed = part.trim().replaceAll("^\\d+[.\\)]\\s*", "");
+        for (String part : response.split("[,，\n]")) {
+            String trimmed = part.trim()
+                    .replaceAll("^[\\d]+[.\\)、]\\s*", "")  // 去掉编号
+                    .trim();
+            if (trimmed.isEmpty()) continue;
             if (trimmed.toUpperCase().startsWith("MISSING:")) {
                 missing.add(trimmed.substring("MISSING:".length()).trim());
                 continue;
             }
-            for (FallbackCategory cat : FALLBACK_CATEGORIES) {
-                if (cat.id.equals(trimmed)) {
-                    neededTools.addAll(Arrays.asList(cat.tools));
+
+            // 精确匹配
+            if (knownNames.contains(trimmed)) {
+                neededTools.add(trimmed);
+                continue;
+            }
+            // 模糊匹配（AI 可能多打/少打字符）
+            String trimmedLower = trimmed.toLowerCase();
+            for (String known : knownNames) {
+                if (known.equalsIgnoreCase(trimmed)
+                        || known.toLowerCase().contains(trimmedLower)) {
+                    neededTools.add(known);
                     break;
                 }
             }
         }
 
-        if (neededTools.isEmpty()) neededTools.addAll(FALLBACK_TOOLS);
-        Set<String> existing = collectExisting(allTools);
-        neededTools.retainAll(existing);
+        // === 关键词兜底：MISSING 或没选到工具时 ===
+        if (!missing.isEmpty()) {
+            List<String> keywordTools = findToolsByKeywords(missing, allTools);
+            if (!keywordTools.isEmpty()) {
+                neededTools.addAll(keywordTools);
+                System.out.println("🔎 关键词兜底匹配: " + keywordTools.size() + " 个工具");
+                missing.clear();
+            }
+        }
+
+        if (neededTools.isEmpty()) neededTools.addAll(props.toolPlanner().fallbackTools());
+        for (String tool : props.toolPlanner().alwaysAppendTools()) {
+            neededTools.add(tool);
+        }
+        System.out.println("📦 AI 选中 " + neededTools.size() + " 个工具" + (missing.isEmpty() ? "" : ", 缺失: " + missing));
         return PlanResult.ofAIPlan(new ArrayList<>(neededTools), missing);
     }
 
-    /** 构造规划 prompt */
-    private static String buildPlanPrompt(String categoryList, String userInput, String failureReason) {
-        if (failureReason != null) {
-            return """
-                    上次方案执行失败，请根据失败原因重新选择能力分类。
-
-                    可用分类:
-                    %s
-                    用户请求: %s
-                    失败原因: %s
-
-                    规则:
-                    - 返回需要的分类编号，逗号分隔
-                    - 避开导致失败的工具，换用其他分类
-                    - 如果某能力不存在，用 MISSING: 描述 说明
-                    """.formatted(categoryList, userInput, failureReason);
-        }
-        return """
-                根据用户请求，选择需要的能力分类。
-
-                可用分类:
-                %s
-                用户请求: %s
-
-                规则:
-                - 返回需要的分类编号，逗号分隔，不要多余内容
-                - 只选确实需要的，不要全选
-                - 如果某项能力在分类中完全不存在，用 MISSING: 描述 说明
-                - 示例: 1,3,8
-                - 示例: 1,3,8, MISSING: 文件压缩工具
-                """.formatted(categoryList, userInput);
-    }
-
-    /** 解析 AI 分类编号响应为工具列表 */
-    private PlanResult parsePlanResponse(String planResponse, List<CategoryMatch> categories,
-                                          Set<String> allCatTools, ToolCallback[] allTools) {
-        if (planResponse == null) {
-            return PlanResult.ofAIPlan(new ArrayList<>(FALLBACK_TOOLS), List.of());
-        }
-
-        Set<String> neededTools = new LinkedHashSet<>();
-        List<String> missing = new ArrayList<>();
-
-        for (String part : planResponse.split("[,，\n]")) {
-            String trimmed = part.trim().replaceAll("^\\d+[.\\)]\\s*", "");
-            if (trimmed.toUpperCase().startsWith("MISSING:")) {
-                missing.add(trimmed.substring("MISSING:".length()).trim());
-                continue;
-            }
-            // 匹配编号（1-based index）
-            try {
-                int idx = Integer.parseInt(trimmed) - 1;
-                if (idx >= 0 && idx < categories.size()) {
-                    neededTools.addAll(categories.get(idx).tools());
+    /**
+     * 关键词匹配：在所有工具中搜索名称/描述包含关键词的工具。
+     * 用于 Qdrant 分类漏掉工具时的兜底补充。
+     *
+     * <p>对中文关键词做多级切分：先按分隔符切，再对每个片段用2-gram滑窗匹配，
+     * 确保 "设备扫描工具" 能匹配到描述中含 "扫描...设备" 的工具。</p>
+     */
+    /** 按关键词匹配工具（公开静态，供外部复用） */
+    public static List<String> findToolsByKeywords(List<String> missingDescriptions,
+                                                    ToolCallback[] allTools) {
+        List<String> result = new ArrayList<>();
+        for (String missing : missingDescriptions) {
+            // 先按分隔符切分
+            String[] segments = missing.split("[的与和或及、\\s]+");
+            for (ToolCallback tc : allTools) {
+                String name = tc.getToolDefinition().name();
+                String desc = tc.getToolDefinition().description();
+                if (desc == null) desc = "";
+                String combined = (name + " " + desc).toLowerCase();
+                for (String seg : segments) {
+                    String segLower = seg.toLowerCase();
+                    // 英文/数字：直接包含匹配
+                    if (segLower.matches(".*[a-z0-9].*")) {
+                        if (segLower.length() >= 2 && combined.contains(segLower)) {
+                            result.add(name);
+                            break;
+                        }
+                    } else {
+                        // 中文：用2-gram滑窗匹配，每个字符也要单独匹配
+                        if (containsChineseKeywords(combined, segLower)) {
+                            result.add(name);
+                            break;
+                        }
+                    }
                 }
-            } catch (NumberFormatException ignored) {
-                // 非编号文本，忽略
             }
         }
+        return result;
+    }
 
-        if (neededTools.isEmpty()) neededTools.addAll(FALLBACK_TOOLS);
-
-        Set<String> existing = collectExisting(allTools);
-        neededTools.retainAll(existing);
-
-        return PlanResult.ofAIPlan(new ArrayList<>(neededTools), missing);
+    /** 中文关键词匹配：每个字符必须在 combined 中出现，且至少一个2-gram匹配 */
+    private static boolean containsChineseKeywords(String combined, String keyword) {
+        if (keyword.isEmpty()) return false;
+        // 每个单字符必须出现
+        for (int i = 0; i < keyword.length(); i++) {
+            if (combined.indexOf(keyword.charAt(i)) < 0) return false;
+        }
+        // 至少一个2-gram子串在 combined 中出现
+        for (int i = 0; i + 2 <= keyword.length(); i++) {
+            if (combined.contains(keyword.substring(i, i + 2))) return true;
+        }
+        // 如果只有1个字符，上面已通过单字符检查
+        return keyword.length() == 1;
     }
 
     private static Set<String> collectExisting(ToolCallback[] allTools) {
         Set<String> existing = new HashSet<>();
         for (ToolCallback tc : allTools) existing.add(tc.getToolDefinition().name());
         return existing;
-    }
-
-    private static String normalizeKey(String input) {
-        if (input == null) return "";
-        // \p{P} 匹配所有 Unicode 标点（含中文全角 ，。！？等）
-        return input.replaceAll("[\\d\\s\\p{P}]", "").toLowerCase();
-    }
-
-    private static String truncate(String s, int max) {
-        if (s == null) return null;
-        String oneLine = s.replace("\n", " ").trim();
-        return oneLine.length() > max ? oneLine.substring(0, max) + "..." : oneLine;
     }
 
     public void clearCache() {

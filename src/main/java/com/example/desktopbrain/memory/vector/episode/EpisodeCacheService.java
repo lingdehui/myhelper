@@ -1,5 +1,10 @@
 package com.example.desktopbrain.memory.vector.episode;
 
+import com.example.desktopbrain.common.AiResponseUtils;
+import com.example.desktopbrain.common.HaApiPaths;
+import com.example.desktopbrain.common.QdrantFields;
+import com.example.desktopbrain.memory.graph.FailurePatternNode;
+import com.example.desktopbrain.memory.graph.FailurePatternRepository;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -9,6 +14,10 @@ import org.springframework.web.reactive.function.client.WebClient;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+
+import static com.example.desktopbrain.common.HaApiPaths.APPLICATION_JSON;
+import static com.example.desktopbrain.common.HaApiPaths.CONTENT_TYPE;
+import static com.example.desktopbrain.common.QdrantFields.*;
 
 /**
  * Episode 缓存服务（核心）。
@@ -37,10 +46,14 @@ public class EpisodeCacheService {
     private final EmbeddingService embeddingService;
     private final ReflectService reflectService;
     private final UnitLearner unitLearner;
+    private final FailurePatternRepository failurePatternRepo;
     private final ObjectMapper objectMapper;
 
     @Value("${qdrant.episodes-collection:episodes}")
     private String collectionName;
+
+    @Value("${qdrant.failure-patterns-collection:failure-patterns}")
+    private String failurePatternsCollection;
 
     @Value("${qdrant.vector-size:768}")
     private int vectorSize;
@@ -64,16 +77,21 @@ public class EpisodeCacheService {
     public EpisodeCacheService(WebClient qdrantWebClient,
                                 EmbeddingService embeddingService,
                                 ReflectService reflectService,
-                                UnitLearner unitLearner) {
+                                UnitLearner unitLearner,
+                                FailurePatternRepository failurePatternRepo) {
         this.qdrant = qdrantWebClient;
         this.embeddingService = embeddingService;
         this.reflectService = reflectService;
         this.unitLearner = unitLearner;
+        this.failurePatternRepo = failurePatternRepo;
         this.objectMapper = new ObjectMapper();
     }
 
     /**
-     * 启动时初始化 episodes collection。
+     * 启动时初始化 episodes collection（idempotent）。
+     *
+     * <p>重启恢复：清理所有遗留的 DRAFT points（前次运行未完成的执行），
+     * 避免 orphan DRAFT 永久占用存储。</p>
      */
     @PostConstruct
     public void initCollection() {
@@ -90,7 +108,7 @@ public class EpisodeCacheService {
                         "{\"vectors\": {\"size\": %d, \"distance\": \"Cosine\"}}", vectorSize);
                 qdrant.put()
                         .uri("/collections/" + collectionName)
-                        .header("Content-Type", "application/json")
+                        .header(CONTENT_TYPE, APPLICATION_JSON)
                         .bodyValue(body)
                         .retrieve()
                         .toBodilessEntity()
@@ -98,9 +116,100 @@ public class EpisodeCacheService {
                 System.out.println("📦 Qdrant 集合 '" + collectionName + "' 已创建（向量维度: " + vectorSize + "）");
             } else {
                 System.out.println("📦 Qdrant 集合 '" + collectionName + "' 已存在");
+                // 清理遗留的 DRAFT points（前次运行未完成的执行）
+                cleanupDraftPoints();
             }
+            // 同时初始化 failure-patterns collection
+            initFailurePatternsCollection();
         } catch (Exception e) {
             System.err.println("⚠️ Episode collection 初始化失败（episode 系统将降级）: " + e.getMessage());
+        }
+    }
+
+    /** 初始化 failure-patterns collection（idempotent） */
+    private void initFailurePatternsCollection() {
+        try {
+            Boolean exists = qdrant.get()
+                    .uri("/collections/" + failurePatternsCollection)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .map(r -> true)
+                    .onErrorReturn(false)
+                    .block();
+            if (Boolean.FALSE.equals(exists)) {
+                String body = String.format(
+                        "{\"vectors\": {\"size\": %d, \"distance\": \"Cosine\"}}", vectorSize);
+                qdrant.put()
+                        .uri("/collections/" + failurePatternsCollection)
+                        .header(CONTENT_TYPE, APPLICATION_JSON)
+                        .bodyValue(body)
+                        .retrieve()
+                        .toBodilessEntity()
+                        .block();
+                System.out.println("📦 Qdrant 集合 '" + failurePatternsCollection + "' 已创建（向量维度: " + vectorSize + "）");
+            } else {
+                System.out.println("📦 Qdrant 集合 '" + failurePatternsCollection + "' 已存在");
+            }
+        } catch (Exception e) {
+            System.err.println("⚠️ FailurePatterns collection 初始化失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 清理所有 status=DRAFT 的遗留 points。
+     * Qdrant 重启后，之前的 DRAFT 不再有对应的内存 episodeId，
+     * 永远无法被 activate/fail，必须清理。
+     */
+    @SuppressWarnings("unchecked")
+    private void cleanupDraftPoints() {
+        try {
+            // 1. scroll 获取所有 DRAFT points 的 ID
+            Map<String, Object> filter = Map.of(MUST, List.of(
+                    Map.of(KEY, STATUS, MATCH, Map.of(VALUE, "DRAFT"))
+            ));
+            Map<String, Object> scrollBody = new LinkedHashMap<>();
+            scrollBody.put(FILTER, filter);
+            scrollBody.put(WITH_PAYLOAD, false);
+            scrollBody.put(WITH_VECTOR, false);
+            scrollBody.put(LIMIT, 1000);
+
+            Map<String, Object> response = qdrant.post()
+                    .uri("/collections/" + collectionName + "/points/scroll")
+                    .header(CONTENT_TYPE, APPLICATION_JSON)
+                    .bodyValue(scrollBody)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response == null) return;
+            Map<String, Object> result = (Map<String, Object>) response.get(RESULT);
+            if (result == null) return;
+            List<Map<String, Object>> points = (List<Map<String, Object>>) result.getOrDefault(POINTS, List.of());
+            if (points.isEmpty()) return;
+
+            List<String> draftIds = new ArrayList<>();
+            for (Map<String, Object> p : points) {
+                Object id = p.get(ID);
+                if (id != null) draftIds.add(String.valueOf(id));
+            }
+
+            // 2. 批量删除
+            Map<String, Object> deleteBody = Map.of("points", draftIds);
+            Map<String, Object> deleteResp = qdrant.post()
+                    .uri("/collections/" + collectionName + "/points/delete?wait=true")
+                    .header(CONTENT_TYPE, APPLICATION_JSON)
+                    .bodyValue(deleteBody)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (deleteResp != null) {
+                Map<String, Object> deleteResult = (Map<String, Object>) deleteResp.get("result");
+                String status = deleteResult != null ? String.valueOf(deleteResult.getOrDefault("status", "ok")) : "ok";
+                System.out.println("🧹 清理遗留 DRAFT points: " + draftIds.size() + " 个 (" + status + ")");
+            }
+        } catch (Exception e) {
+            System.err.println("⚠️ DRAFT 清理失败（不影响正常功能）: " + e.getMessage());
         }
     }
 
@@ -115,22 +224,22 @@ public class EpisodeCacheService {
         try {
             List<Float> queryVector = embeddingService.embed(userInput);
 
-            Map<String, Object> filter = Map.of("must", List.of(
-                    Map.of("key", "archived", "equals", false),
-                    Map.of("key", "stability", "range", Map.of("gte", stabilityThreshold)),
-                    Map.of("key", "status", "match", Map.of("value", "ACTIVE"))
+            Map<String, Object> filter = Map.of(MUST, List.of(
+                    Map.of(KEY, ARCHIVED, MATCH, Map.of(VALUE, false)),
+                    Map.of(KEY, STABILITY, RANGE, Map.of(GTE, stabilityThreshold)),
+                    Map.of(KEY, STATUS, MATCH, Map.of(VALUE, "ACTIVE"))
             ));
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("vector", queryVector);
-            body.put("limit", topK);
-            body.put("with_payload", true);
-            body.put("score_threshold", (float) similarityThreshold);
-            body.put("filter", filter);
+            body.put(VECTOR, queryVector);
+            body.put(LIMIT, topK);
+            body.put(WITH_PAYLOAD, true);
+            body.put(SCORE_THRESHOLD, (float) similarityThreshold);
+            body.put(FILTER, filter);
 
             @SuppressWarnings("unchecked")
             Map<String, Object> response = qdrant.post()
                     .uri("/collections/" + collectionName + "/points/search")
-                    .header("Content-Type", "application/json")
+                    .header(CONTENT_TYPE, APPLICATION_JSON)
                     .bodyValue(body)
                     .retrieve()
                     .bodyToMono(Map.class)
@@ -170,7 +279,7 @@ public class EpisodeCacheService {
      * @param userInput         用户原话
      * @param selectedToolNames 选中的工具名列表
      * @param missingDescriptions 缺失的工具描述
-     * @return 新生成的 episodeId
+     * @return 新生成的 episodeId；写入失败时返回 null
      */
     public String createDraft(String userInput,
                                List<String> selectedToolNames,
@@ -204,10 +313,11 @@ public class EpisodeCacheService {
 
             upsertPoint(episodeId, vector, payload);
             System.out.println("📝 已创建 DRAFT Episode（id=" + episodeId.substring(0, 8) + "...）");
+            return episodeId;
         } catch (Exception e) {
             System.err.println("❌ DRAFT Episode 创建失败: " + e.getMessage());
+            return null;
         }
-        return episodeId;
     }
 
     /**
@@ -226,7 +336,8 @@ public class EpisodeCacheService {
         if (episodeId == null) return;
         CompletableFuture.runAsync(() -> {
             try {
-                Optional<Episode> current = fetchEpisode(episodeId);
+                // 重试获取：createDraft 是同步写入的，但 Qdrant 写入和读取之间可能有传播延迟
+                Optional<Episode> current = fetchEpisodeWithRetry(episodeId, 3, 200);
                 if (current.isEmpty()) return;
                 Episode ep = current.get();
 
@@ -239,13 +350,13 @@ public class EpisodeCacheService {
 
                 int newSuccess = ep.successCount() + 1;
                 int failure = ep.failureCount();
-                double newStability = (double) newSuccess / (newSuccess + failure);
+                double newStability = Episode.calcStability(newSuccess, failure);
                 boolean canScript = newSuccess >= scriptSuccessThreshold && newStability > 0.9;
 
                 Map<String, Object> update = new LinkedHashMap<>();
                 update.put("toolCalls", templatedToolCalls);
                 update.put("signature", signature);
-                update.put("aiResponse", truncate(aiResponse, 500));
+                update.put("aiResponse", AiResponseUtils.truncate(aiResponse, 500));
                 update.put("successLesson", successLesson);
                 update.put("successCount", newSuccess);
                 update.put("stability", newStability);
@@ -257,7 +368,7 @@ public class EpisodeCacheService {
                 System.out.println("✅ DRAFT→ACTIVE（id=" + episodeId.substring(0, 8)
                         + "..., success=" + newSuccess + ", stability=" + String.format("%.2f", newStability)
                         + (canScript ? ", 🚀可脚本化" : "")
-                        + (successLesson != null ? ", 经验: " + truncate(successLesson, 40) : "")
+                        + (successLesson != null ? ", 经验: " + AiResponseUtils.truncate(successLesson, 40) : "")
                         + (!signature.isEmpty() ? ", 变量: " + signature.keySet() : "") + "）");
 
                 // 异步触发通用步骤提取（"越用越聪明"：积累 episode 后自动发现可复用 ATOMIC）
@@ -294,7 +405,7 @@ public class EpisodeCacheService {
                 System.out.println("❌ DRAFT→FAILED（id=" + episodeId.substring(0, 8)
                         + "..., 已保存 " + (toolCalls != null ? toolCalls.size() : 0) + " 步"
                         + ", 失败步: " + failedStepIndex
-                        + (failureLesson != null ? ", 教训: " + truncate(failureLesson, 40) : "") + "）");
+                        + (failureLesson != null ? ", 教训: " + AiResponseUtils.truncate(failureLesson, 40) : "") + "）");
             } catch (Exception e) {
                 System.err.println("❌ DRAFT→FAILED 失败: " + e.getMessage());
             }
@@ -334,7 +445,7 @@ public class EpisodeCacheService {
                     // 计划问题 → 失败数+1
                     int newFailure = ep.failureCount() + 1;
                     int success = ep.successCount();
-                    double newStability = (double) success / (success + newFailure);
+                    double newStability = Episode.calcStability(success, newFailure);
                     boolean shouldArchive = newFailure >= failureThreshold || newStability < 0.3;
 
                     payloadUpdate.put("failureCount", newFailure);
@@ -350,12 +461,12 @@ public class EpisodeCacheService {
                     System.out.println("⚠️ Episode 计划失败+1（id=" + episodeId.substring(0, 8)
                             + "..., failure=" + newFailure + ", stability=" + String.format("%.2f", newStability)
                             + (shouldArchive ? ", 已归档" : "")
-                            + (failureLesson != null ? ", 教训: " + truncate(failureLesson, 40) : "") + "）");
+                            + (failureLesson != null ? ", 教训: " + AiResponseUtils.truncate(failureLesson, 40) : "") + "）");
                 } else {
                     // 环境问题 → 不惩罚计划，只存教训
                     setPayload(episodeId, payloadUpdate);
                     System.out.println("ℹ️ Episode 环境失败（不惩罚计划，id=" + episodeId.substring(0, 8)
-                            + "..., 教训: " + (failureLesson != null ? truncate(failureLesson, 40) : "无") + "）");
+                            + "..., 教训: " + (failureLesson != null ? AiResponseUtils.truncate(failureLesson, 40) : "无") + "）");
                 }
             } catch (Exception e) {
                 System.err.println("❌ Episode 失败更新失败: " + e.getMessage());
@@ -379,7 +490,7 @@ public class EpisodeCacheService {
 
                 int newSuccess = ep.successCount() + 1;
                 int failure = ep.failureCount();
-                double newStability = (double) newSuccess / (newSuccess + failure);
+                double newStability = Episode.calcStability(newSuccess, failure);
                 boolean canScript = newSuccess >= scriptSuccessThreshold && newStability > 0.9;
 
                 Map<String, Object> payloadUpdate = new LinkedHashMap<>();
@@ -412,7 +523,7 @@ public class EpisodeCacheService {
             );
             Map<String, Object> response = qdrant.post()
                     .uri("/collections/" + collectionName + "/points")
-                    .header("Content-Type", "application/json")
+                    .header(CONTENT_TYPE, APPLICATION_JSON)
                     .bodyValue(body)
                     .retrieve()
                     .bodyToMono(Map.class)
@@ -427,6 +538,19 @@ public class EpisodeCacheService {
         }
     }
 
+    /** 带重试的 fetch（应对 DRAFT→ACTIVE 的写入传播延迟） */
+    private Optional<Episode> fetchEpisodeWithRetry(String episodeId, int maxRetries, int delayMs) {
+        for (int i = 0; i < maxRetries; i++) {
+            Optional<Episode> ep = fetchEpisode(episodeId);
+            if (ep.isPresent()) return ep;
+            if (i < maxRetries - 1) {
+                try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
+            }
+        }
+        System.err.println("⚠️ fetchEpisode 重试 " + maxRetries + " 次后仍未找到: " + episodeId.substring(0, 8) + "...");
+        return Optional.empty();
+    }
+
     /** upsert 单个 point（含 vector + payload） */
     private void upsertPoint(String episodeId, List<Float> vector, Map<String, Object> payload) {
         Map<String, Object> point = new LinkedHashMap<>();
@@ -439,7 +563,7 @@ public class EpisodeCacheService {
 
         qdrant.put()
                 .uri("/collections/" + collectionName + "/points?wait=true")
-                .header("Content-Type", "application/json")
+                .header(CONTENT_TYPE, APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
                 .toBodilessEntity()
@@ -452,7 +576,7 @@ public class EpisodeCacheService {
         body.put("points", List.of(episodeId));
         qdrant.post()
                 .uri("/collections/" + collectionName + "/points/payload?wait=true")
-                .header("Content-Type", "application/json")
+                .header(CONTENT_TYPE, APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
                 .toBodilessEntity()
@@ -464,33 +588,257 @@ public class EpisodeCacheService {
      */
     @SuppressWarnings("unchecked")
     private Episode deserializeEpisode(Map<String, Object> point) {
-        try {
-            Map<String, Object> payload = (Map<String, Object>) point.get("payload");
-            if (payload == null) return null;
-            String id = String.valueOf(point.get("id"));
-            payload.put("id", id);
+        return Episode.fromQdrantPoint(point, objectMapper);
+    }
 
-            // 确保新增字段有默认值（兼容旧数据）
-            payload.putIfAbsent("successLesson", null);
-            payload.putIfAbsent("failureLesson", null);
-            payload.putIfAbsent("signature", Map.of());
-            payload.putIfAbsent("unitType", Episode.UnitType.COMPOSITE.name());
-            payload.putIfAbsent("isGeneric", false);
-            payload.putIfAbsent("parentIds", List.of());
-            payload.putIfAbsent("status", Episode.EpisodeStatus.ACTIVE.name());
-            payload.putIfAbsent("canScript", false);
-            payload.putIfAbsent("failedStepIndex", -1);
+    /**
+     * 从失败计划中提取可复用的步骤链，保存为 ATOMIC 通用模板。
+     *
+     * <p>例如"打开番茄网站"失败（网址错了），但"打开浏览器→输入网址"步骤链可复用。
+     * 每条第≥2步的连续成功链存为独立 ATOMIC episode，积累≥3次引用后自动变通用。</p>
+     *
+     * @param userInput   原始用户输入（用于生成步骤描述）
+     * @param toolCalls   完整的执行轨迹
+     * @param chains      可复用步骤索引链，如 [[0,1], [3]]
+     * @param parentDraftId 原始 DRAFT episode ID（用于关联）
+     */
+    public void saveSalvageableAtomicChains(String userInput, List<ToolCallLog> toolCalls,
+                                             List<List<Integer>> chains, String parentDraftId) {
+        if (chains == null || chains.isEmpty()) return;
 
-            return objectMapper.convertValue(payload, Episode.class);
-        } catch (Exception e) {
-            System.err.println("❌ Episode 反序列化失败: " + e.getMessage());
-            return null;
+        for (List<Integer> chain : chains) {
+            if (chain.size() < 1) continue;
+            try {
+                // 提取这一链的步骤
+                List<ToolCallLog> chainSteps = new ArrayList<>();
+                StringBuilder desc = new StringBuilder();
+                for (int i = 0; i < chain.size(); i++) {
+                    int idx = chain.get(i);
+                    if (idx < 0 || idx >= toolCalls.size()) continue;
+                    ToolCallLog step = toolCalls.get(idx);
+                    if (!step.success()) continue; // 只收成功步骤
+                    chainSteps.add(step);
+                    if (i > 0) desc.append(" → ");
+                    desc.append(step.toolName());
+                }
+                if (chainSteps.isEmpty()) continue;
+
+                // 单步跳过（没有组合价值）
+                if (chainSteps.size() < 2) continue;
+
+                String stepDesc = desc.toString();
+                String episodeId = UUID.randomUUID().toString();
+
+                // 用步骤描述生成向量
+                List<Float> vector = embeddingService.embed(userInput + " → " + stepDesc);
+
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("id", episodeId);
+                payload.put("userInput", stepDesc);
+                payload.put("selectedToolNames", List.of());
+                payload.put("missingDescriptions", List.of());
+                payload.put("toolCalls", chainSteps);
+                payload.put("aiResponse", null);
+                payload.put("successLesson", "自动从失败任务中提取的可复用步骤链");
+                payload.put("failureLesson", null);
+                payload.put("signature", Map.of());
+                payload.put("unitType", Episode.UnitType.ATOMIC.name());
+                payload.put("isGeneric", false);
+                payload.put("parentIds", parentDraftId != null ? List.of(parentDraftId) : List.of());
+                payload.put("successCount", 1);
+                payload.put("failureCount", 0);
+                payload.put("archived", false);
+                payload.put("timestamp", System.currentTimeMillis());
+                payload.put("stability", Episode.calcStability(1, 0));
+                payload.put("status", Episode.EpisodeStatus.ACTIVE.name());
+                payload.put("canScript", false);
+                payload.put("failedStepIndex", -1);
+
+                upsertPoint(episodeId, vector, payload);
+                System.out.println("🧩 已提取可复用步骤链: " + stepDesc + " (id=" + episodeId.substring(0, 8) + "...)");
+            } catch (Exception e) {
+                System.err.println("⚠️ 提取步骤链失败: " + e.getMessage());
+            }
         }
     }
 
-    private static String truncate(String s, int max) {
-        if (s == null) return null;
-        String oneLine = s.replace("\n", " ").trim();
-        return oneLine.length() > max ? oneLine.substring(0, max) + "...[truncated]" : oneLine;
+    /**
+     * 获取近期成功 Episode 摘要列表（供定时规则归纳使用）。
+     *
+     * <p>scroll 出 status=ACTIVE 且 archived=false 且 stability>=0.5 的最近 N 条，返回摘要信息。</p>
+     */
+    @SuppressWarnings("unchecked")
+    public List<String> getRecentSuccessfulEpisodeSummaries(int limit) {
+        try {
+            Map<String, Object> filter = Map.of(MUST, List.of(
+                    Map.of(KEY, STATUS, MATCH, Map.of(VALUE, "ACTIVE")),
+                    Map.of(KEY, ARCHIVED, MATCH, Map.of(VALUE, false)),
+                    Map.of(KEY, STABILITY, RANGE, Map.of(GTE, 0.5))
+            ));
+            Map<String, Object> scrollBody = new LinkedHashMap<>();
+            scrollBody.put(FILTER, filter);
+            scrollBody.put(WITH_PAYLOAD, true);
+            scrollBody.put(WITH_VECTOR, false);
+            scrollBody.put(LIMIT, limit);
+
+            Map<String, Object> response = qdrant.post()
+                    .uri("/collections/" + collectionName + "/points/scroll")
+                    .header(CONTENT_TYPE, APPLICATION_JSON)
+                    .bodyValue(scrollBody)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response == null) return List.of();
+            Map<String, Object> result = (Map<String, Object>) response.get(RESULT);
+            if (result == null) return List.of();
+            List<Map<String, Object>> points = (List<Map<String, Object>>) result.getOrDefault(POINTS, List.of());
+
+            List<String> summaries = new ArrayList<>();
+            for (Map<String, Object> p : points) {
+                Map<String, Object> payload = (Map<String, Object>) p.get("payload");
+                if (payload == null) continue;
+                String userInput = (String) payload.getOrDefault("userInput", "");
+                String successLesson = (String) payload.getOrDefault("successLesson", "");
+                int successCount = ((Number) payload.getOrDefault("successCount", 0)).intValue();
+                summaries.add(String.format("任务: %s | 成功经验: %s | 成功次数: %d",
+                        userInput, successLesson != null ? successLesson : "无", successCount));
+            }
+            return summaries;
+        } catch (Exception e) {
+            System.err.println("⚠️ 获取成功 Episode 摘要失败: " + e.getMessage());
+            return List.of();
+        }
     }
+
+    // ========== 失败经验持久化 ==========
+
+    /**
+     * 持久化 FailurePattern 到 Qdrant。
+     *
+     * <p>用 pattern.type + pattern.description 拼接作为向量化的输入文本，
+     * 异步写入 failure-patterns collection，Qdrant 故障吞异常不传染。</p>
+     */
+    public void saveFailurePattern(FailureExperienceHandler.FailurePattern pattern, List<String> toolNames) {
+        if (pattern == null) return;
+        CompletableFuture.runAsync(() -> {
+            try {
+                String text = pattern.type() + " " + pattern.description();
+                List<Float> vector = embeddingService.embed(text);
+                String pointId = UUID.randomUUID().toString();
+
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("id", pointId);
+                payload.put("type", pattern.type());
+                payload.put("description", pattern.description());
+                payload.put("mitigation", pattern.mitigation());
+                payload.put("count", pattern.count());
+                payload.put("detectedAt", pattern.detectedAt());
+                payload.put("toolNames", toolNames != null ? toolNames : List.of());
+
+                upsertPointToCollection(failurePatternsCollection, pointId, vector, payload);
+                System.out.println("💾 失败模式已持久化: " + pattern.type() + " (id=" + pointId.substring(0, 8) + "...)");
+
+                // 同时写入 Neo4j 知识图谱
+                try {
+                    FailurePatternNode node = new FailurePatternNode(
+                            pattern.type(), pattern.description(), pattern.mitigation(),
+                            pattern.count(), pattern.detectedAt());
+                    failurePatternRepo.save(node);
+                    System.out.println("🧠 失败模式已写入 Neo4j: " + pattern.type());
+                } catch (Exception neoEx) {
+                    System.err.println("⚠️ FailurePattern Neo4j 写入失败: " + neoEx.getMessage());
+                }
+            } catch (Exception e) {
+                System.err.println("❌ FailurePattern 持久化失败: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * 向量检索失败模式。
+     *
+     * @param query 查询文本（如 AI 要执行的用户指令）
+     * @param topK  返回条数
+     * @return 匹配的 FailurePattern 列表（含 Qdrant score）；出错时返回空列表
+     */
+    @SuppressWarnings("unchecked")
+    public List<FailureSearchResult> searchFailurePatterns(String query, int topK) {
+        try {
+            List<Float> queryVector = embeddingService.embed(query);
+
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put(VECTOR, queryVector);
+            body.put(LIMIT, topK);
+            body.put(WITH_PAYLOAD, true);
+            body.put(SCORE_THRESHOLD, 0.55f);
+
+            Map<String, Object> response = qdrant.post()
+                    .uri("/collections/" + failurePatternsCollection + "/points/search")
+                    .header(CONTENT_TYPE, APPLICATION_JSON)
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response == null) return List.of();
+
+            List<Map<String, Object>> points = (List<Map<String, Object>>) response.getOrDefault("result", List.of());
+            if (points.isEmpty()) return List.of();
+
+            List<FailureSearchResult> results = new ArrayList<>();
+            for (Map<String, Object> point : points) {
+                double score = ((Number) point.getOrDefault(SCORE, 0.0)).doubleValue();
+                Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+                if (payload == null) continue;
+
+                results.add(new FailureSearchResult(
+                        (String) payload.get("type"),
+                        (String) payload.get("description"),
+                        (String) payload.get("mitigation"),
+                        ((Number) payload.getOrDefault("count", 0)).intValue(),
+                        ((Number) payload.getOrDefault("detectedAt", 0L)).longValue(),
+                        (List<String>) payload.getOrDefault("toolNames", List.of()),
+                        score
+                ));
+            }
+            return results;
+        } catch (Exception e) {
+            System.err.println("❌ FailurePattern 搜索失败: " + e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** upsert point 到指定 collection（不耦合 this.collectionName） */
+    private void upsertPointToCollection(String collection, String pointId,
+                                          List<Float> vector, Map<String, Object> payload) {
+        Map<String, Object> point = new LinkedHashMap<>();
+        point.put("id", pointId);
+        point.put("vector", vector);
+        point.put("payload", payload);
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("points", List.of(point));
+
+        qdrant.put()
+                .uri("/collections/" + collection + "/points?wait=true")
+                .header(CONTENT_TYPE, APPLICATION_JSON)
+                .bodyValue(body)
+                .retrieve()
+                .toBodilessEntity()
+                .block();
+    }
+
+    /**
+     * 失败经验检索结果。
+     */
+    public record FailureSearchResult(
+            String type,
+            String description,
+            String mitigation,
+            int count,
+            long detectedAt,
+            List<String> toolNames,
+            double score
+    ) {}
 }

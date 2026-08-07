@@ -1,5 +1,6 @@
 package com.example.desktopbrain.service;
 
+import com.example.desktopbrain.config.DesktopBrainProperties;
 import com.k2fsa.sherpa.onnx.*;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -15,16 +16,13 @@ import java.nio.file.Path;
 @Component
 public class VadService {
 
+    private final DesktopBrainProperties props;
     private Vad vad;
     private volatile boolean enabled = false;
-    private static final int SAMPLE_RATE = 16000;
 
-    // VAD 参数 — 偏敏感，靠后续能量校验过滤噪音
-    private static final float THRESHOLD = 0.5f;
-    private static final float MIN_SILENCE_DURATION = 1.2f;
-    private static final float MIN_SPEECH_DURATION = 0.25f;
-    private static final float MAX_SPEECH_DURATION = 8f;
-    private static final int WINDOW_SIZE = 512;
+    public VadService(DesktopBrainProperties props) {
+        this.props = props;
+    }
 
     @PostConstruct
     public void init() {
@@ -39,23 +37,23 @@ public class VadService {
 
             SileroVadModelConfig sileroConfig = SileroVadModelConfig.builder()
                     .setModel(modelPath.toString())
-                    .setThreshold(THRESHOLD)
-                    .setMinSilenceDuration(MIN_SILENCE_DURATION)
-                    .setMinSpeechDuration(MIN_SPEECH_DURATION)
-                    .setMaxSpeechDuration(MAX_SPEECH_DURATION)
-                    .setWindowSize(WINDOW_SIZE)
+                    .setThreshold(props.vad().threshold())
+                    .setMinSilenceDuration(props.vad().minSilenceDuration())
+                    .setMinSpeechDuration(props.vad().minSpeechDuration())
+                    .setMaxSpeechDuration(props.vad().maxSpeechDuration())
+                    .setWindowSize(props.vad().windowSize())
                     .build();
 
             VadModelConfig config = VadModelConfig.builder()
                     .setSileroVadModelConfig(sileroConfig)
-                    .setSampleRate(SAMPLE_RATE)
+                    .setSampleRate(props.voice().sampleRate())
                     .setNumThreads(1)
                     .setProvider("cpu")
                     .build();
 
             this.vad = new Vad(config);
             this.enabled = true;
-            System.out.println("✅ VAD 引擎就绪 (Silero v4, 阈值=" + THRESHOLD + ")");
+            System.out.println("✅ VAD 引擎就绪 (Silero v4, 阈值=" + props.vad().threshold() + ")");
         } catch (Exception e) {
             System.out.println("⚠️ VAD 初始化失败: " + e.getMessage() + "，使用能量检测回退");
             this.enabled = false;

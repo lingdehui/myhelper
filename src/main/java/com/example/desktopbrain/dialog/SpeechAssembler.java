@@ -23,7 +23,7 @@ import java.util.List;
 @Component
 public class SpeechAssembler {
 
-    @Value("${desktopbrain.dialogue.debounce-window-ms:500}")
+    @Value("${desktopbrain.dialog.debounce-window-ms:300}")
     private int debounceWindowMs;
 
     private final List<String> segments = Collections.synchronizedList(new ArrayList<>());
@@ -55,7 +55,7 @@ public class SpeechAssembler {
         // 之前没有待处理的，直接加入
         segments.add(text);
         lastSegmentTime = now;
-        hasPending = false;
+        hasPending = true;
         return true;
     }
 

@@ -1,6 +1,13 @@
 server:
   port: 8082
 spring:
+  config:
+    import:
+      - classpath:config/desktopbrain-voice.yml
+      - classpath:config/desktopbrain-dialog.yml
+      - classpath:config/desktopbrain-tool.yml
+      - classpath:config/desktopbrain-semantic.yml
+      - classpath:config/desktopbrain-exploration.yml
   ai:
     mcp:
       client:
@@ -39,7 +46,7 @@ qdrant:
 homeassistant:
   url: http://localhost:8123
   # 安装后在 HA 后台创建长期访问令牌，替换下面的值
-  access-token: YOUR_HA_LONG_LIVED_ACCESS_TOKEN
+  access-token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIyOWY2MWFlNzFjN2I0NzE5YjMzYzJlZTE5OWY0OGM4NiIsImlhdCI6MTc4NjAyNTYxOCwiZXhwIjoyMTAxMzg1NjE4fQ.zumI0Hb19lCEPq_AR8bfezM8TgdEoenTH7B8d6sqp5o
 
 # ===== Ollama 嵌入模型 =====
 embedding:

@@ -1,5 +1,6 @@
 package com.example.desktopbrain.memory.vector.episode;
 
+import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
@@ -99,7 +100,7 @@ public class UnitLearner {
                 }
             }
 
-            // 4. 过滤：出现≥threshold 次 且 不是已有 ATOMIC
+            // 4. 过滤：出现≥threshold 次 且 不是已有 ATOMIC，并验证多样性
             int created = 0;
             for (Map.Entry<String, Set<String>> entry : subseqFreq.entrySet()) {
                 if (entry.getValue().size() < genericThreshold) continue;
@@ -114,9 +115,25 @@ public class UnitLearner {
                 List<ToolCallLog> subCalls = extractSubCalls(refComposites.toolCalls(), entry.getKey());
                 if (subCalls.isEmpty()) continue;
 
+                // 🆕 闭环验证：检查父 episode 的多样性
+                // 如果所有父 episode 都是同样的任务（相同 userInput），则子序列是重复任务模式，非真正通用步骤
+                ParentDiversity div = checkParentDiversity(composites, entry.getValue());
+                double initialStability;
+                if (div.isDiverse) {
+                    // 不同任务中反复出现 → 高置信度通用步骤
+                    initialStability = 0.7;
+                    System.out.println("  🧩 高置信度 ATOMIC: " + entry.getKey()
+                            + "（" + div.diverseCount + " 种不同任务）");
+                } else {
+                    // 相同任务重复出现 → 可能只是任务模式，低置信度
+                    initialStability = 0.3;
+                    System.out.println("  🧩 低置信度 ATOMIC: " + entry.getKey()
+                            + "（仅 1 种任务，" + div.totalCount + " 次重复）→ stability=" + initialStability + "，需实际验证");
+                }
+
                 // 创建 ATOMIC episode
                 createAtomicEpisode(entry.getKey(), subCalls,
-                        new ArrayList<>(entry.getValue()));
+                        new ArrayList<>(entry.getValue()), initialStability);
                 created++;
             }
 
@@ -144,7 +161,7 @@ public class UnitLearner {
                 Map<String, Object> filter = Map.of("must", List.of(
                         Map.of("key", "status", "match", Map.of("value", "ACTIVE")),
                         Map.of("key", "unitType", "match", Map.of("value", "COMPOSITE")),
-                        Map.of("key", "archived", "equals", false)
+                        Map.of("key", "archived", "match", Map.of("value", false))
                 ));
                 scrollBody.put("filter", filter);
                 if (offset != null) scrollBody.put("offset", offset);
@@ -210,7 +227,7 @@ public class UnitLearner {
             body.put("with_vector", false);
             Map<String, Object> filter = Map.of("must", List.of(
                     Map.of("key", "unitType", "match", Map.of("value", "ATOMIC")),
-                    Map.of("key", "archived", "equals", false)
+                    Map.of("key", "archived", "match", Map.of("value", false))
             ));
             body.put("filter", filter);
 
@@ -240,14 +257,51 @@ public class UnitLearner {
     // ========== ATOMIC 创建 ==========
 
     /**
+     * 父 episode 多样性检查结果。
+     *
+     * @param isDiverse    父 episode 是否包含多种不同任务（true=通用步骤，false=任务重复）
+     * @param totalCount   父 episode 总数
+     * @param diverseCount 不同任务种类数（基于 normalizeKey 去重）
+     */
+    private record ParentDiversity(boolean isDiverse, int totalCount, int diverseCount) {}
+
+    /**
+     * 检查引用了同一子序列的父 episode 的任务多样性。
+     *
+     * <p>真正的通用步骤：在多种不同任务中反复出现（如 "找联系人→发消息" 出现在
+     * "给张三发微信"、"回复李四消息"、"群里通知开会" 中）。</p>
+     *
+     * <p>伪通用步骤（任务重复）：同一个任务重复执行导致的（如 "给张三发微信"
+     * 执行了 5 次），这种子序列是任务模式，不是通用步骤。</p>
+     */
+    private static ParentDiversity checkParentDiversity(List<Episode> allComposites,
+                                                         Set<String> parentIds) {
+        // 收集父 episode 的归一化 userInput（去标点/空格/数字）
+        Set<String> diverseInputs = new HashSet<>();
+        int count = 0;
+        for (Episode ep : allComposites) {
+            if (parentIds.contains(ep.id())) {
+                String normalized = AiResponseUtils.normalizeKey(ep.userInput());
+                if (normalized != null && !normalized.isEmpty()) {
+                    diverseInputs.add(normalized);
+                }
+                count++;
+            }
+        }
+        // 不同任务种类 ≥ 2 才认为是真正跨任务的通用步骤
+        return new ParentDiversity(diverseInputs.size() >= 2, count, diverseInputs.size());
+    }
+
+    /**
      * 创建一个 ATOMIC 通用步骤 episode。
      *
      * @param toolKey   工具名序列（"toolA|toolB|..."），用于生成描述
      * @param subCalls  对应的 toolCalls 子序列
      * @param parentIds 引用此步骤的 COMPOSITE episode id 列表
+     * @param initialStability 初始稳定度（基于父 episode 多样性：多样性高=0.7，单任务重复=0.3）
      */
     private void createAtomicEpisode(String toolKey, List<ToolCallLog> subCalls,
-                                      List<String> parentIds) {
+                                      List<String> parentIds, double initialStability) {
         try {
             String episodeId = UUID.randomUUID().toString();
             long timestamp = System.currentTimeMillis();
@@ -270,13 +324,13 @@ public class UnitLearner {
             payload.put("failureLesson", null);
             payload.put("signature", Map.of());
             payload.put("unitType", Episode.UnitType.ATOMIC.name());
-            payload.put("isGeneric", true);
+            payload.put("isGeneric", initialStability >= 0.6); // 只有高置信度才标记通用
             payload.put("parentIds", parentIds);
             payload.put("successCount", 0);
             payload.put("failureCount", 0);
             payload.put("archived", false);
             payload.put("timestamp", timestamp);
-            payload.put("stability", 0.5); // ATOMIC 初始稳定度中等（尚未单独验证）
+            payload.put("stability", initialStability); // 🆕 动态初始稳定度
             payload.put("status", Episode.EpisodeStatus.ACTIVE.name());
             payload.put("canScript", false); // ATOMIC 不单独脚本化
             payload.put("failedStepIndex", -1);
@@ -334,25 +388,7 @@ public class UnitLearner {
         return List.of();
     }
 
-    @SuppressWarnings("unchecked")
     private Episode deserializeEpisode(Map<String, Object> point) {
-        try {
-            Map<String, Object> payload = (Map<String, Object>) point.get("payload");
-            if (payload == null) return null;
-            String id = String.valueOf(point.get("id"));
-            payload.put("id", id);
-            payload.putIfAbsent("successLesson", null);
-            payload.putIfAbsent("failureLesson", null);
-            payload.putIfAbsent("signature", Map.of());
-            payload.putIfAbsent("unitType", Episode.UnitType.COMPOSITE.name());
-            payload.putIfAbsent("isGeneric", false);
-            payload.putIfAbsent("parentIds", List.of());
-            payload.putIfAbsent("status", Episode.EpisodeStatus.ACTIVE.name());
-            payload.putIfAbsent("canScript", false);
-            payload.putIfAbsent("failedStepIndex", -1);
-            return objectMapper.convertValue(payload, Episode.class);
-        } catch (Exception e) {
-            return null;
-        }
+        return Episode.fromQdrantPoint(point, objectMapper);
     }
 }

@@ -1,5 +1,7 @@
 package com.example.desktopbrain.memory.vector.category;
 
+import com.example.desktopbrain.common.AiResponseUtils;
+import com.example.desktopbrain.common.PromptLoader;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,6 +42,7 @@ public class ToolCategoryService {
     private final ChatClient chatClient;
     private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper;
+    private final PromptLoader promptLoader;
 
     private static final String COLLECTION_NAME = "tool-categories";
 
@@ -51,20 +54,27 @@ public class ToolCategoryService {
 
     public ToolCategoryService(WebClient qdrantWebClient,
                                 ChatClient.Builder chatClientBuilder,
-                                EmbeddingService embeddingService) {
+                                EmbeddingService embeddingService,
+                                PromptLoader promptLoader) {
         this.qdrant = qdrantWebClient;
         this.chatClient = chatClientBuilder
                 .defaultSystem("你是工具分类器，根据工具名称和描述将它们分组到语义类别中。")
                 .build();
         this.embeddingService = embeddingService;
         this.objectMapper = new ObjectMapper();
+        this.promptLoader = promptLoader;
     }
 
     /**
-     * 启动时初始化 tool-categories collection（idempotent）。
+     * 启动时初始化 tool-categories collection（@PostConstruct 入口）。
      */
     @PostConstruct
     public void initCollection() {
+        ensureCollection();
+    }
+
+    /** 确保 tool-categories 集合存在，不存在则创建。幂等，可重复调用。 */
+    private void ensureCollection() {
         try {
             Boolean exists = qdrant.get()
                     .uri("/collections/" + COLLECTION_NAME)
@@ -104,6 +114,9 @@ public class ToolCategoryService {
     public int syncCategories(ToolCallback[] allTools) {
         if (allTools == null || allTools.length == 0) return 0;
 
+        // 兜底确保集合已创建（@PostConstruct 可能因 Qdrant 未就绪而静默失败）
+        ensureCollection();
+
         try {
             // 构建工具列表字符串供 AI 分类
             StringBuilder toolList = new StringBuilder();
@@ -111,40 +124,27 @@ public class ToolCategoryService {
                 toolList.append("- ").append(tc.getToolDefinition().name());
                 String desc = tc.getToolDefinition().description();
                 if (desc != null && !desc.isBlank()) {
-                    toolList.append(": ").append(truncate(desc, 80));
+                    toolList.append(": ").append(AiResponseUtils.truncateNotNull(desc, 80));
                 }
                 toolList.append("\n");
             }
 
-            String prompt = """
-                    将以下工具按功能分组到语义类别中。每个工具可以属于多个类别（交叉分类）。
-
-                    工具列表:
-                    %s
-
-                    规则:
-                    - 每个类别 3-15 个工具
-                    - 类别名简洁（2-4字中文）
-                    - 同功能工具可交叉归类
-                    - 描述一句话说明该类别的用途
-                    - 把 HA 智能家居工具、MCP 桌面工具、本地工具合理分组
-
-                    返回严格 JSON 数组（不要 markdown 标记）:
-                    [{"name":"类别名","desc":"简短描述","tools":["tool1","tool2"]}]
-                    """.formatted(toolList);
+            String prompt = promptLoader.getToolCategorySync().formatted(toolList);
 
             String response = chatClient.prompt().user(prompt).call().content();
             if (response == null || response.isBlank()) return 0;
 
-            String json = response.trim();
-            if (json.startsWith("```")) {
-                json = json.replaceAll("^```\\w*\\n?", "").replaceAll("\\n?```$", "").trim();
-            }
+            String json = AiResponseUtils.stripMarkdownCodeBlock(response);
 
             List<Map<String, Object>> categories =
                     objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
 
             long version = System.currentTimeMillis();
+
+            // 先构建所有新 points，一次性写入，成功后再删旧版本
+            // （防止先删后写时中途失败导致分类为空）
+            Map<String, Object> upsertBody = new LinkedHashMap<>();
+            List<Map<String, Object>> points = new ArrayList<>();
             int count = 0;
 
             for (Map<String, Object> cat : categories) {
@@ -175,9 +175,22 @@ public class ToolCategoryService {
                 payload.put("toolCount", validTools.size());
                 payload.put("version", version);
 
-                upsertPoint(categoryId, vector, payload);
+                Map<String, Object> point = new LinkedHashMap<>();
+                point.put("id", categoryId);
+                point.put("vector", vector);
+                point.put("payload", payload);
+                points.add(point);
                 count++;
             }
+
+            if (points.isEmpty()) return 0;
+
+            // 批量 upsert 所有新分类
+            upsertBody.put("points", points);
+            upsertBatch(upsertBody);
+
+            // 新分类全部写成功后，再删除旧版本
+            deleteAllCategoryPoints();
 
             this.lastSyncVersion = version;
             System.out.println("✅ 工具分类同步完成: " + count + " 类, "
@@ -256,41 +269,30 @@ public class ToolCategoryService {
         }
     }
 
+    // ========== 内部工具方法 ==========
+
     /**
-     * 检查分类是否已过期（与当前工具数不匹配）。
+     * 删除所有分类 points（同步前清理旧数据）。
+     * 使用 Qdrant delete 按 filter 删除所有匹配 points。
      */
-    public boolean isStale(int currentToolCount) {
-        if (lastSyncVersion == 0) return true;
+    private void deleteAllCategoryPoints() {
         try {
-            // 通过 count API 检查 Qdrant 中分类数量
-            @SuppressWarnings("unchecked")
-            Map<String, Object> response = qdrant.post()
-                    .uri("/collections/" + COLLECTION_NAME + "/points/count")
+            Map<String, Object> deleteBody = new LinkedHashMap<>();
+            deleteBody.put("filter", Map.of());
+            qdrant.post()
+                    .uri("/collections/" + COLLECTION_NAME + "/points/delete?wait=true")
                     .header("Content-Type", "application/json")
-                    .bodyValue("{}")
+                    .bodyValue(deleteBody)
                     .retrieve()
-                    .bodyToMono(Map.class)
+                    .toBodilessEntity()
                     .block();
-            if (response == null) return true;
-            int count = ((Number) response.getOrDefault("result", 0)).intValue();
-            return count == 0;
         } catch (Exception e) {
-            return true;
+            System.err.println("⚠️ 清理旧分类失败: " + e.getMessage());
         }
     }
 
-    // ========== 内部工具方法 ==========
-
-    private void upsertPoint(String id, List<Float> vector, Map<String, Object> payload) {
+    private void upsertBatch(Map<String, Object> body) {
         try {
-            Map<String, Object> point = new LinkedHashMap<>();
-            point.put("id", id);
-            point.put("vector", vector);
-            point.put("payload", payload);
-
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("points", List.of(point));
-
             qdrant.put()
                     .uri("/collections/" + COLLECTION_NAME + "/points?wait=true")
                     .header("Content-Type", "application/json")
@@ -299,7 +301,7 @@ public class ToolCategoryService {
                     .toBodilessEntity()
                     .block();
         } catch (Exception e) {
-            System.err.println("❌ tool-categories upsert 失败: " + e.getMessage());
+            System.err.println("❌ tool-categories 批量 upsert 失败: " + e.getMessage());
         }
     }
 
@@ -309,12 +311,6 @@ public class ToolCategoryService {
             names.add(tc.getToolDefinition().name());
         }
         return names;
-    }
-
-    private static String truncate(String s, int max) {
-        if (s == null) return "";
-        String oneLine = s.replace("\n", " ").trim();
-        return oneLine.length() > max ? oneLine.substring(0, max) + "..." : oneLine;
     }
 
     // ========== 内部类型 ==========

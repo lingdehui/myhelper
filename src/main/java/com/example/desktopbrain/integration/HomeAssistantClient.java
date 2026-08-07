@@ -1,5 +1,6 @@
 package com.example.desktopbrain.integration;
 
+import com.example.desktopbrain.common.HaApiPaths;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
@@ -7,6 +8,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.util.*;
+
+import static com.example.desktopbrain.common.HaApiPaths.*;
 
 /**
  * Home Assistant REST API 客户端
@@ -23,14 +26,14 @@ public class HomeAssistantClient {
     private final ObjectMapper objectMapper;
 
     public HomeAssistantClient(
-            @Value("${homeassistant.url}") String haUrl,
-            @Value("${homeassistant.access-token}") String accessToken,
+            @Value("${homeassistant.url:http://localhost:8123}") String haUrl,
+            @Value("${homeassistant.access-token:}") String accessToken,
             WebClient.Builder webClientBuilder) {
         this.accessToken = accessToken;
         this.objectMapper = new ObjectMapper();
         this.webClient = webClientBuilder
                 .baseUrl(haUrl)
-                .defaultHeader("Authorization", "Bearer " + accessToken)
+                .defaultHeader(AUTHORIZATION, BEARER_PREFIX + accessToken)
                 .build();
     }
 
@@ -43,7 +46,7 @@ public class HomeAssistantClient {
     public List<Map<String, Object>> getAllStates() {
         try {
             String response = webClient.get()
-                    .uri("/api/states")
+                    .uri(STATES)
                     .retrieve()
                     .bodyToMono(String.class)
                     .block();
@@ -62,7 +65,7 @@ public class HomeAssistantClient {
     public Map<String, Object> getState(String entityId) {
         try {
             String response = webClient.get()
-                    .uri("/api/states/" + entityId)
+                    .uri(STATES + "/" + entityId)
                     .retrieve()
                     .bodyToMono(String.class)
                     .block();
@@ -82,7 +85,7 @@ public class HomeAssistantClient {
             List<Map<String, Object>> all = getAllStates();
             List<Map<String, Object>> result = new ArrayList<>();
             for (Map<String, Object> state : all) {
-                String entityId = (String) state.get("entity_id");
+                String entityId = (String) state.get(ENTITY_ID);
                 if (entityId != null && entityId.startsWith(domain + ".")) {
                     result.add(state);
                 }
@@ -102,7 +105,7 @@ public class HomeAssistantClient {
             List<Map<String, Object>> result = new ArrayList<>();
             String lowerKeyword = keyword.toLowerCase();
             for (Map<String, Object> state : all) {
-                String entityId = (String) state.get("entity_id");
+                String entityId = (String) state.get(ENTITY_ID);
                 if (entityId != null && entityId.toLowerCase().contains(lowerKeyword)) {
                     result.add(state);
                 }
@@ -127,13 +130,13 @@ public class HomeAssistantClient {
                                Map<String, Object> params) {
         try {
             Map<String, Object> payload = new HashMap<>();
-            payload.put("entity_id", entityId);
+            payload.put(ENTITY_ID, entityId);
             if (params != null) {
                 payload.putAll(params);
             }
 
             webClient.post()
-                    .uri("/api/services/" + domain + "/" + service)
+                    .uri(SERVICES + "/" + domain + "/" + service)
                     .bodyValue(payload)
                     .retrieve()
                     .bodyToMono(String.class)
@@ -156,39 +159,39 @@ public class HomeAssistantClient {
 
     /** 开灯 */
     public boolean turnOnLight(String entityId) {
-        return callService("light", "turn_on", entityId);
+        return callService(DOMAIN_LIGHT, SERVICE_TURN_ON, entityId);
     }
 
     /** 关灯 */
     public boolean turnOffLight(String entityId) {
-        return callService("light", "turn_off", entityId);
+        return callService(DOMAIN_LIGHT, SERVICE_TURN_OFF, entityId);
     }
 
     /** 切换灯开关 */
     public boolean toggleLight(String entityId) {
-        return callService("light", "toggle", entityId);
+        return callService(DOMAIN_LIGHT, SERVICE_TOGGLE, entityId);
     }
 
     /** 设置灯亮度 (0-255) */
     public boolean setBrightness(String entityId, int brightness) {
-        Map<String, Object> params = Map.of("brightness", brightness);
-        return callService("light", "turn_on", entityId, params);
+        Map<String, Object> params = Map.of(BRIGHTNESS, brightness);
+        return callService(DOMAIN_LIGHT, SERVICE_TURN_ON, entityId, params);
     }
 
     /** 设置空调温度 */
     public boolean setTemperature(String entityId, double temperature) {
-        Map<String, Object> params = Map.of("temperature", temperature);
-        return callService("climate", "set_temperature", entityId, params);
+        Map<String, Object> params = Map.of(TEMPERATURE, temperature);
+        return callService(DOMAIN_CLIMATE, SERVICE_SET_TEMPERATURE, entityId, params);
     }
 
     /** 打开开关/插座 */
     public boolean turnOnSwitch(String entityId) {
-        return callService("switch", "turn_on", entityId);
+        return callService(DOMAIN_SWITCH, SERVICE_TURN_ON, entityId);
     }
 
     /** 关闭开关/插座 */
     public boolean turnOffSwitch(String entityId) {
-        return callService("switch", "turn_off", entityId);
+        return callService(DOMAIN_SWITCH, SERVICE_TURN_OFF, entityId);
     }
 
     // ========== 系统状态 ==========
@@ -197,7 +200,7 @@ public class HomeAssistantClient {
     public boolean isConnected() {
         try {
             webClient.get()
-                    .uri("/api/")
+                    .uri(API_PREFIX)
                     .retrieve()
                     .bodyToMono(String.class)
                     .block();
@@ -211,7 +214,7 @@ public class HomeAssistantClient {
     public Map<String, Object> getConfig() {
         try {
             String response = webClient.get()
-                    .uri("/api/config")
+                    .uri(CONFIG)
                     .retrieve()
                     .bodyToMono(String.class)
                     .block();

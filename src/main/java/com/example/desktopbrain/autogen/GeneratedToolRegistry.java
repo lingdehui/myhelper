@@ -1,11 +1,17 @@
 package com.example.desktopbrain.autogen;
 
 import jakarta.annotation.PostConstruct;
+import org.springframework.ai.tool.ToolCallback;
+import org.springframework.ai.tool.method.MethodToolCallbackProvider;
+import org.springframework.context.ApplicationContext;
 import org.springframework.stereotype.Service;
 
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -13,20 +19,19 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * 生成工具注册中心：协调工具自生成的完整流程 + 管理已生成工具记录。
  *
- * <h3>核心流程（用户设计："工具缺失→自己写工具→提醒重启或动态加载"）</h3>
+ * <h3>核心流程（用户设计："工具缺失→自己写工具→即时生效"）</h3>
  * <ol>
  *   <li>ToolPlanner 报告 missingDescriptions（能力缺失）</li>
  *   <li>本中心调 {@link ToolGenerator} 让 AI 生成 .java 源码</li>
  *   <li>调 {@link ToolCompiler} 编译验证 + 持久化到 generated 目录</li>
- *   <li>编译成功 → TTS 提醒用户"已生成新工具，重启后生效"</li>
+ *   <li>编译成功 → 运行时编译到 target/generated-classes/ → URLClassLoader 动态加载 → 即时生效</li>
  *   <li>编译失败 → 带错误信息让 AI 重新生成（最多 2 次重试）</li>
  * </ol>
  *
  * <h3>加载策略</h3>
  * <ul>
- *   <li><b>默认（可靠）</b>：持久化到 src/main/java/.../generated/，重启后 Spring 自动扫描 @Component</li>
- *   <li><b>热加载（预留）</b>：用 URLClassLoader 运行时加载，但因 Spring AI ToolCallbackProvider
- *       是启动时扫描的，运行时注入复杂，暂不实现</li>
+ *   <li><b>即时加载</b>：编译到 target/generated-classes/，URLClassLoader 加载，MethodToolCallbackProvider 创建 ToolCallback</li>
+ *   <li><b>持久化</b>：同步写入 src/main/java/.../generated/，重启后 Maven 编译 + Spring 自动扫描</li>
  * </ul>
  *
  * <h3>防重复生成</h3>
@@ -38,9 +43,16 @@ public class GeneratedToolRegistry {
 
     private final ToolGenerator toolGenerator;
     private final ToolCompiler toolCompiler;
+    private final ApplicationContext applicationContext;
 
     /** 已生成工具记录：descriptionHash → 注册信息（防止重复生成） */
     private final Map<String, GeneratedToolInfo> generatedTools = new ConcurrentHashMap<>();
+
+    /** 动态加载的工具列表（运行时即时生效） */
+    private final List<ToolCallback> dynamicTools = Collections.synchronizedList(new ArrayList<>());
+
+    /** 用于动态加载的 ClassLoader（parent = 当前 ClassLoader） */
+    private URLClassLoader dynamicClassLoader;
 
     /** 生成结果记录 */
     public record GeneratedToolInfo(String className, String description, Path sourceFile, long timestamp) {}
@@ -54,9 +66,11 @@ public class GeneratedToolRegistry {
      */
     public record GenerationOutcome(boolean success, String message, String className) {}
 
-    public GeneratedToolRegistry(ToolGenerator toolGenerator, ToolCompiler toolCompiler) {
+    public GeneratedToolRegistry(ToolGenerator toolGenerator, ToolCompiler toolCompiler,
+                                   ApplicationContext applicationContext) {
         this.toolGenerator = toolGenerator;
         this.toolCompiler = toolCompiler;
+        this.applicationContext = applicationContext;
     }
 
     /**
@@ -84,7 +98,7 @@ public class GeneratedToolRegistry {
                         new GeneratedToolInfo(className, desc != null ? desc : className, f, 0));
             }
             if (!files.isEmpty()) {
-                System.out.println("🔧 已加载 " + files.size() + " 个生成工具: "
+                System.out.println("🔧 已加载 " + files.size() + " 个生成工具记录: "
                         + generatedTools.values().stream().map(GeneratedToolInfo::className).toList());
             }
         } catch (Exception e) {
@@ -93,10 +107,33 @@ public class GeneratedToolRegistry {
     }
 
     /**
-     * 生成并持久化新工具（带重试）。
+     * 获取所有动态加载的工具（供 DesktopBrainApplication 合并到工具列表）。
+     */
+    public ToolCallback[] getDynamicTools() {
+        return dynamicTools.toArray(new ToolCallback[0]);
+    }
+
+    /**
+     * 初始化动态 ClassLoader（需在 target/classes 就绪后调用）。
+     */
+    public void initDynamicClassLoader() {
+        try {
+            Path classDir = Path.of(ToolCompiler.GENERATED_CLASSES_DIR);
+            if (!Files.exists(classDir)) Files.createDirectories(classDir);
+            this.dynamicClassLoader = new URLClassLoader(
+                    new URL[]{classDir.toUri().toURL()},
+                    getClass().getClassLoader()
+            );
+            System.out.println("⚡ 动态 ClassLoader 就绪 (" + classDir + ")");
+        } catch (Exception e) {
+            System.err.println("⚠️ 初始化动态 ClassLoader 失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 生成并持久化新工具（带重试 + 运行时动态加载）。
      *
-     * <p>流程：AI 生成源码 → 编译验证 → 持久化。
-     * 编译失败时带错误信息让 AI 重试，最多 {@code maxRetries} 次。</p>
+     * <p>流程：AI 生成源码 → 编译验证 → 持久化 → 运行时编译 → 动态加载 → 即时生效。</p>
      *
      * @param description 工具功能描述（来自 missingDescriptions）
      * @param maxRetries 编译失败时最大重试次数（默认 2）
@@ -106,7 +143,7 @@ public class GeneratedToolRegistry {
         String hash = hashDescription(description);
         GeneratedToolInfo existing = generatedTools.get(hash);
         if (existing != null) {
-            String msg = "工具已存在（" + existing.className() + "），如需重新生成请先删除";
+            String msg = "工具已存在（" + existing.className() + "），跳过重复生成";
             System.out.println("ℹ️ " + msg);
             return new GenerationOutcome(true, msg, existing.className());
         }
@@ -130,8 +167,12 @@ public class GeneratedToolRegistry {
                 generatedTools.put(hash, new GeneratedToolInfo(
                         generated.className(), description, result.sourceFile(),
                         System.currentTimeMillis()));
+
+                // ===== 运行时动态加载（即时生效，无需重启）=====
+                boolean runtimeLoaded = loadAtRuntime(generated.sourceCode(), generated.className());
+
                 String msg = "已生成新工具 " + generated.className()
-                        + "，重启应用后生效（已写入 " + result.sourceFile() + "）";
+                        + (runtimeLoaded ? "（已即时生效）" : "（重启后生效）");
                 System.out.println("✅ " + msg);
                 return new GenerationOutcome(true, msg, generated.className());
             }
@@ -143,6 +184,67 @@ public class GeneratedToolRegistry {
         }
 
         return new GenerationOutcome(false, "工具生成失败（编译错误，重试 " + maxRetries + " 次仍未通过）", null);
+    }
+
+    // ===== 运行时动态加载 =====
+
+    /**
+     * 运行时编译 + 类加载 + 创建 ToolCallback。
+     *
+     * @return true = 即时生效成功；false = 降级到重启后生效
+     */
+    private boolean loadAtRuntime(String sourceCode, String className) {
+        try {
+            // 1. 运行时编译到 target/generated-classes/
+            Path classDir = toolCompiler.compileForRuntime(sourceCode, className);
+            if (classDir == null) return false;
+
+            // 2. URLClassLoader 加载类
+            if (dynamicClassLoader == null) initDynamicClassLoader();
+            if (dynamicClassLoader == null) return false;
+
+            Class<?> clazz;
+            try {
+                clazz = Class.forName(ToolCompiler.GENERATED_PACKAGE + "." + className,
+                        true, dynamicClassLoader);
+            } catch (ClassNotFoundException e) {
+                // 新 URLClassLoader 重新加载
+                dynamicClassLoader = new URLClassLoader(
+                        new URL[]{classDir.toUri().toURL()},
+                        getClass().getClassLoader()
+                );
+                clazz = Class.forName(ToolCompiler.GENERATED_PACKAGE + "." + className,
+                        true, dynamicClassLoader);
+            }
+
+            // 3. 尝试实例化
+            // 优先无参构造（简单工具），失败则尝试注入 Spring Bean（持久化工具）
+            Object instance;
+            try {
+                instance = clazz.getDeclaredConstructor().newInstance();
+            } catch (NoSuchMethodException e) {
+                // AI 按 prompt 生成了带构造注入的类 → 从 Spring context 获取 Bean
+                instance = applicationContext.getBean(clazz);
+            }
+
+            // 4. 用 MethodToolCallbackProvider 创建 ToolCallback
+            ToolCallback[] callbacks = MethodToolCallbackProvider.builder()
+                    .toolObjects(instance)
+                    .build()
+                    .getToolCallbacks();
+
+            // 5. 注册到动态工具列表
+            for (ToolCallback tc : callbacks) {
+                dynamicTools.add(tc);
+                System.out.println("  ⚡ 动态注册工具: " + tc.getToolDefinition().name());
+            }
+
+            System.out.println("⚡ 工具 " + className + " 已即时生效（" + callbacks.length + " 个方法）");
+            return true;
+        } catch (Exception e) {
+            System.err.println("⚠️ 运行时动态加载失败（降级为重启后生效）: " + e.getMessage());
+            return false;
+        }
     }
 
     /** 便捷重载：默认重试 2 次 */

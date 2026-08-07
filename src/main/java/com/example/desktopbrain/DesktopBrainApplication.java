@@ -1,25 +1,24 @@
 package com.example.desktopbrain;
 
-import com.example.desktopbrain.autogen.GeneratedToolRegistry;
+import com.example.desktopbrain.common.PromptLoader;
+import com.example.desktopbrain.config.DesktopBrainProperties;
 import com.example.desktopbrain.dialog.DialogStateMachine;
 import com.example.desktopbrain.dialog.SpeechAssembler;
-import com.example.desktopbrain.memory.vector.episode.Episode;
-import com.example.desktopbrain.memory.vector.episode.PlanExecutor;
-import com.example.desktopbrain.memory.vector.episode.PlanMatcher;
-import com.example.desktopbrain.memory.vector.episode.ReflectService;
-import com.example.desktopbrain.memory.vector.episode.ToolCallLog;
+import com.example.desktopbrain.exploration.ExplorationTool;
 import com.example.desktopbrain.service.AudioRecorder;
 import com.example.desktopbrain.service.CapabilityService;
 import com.example.desktopbrain.service.FriendMatcher;
+import com.example.desktopbrain.service.FailurePatternTool;
 import com.example.desktopbrain.service.LocalASR;
-import com.example.desktopbrain.service.LoggingToolCallback;
 import com.example.desktopbrain.service.SkillConfig;
-import com.example.desktopbrain.service.ToolPlanner;
+import com.example.desktopbrain.service.ToolSearchService;
 import com.example.desktopbrain.service.TtsService;
+import com.example.desktopbrain.service.TurnProcessor;
 import com.example.desktopbrain.service.VadService;
 import com.example.desktopbrain.service.VoiceprintService;
 import com.example.desktopbrain.integration.HaToolService;
 import com.example.desktopbrain.util.NativeLoader;
+import com.k2fsa.sherpa.onnx.OnlineStream;
 import com.k2fsa.sherpa.onnx.SpeechSegment;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.tool.ToolCallback;
@@ -34,19 +33,15 @@ import org.springframework.context.annotation.ComponentScan;
 import javax.sound.sampled.*;
 import java.io.ByteArrayOutputStream;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 @SpringBootApplication
-@ComponentScan(basePackages = {"com.example.tools.windows", "com.example.desktopbrain", "com.example.desktopbrain.memory", "com.example.desktopbrain.integration"})
+@ComponentScan(basePackages = {"com.example.tools.windows", "com.example.desktopbrain", "com.example.desktopbrain.memory", "com.example.desktopbrain.integration", "com.example.desktopbrain.exploration"})
 public class DesktopBrainApplication {
 
-    // ========== 配置 ==========
-    private static final String WAKE_WORD = "那个谁";
-    private static final int SAMPLE_RATE = 16000;
-    private static final float ENERGY_THRESHOLD = 0.02f;
+    // ========== 配置（从 application.yml 注入） ==========
+    private volatile DesktopBrainProperties props;
 
     // ========== 状态 ==========
     private enum Mode { IDLE, VOICE_DIALOG }
@@ -56,17 +51,18 @@ public class DesktopBrainApplication {
     private volatile DialogStateMachine dialogStateMachine;
     private volatile SpeechAssembler speechAssembler;
 
-    // ========== AI 中断控制 ==========
-    private final AtomicLong aiTurnId = new AtomicLong(0);
-    private volatile long currentAiTurnId = -1;
-    private volatile int silenceCount = 0;
-    private volatile boolean lastWasFuzzyListening = false;  // 上次是否在模糊监听
-    private volatile ToolPlanner toolPlanner;
-    private volatile PlanMatcher planMatcher;
-    private volatile ReflectService reflectService;
-    private volatile PlanExecutor planExecutor;
+    // ========== AI Turn 处理器 ==========
+    private volatile TurnProcessor turnProcessor;
+
+    // ========== 服务（仅保留语音/声纹相关） ==========
     private volatile VoiceprintService voiceprintService;
-    private volatile GeneratedToolRegistry generatedToolRegistry;
+    private volatile boolean lastWasFuzzyListening = false;  // 上次是否在模糊监听
+
+    // ========== 工具管理 ==========
+    /** 静态工具（MCP + 本地 @Tool，启动时一次性注册） */
+    private volatile ToolCallback[] allTools;
+    /** 工具搜索服务（让 AI 在执行过程中搜工具） */
+    private volatile ToolSearchService toolSearchService;
 
     // ========== 补充信息 ==========
     private volatile String lastUserInput = "";        // 最近一次用户输入
@@ -75,6 +71,7 @@ public class DesktopBrainApplication {
     private volatile String pendingSupplement = null;    // 待确认的补充信息
     private volatile boolean awaitingSupplementConfirm = false; // 等待用户确认补充
     private volatile boolean enrollmentHinted = false;  // 是否已提示过注册声纹（只提示一次）
+    private volatile boolean followUpHintGiven = false;   // 跟随窗口内是否已提示
 
     // ========== 事件队列 ==========
     private final LinkedBlockingQueue<String> speechQueue = new LinkedBlockingQueue<>();
@@ -93,20 +90,23 @@ public class DesktopBrainApplication {
                                  TtsService ttsService,
                                  VadService vadService,
                                  SkillConfig skillConfig,
-                                 ToolPlanner toolPlanner,
-                                 PlanMatcher planMatcher,
-                                 ReflectService reflectService,
-                                 PlanExecutor planExecutor,
+                                 TurnProcessor turnProcessor,
                                  HaToolService haToolService,
                                  VoiceprintService voiceprintService,
-                                 GeneratedToolRegistry generatedToolRegistry,
                                  DialogStateMachine dialogStateMachine,
-                                 SpeechAssembler speechAssembler) {
+                                 SpeechAssembler speechAssembler,
+                                 ToolSearchService toolSearchService,
+                                 FailurePatternTool failurePatternTool,
+                                 ExplorationTool explorationTool,
+                                 DesktopBrainProperties props,
+                                 PromptLoader promptLoader) {
         return args -> {
+            this.props = props;
+
             // 合并 MCP 工具 + 本地工具
             int mcpCount = mcpTools.getToolCallbacks().length;
             ToolCallback[] localTools = MethodToolCallbackProvider.builder()
-                    .toolObjects(friendMatcher, capabilityService, haToolService)
+                    .toolObjects(friendMatcher, capabilityService, haToolService, toolSearchService, failurePatternTool, explorationTool)
                     .build()
                     .getToolCallbacks();
             int localCount = localTools.length;
@@ -115,41 +115,41 @@ public class DesktopBrainApplication {
                     Arrays.stream(localTools)
             ).toArray(ToolCallback[]::new);
 
-            this.toolPlanner = toolPlanner;
-            this.planMatcher = planMatcher;
-            this.reflectService = reflectService;
-            this.planExecutor = planExecutor;
+            this.turnProcessor = turnProcessor;
             this.voiceprintService = voiceprintService;
-            this.generatedToolRegistry = generatedToolRegistry;
+            this.toolSearchService = toolSearchService;
             this.dialogStateMachine = dialogStateMachine;
             this.speechAssembler = speechAssembler;
 
+            // 存储静态工具 + 初始化动态 ClassLoader
+            this.allTools = allToolCallbacks;
+            turnProcessor.initToolSearch(allToolCallbacks);
+            turnProcessor.initDynamicClassLoader();
+
             ChatClient chatClient = chatClientBuilder
-                    .defaultSystem("""
-                            你是一个 Windows 桌面助手，能够通过工具控制鼠标、键盘、窗口和屏幕。
-                            你需要将用户的自然语言指令转换为具体的工具调用。
-                            如果用户的要求不明确，请向用户提问澄清。
-                            重要规则：
-                            - 每次工具调用尽量一步到位，不要反复确认
-                            - 工具调用失败时最多重试1次，不要反复重试
-                            - 每步操作后等待界面响应即可，不需要额外验证
-                            - 当用户问"你有什么技能"/"你能做什么"/"技能列表"时：
-                              1. 调用 listLocalSkills 获取本地技能
-                              2. 结合你已有的 MCP 工具（GUI操控、截图、OCR、键盘鼠标等），
-                                 汇总列出所有能力，格式为"本地技能：...\nMCP工具：..."
-                            """)
+                    .defaultSystem(promptLoader.getDefaultSystem())
                     .build();
 
             System.out.println("🤖 桌面助手已启动（贾维斯模式）");
             System.out.println("💡 文字输入：直接对话，回复有语音播报");
-            System.out.println("💡 语音唤醒：说 '" + WAKE_WORD + "' 进入语音对话");
+            System.out.println("💡 语音唤醒：说 '" + props.voice().wakeWord() + "' 进入语音对话");
             System.out.println("💡 语音模式：说 '停' 中断，说 '退出' 结束");
             System.out.println("📊 技能数: " + skillConfig.getSkillNames().size() + " 个");
-            System.out.println("🔧 工具数: MCP " + mcpCount + " + 本地 " + localCount + " = " + allToolCallbacks.length + " 个");
+            System.out.println("🔧 工具数: MCP " + mcpCount + " + 本地 " + localCount + " = " + getMergedTools().length + " 个");
+
+            // JVM 退出时主动释放 sherpa-onnx native 资源，避免 EXCEPTION_ACCESS_VIOLATION
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                System.out.println("🧹 释放 sherpa-onnx 资源...");
+                try { localASR.shutdown(); } catch (Exception ignored) {}
+                try { ttsService.destroy(); } catch (Exception ignored) {}
+                try { vadService.destroy(); } catch (Exception ignored) {}
+                try { voiceprintService.release(); } catch (Exception ignored) {}
+                System.out.println("✅ sherpa-onnx 资源已释放");
+            }, "sherpa-shutdown"));
 
             // 异步同步工具分类到 Qdrant（启动时 AI 扫描所有工具自动分组归类）
             Thread categorySyncThread = new Thread(() -> {
-                int catCount = toolPlanner.syncCategories(allToolCallbacks);
+                int catCount = turnProcessor.syncCategories(getMergedTools());
                 if (catCount > 0) System.out.println("📁 工具分类已同步: " + catCount + " 类");
             }, "category-sync");
             categorySyncThread.setDaemon(true);
@@ -161,7 +161,7 @@ public class DesktopBrainApplication {
             recorderThread.start();
 
             // 启动语音事件处理线程
-            Thread handlerThread = new Thread(() -> handleSpeechEvents(chatClient, allToolCallbacks, ttsService, skillConfig, vadService), "speech-handler");
+            Thread handlerThread = new Thread(() -> handleSpeechEvents(chatClient, getMergedTools(), ttsService, skillConfig, vadService), "speech-handler");
             handlerThread.setDaemon(true);
             handlerThread.start();
 
@@ -170,6 +170,7 @@ public class DesktopBrainApplication {
                 while (true) {
                     System.out.print("\n> ");
                     String userInput = scanner.nextLine();
+                    dialogStateMachine.touch();  // 标记交互时间
                     if ("exit".equalsIgnoreCase(userInput.trim())) {
                         break;
                     }
@@ -181,7 +182,8 @@ public class DesktopBrainApplication {
                             String text = localASR.recognizeOnline(audio.samples(), audio.sampleRate());
                             System.out.println("📝 识别结果: " + text);
                             if (text != null && !text.isEmpty() && !text.startsWith("(")) {
-                                processAITurn(chatClient, allToolCallbacks, text, ttsService, skillConfig);
+                                ToolCallback[] mergedTools = getMergedTools();
+                                turnProcessor.process(chatClient, allTools, text, ttsService);
                             }
                         } catch (Exception e) {
                             System.err.println("❌ 录音或识别失败: " + e.getMessage());
@@ -190,7 +192,8 @@ public class DesktopBrainApplication {
                     }
 
                     // 文字对话
-                    processAITurn(chatClient, allToolCallbacks, userInput, ttsService, skillConfig);
+                    ToolCallback[] mergedTools = getMergedTools();
+                    turnProcessor.process(chatClient, allTools, userInput, ttsService);
                 }
             }
         };
@@ -200,7 +203,7 @@ public class DesktopBrainApplication {
     private void startBackgroundRecording(LocalASR localASR, VadService vadService, TtsService ttsService) {
         TargetDataLine line = null;
         try {
-            AudioFormat format = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
+            AudioFormat format = new AudioFormat(props.voice().sampleRate(), 16, 1, true, false);
             DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
             line = (TargetDataLine) AudioSystem.getLine(info);
             line.open(format, 16000);
@@ -212,9 +215,13 @@ public class DesktopBrainApplication {
             long silenceStart = 0, speechStart = 0;
             boolean isSpeaking = false;
             final boolean useVad = vadService.isAvailable();
-            float[] trailBuf = new float[SAMPLE_RATE / 5];
+            float[] trailBuf = new float[props.voice().sampleRate() / 5];
             int trailPos = 0;
             long ttsEchoUntil = 0;
+
+            // 流式 ASR：IDLE 模式的持续识别流（用于快速唤醒词检测）
+            OnlineStream idleStream = null;
+            long idleStreamCreated = 0;
 
             if (!useVad) System.out.println("ℹ️ VAD 未就绪，使用能量检测回退");
 
@@ -229,7 +236,7 @@ public class DesktopBrainApplication {
 
                 if (ttsService.isPlaying()) {
                     // TTS 播放中仍保持录音（用于自然打断检测），但清空 VAD 以过滤 TTS 回声
-                    ttsEchoUntil = System.currentTimeMillis() + 300;
+                    ttsEchoUntil = System.currentTimeMillis() + props.voice().ttsEchoDrainMs();
                     if (useVad) vadService.clear();
                     else { isSpeaking = false; energyBuf.reset(); silenceStart = 0; }
                     wasSpeaking = false;
@@ -250,13 +257,37 @@ public class DesktopBrainApplication {
                     trailPos = (trailPos + 1) % trailBuf.length;
                 }
 
+                // ===== 流式唤醒词检测（IDLE 模式，边进边识别）=====
+                if (mode == Mode.IDLE && useVad) {
+                    if (idleStream == null) {
+                        idleStream = localASR.createStream();
+                        idleStreamCreated = System.currentTimeMillis();
+                    }
+                    String partial = localASR.feedStream(idleStream, samples, props.voice().sampleRate(), false);
+                    if (partial.contains(props.voice().wakeWord())) {
+                        System.out.println("\n🎤 流式识别: " + partial + " → 唤醒！");
+                        speechQueue.offer(props.voice().wakeWord());
+                        idleStream.release();
+                        idleStream = null;
+                    }
+                    // 每 3 秒重建 stream 防止上下文累积
+                    if (System.currentTimeMillis() - idleStreamCreated > 3000) {
+                        idleStream.release();
+                        idleStream = null;
+                    }
+                } else if (mode != Mode.IDLE && idleStream != null) {
+                    // 进入语音对话后释放空闲流
+                    idleStream.release();
+                    idleStream = null;
+                }
+
                 if (useVad) {
                     vadService.acceptWaveform(samples);
                     while (vadService.hasSegment()) {
                         SpeechSegment seg = vadService.nextSegment();
                         float[] speech = seg.getSamples();
-                        if (speech.length > SAMPLE_RATE * 0.25f) {
-                            if (calcEnergyFallback(speech) < ENERGY_THRESHOLD) continue;
+                        if (speech.length > props.voice().sampleRate() * 0.25f) {
+                            if (calcEnergyFallback(speech) < (float) props.voice().energyThreshold()) continue;
                             float[] withTrail = new float[speech.length + trailBuf.length];
                             System.arraycopy(speech, 0, withTrail, 0, speech.length);
                             for (int j = 0; j < trailBuf.length; j++) {
@@ -266,15 +297,15 @@ public class DesktopBrainApplication {
                             // 声纹验证（在 ASR 之前用原始音频）
                             String speaker = null;
                             if (voiceprintService.isAvailable() && voiceprintService.listSpeakers().length > 0) {
-                                speaker = voiceprintService.search(withTrail, SAMPLE_RATE);
+                                speaker = voiceprintService.search(withTrail, props.voice().sampleRate());
                                 currentSpeaker = speaker;
                             }
 
                             String text;
                             if (mode == Mode.VOICE_DIALOG && localASR.isOfflineAvailable()) {
-                                text = localASR.recognizeOffline(withTrail, SAMPLE_RATE);
+                                text = localASR.recognizeOffline(withTrail, props.voice().sampleRate());
                             } else {
-                                text = localASR.recognizeOnline(withTrail, SAMPLE_RATE);
+                                text = localASR.recognizeOnline(withTrail, props.voice().sampleRate());
                             }
                             if (text != null && !text.isEmpty() && !text.startsWith("(")) {
                                 // 送入拼接器：在 debounce 窗口内合并多段语音为完整句子
@@ -293,40 +324,48 @@ public class DesktopBrainApplication {
                     boolean nowSpeaking = vadService.isSpeech();
                     if (nowSpeaking && !wasSpeaking) {
                         System.out.print("\r🎤 正在听... ");
-                        playBeep(800, 80);
+                        playBeep(props.voice().beep().frequency(), 80);
                     }
                     wasSpeaking = nowSpeaking;
+                    // 周期性 flush SpeechAssembler：确保超时句子不会卡住（没有后续语音时也能交付）
+                    if (!turnProcessor.isActive() && speechAssembler.hasPending()) {
+                        String complete = speechAssembler.getFullSentence();
+                        if (complete != null && !complete.isEmpty()) {
+                            System.out.println("\n🎤 " + (currentSpeaker != null ? "[" + currentSpeaker + "]" : "") + ": " + complete);
+                            speechQueue.offer(complete);
+                        }
+                    }
                 } else {
                     float energy = calcEnergyFallback(samples);
                     if (!isSpeaking) {
-                        if (energy > ENERGY_THRESHOLD) {
+                        if (energy > (float) props.voice().energyThreshold()) {
                             isSpeaking = true;
                             speechStart = System.currentTimeMillis();
                             silenceStart = 0;
                             energyBuf.reset();
                             System.out.print("\r🎤 正在听... ");
-                            playBeep(800, 80);
+                            playBeep(props.voice().beep().frequency(), 80);
                         }
                     } else {
                         energyBuf.write(buffer, 0, count);
-                        if (energy < ENERGY_THRESHOLD) {
+                        if (energy < (float) props.voice().energyThreshold()) {
                             if (silenceStart == 0) silenceStart = System.currentTimeMillis();
-                            if (System.currentTimeMillis() - silenceStart > 2000) {
-                                if (System.currentTimeMillis() - speechStart > 400) {
+                            if (System.currentTimeMillis() - silenceStart > props.voice().silenceTimeoutMs()) {
+                                if (System.currentTimeMillis() - speechStart > props.voice().minSpeechDurationMs()) {
                                     float[] energySamples = pcmToFloat(energyBuf.toByteArray());
 
                                     // 声纹验证
                                     String speaker = null;
                                     if (voiceprintService.isAvailable() && voiceprintService.listSpeakers().length > 0) {
-                                        speaker = voiceprintService.search(energySamples, SAMPLE_RATE);
+                                        speaker = voiceprintService.search(energySamples, props.voice().sampleRate());
                                         currentSpeaker = speaker;
                                     }
 
                                     String text;
                                     if (mode == Mode.VOICE_DIALOG && localASR.isOfflineAvailable()) {
-                                        text = localASR.recognizeOffline(energySamples, SAMPLE_RATE);
+                                        text = localASR.recognizeOffline(energySamples, props.voice().sampleRate());
                                     } else {
-                                        text = localASR.recognizeOnline(energySamples, SAMPLE_RATE);
+                                        text = localASR.recognizeOnline(energySamples, props.voice().sampleRate());
                                     }
                                     if (text != null && !text.isEmpty() && !text.startsWith("(")) {
                                         // 送入拼接器
@@ -337,7 +376,7 @@ public class DesktopBrainApplication {
                                 silenceStart = 0;
                             }
                         } else { silenceStart = 0; }
-                        if (System.currentTimeMillis() - speechStart > 10000) {
+                        if (System.currentTimeMillis() - speechStart > props.voice().maxSpeechDurationMs()) {
                             isSpeaking = false; silenceStart = 0; energyBuf.reset();
                         }
                     }
@@ -356,14 +395,17 @@ public class DesktopBrainApplication {
             System.err.println("❌ 录音线程异常: " + e.getMessage());
         } finally {
             if (line != null) {
-                try { line.stop(); line.close(); } catch (Exception ignored) {}
+                try { line.stop(); line.close(); } catch (Exception ex) {
+                    System.err.println("⚠️ 音频设备关闭异常: " + ex.getMessage());
+                }
             }
         }
     }
 
     // ========== 语音事件处理线程（基于 DialogStateMachine + SpeechAssembler） ==========
     private void handleSpeechEvents(ChatClient chatClient, ToolCallback[] tools, TtsService ttsService, SkillConfig skillConfig, VadService vadService) {
-        // 检查声纹状态
+        // 守卫：服务未初始化完成时静默跳过（启动时序保护）
+        if (voiceprintService == null || speechAssembler == null) return;
         boolean voiceprintAvailable = voiceprintService.isAvailable();
         boolean hasVoiceprints = voiceprintAvailable && voiceprintService.listSpeakers().length > 0;
 
@@ -378,8 +420,13 @@ public class DesktopBrainApplication {
 
         while (!Thread.currentThread().isInterrupted()) {
             try {
-                String text = speechQueue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                String text = speechQueue.poll(props.voice().eventPollIntervalMs(), java.util.concurrent.TimeUnit.MILLISECONDS);
                 DialogStateMachine.State state = dialogStateMachine.getState();
+
+                // 有语音输入 → 标记交互时间
+                if (text != null && !text.isEmpty()) {
+                    dialogStateMachine.touch();
+                }
 
                 // ========== IDLE 状态：模糊监听，只检测唤醒词 ==========
                 if (state == DialogStateMachine.State.IDLE) {
@@ -392,14 +439,12 @@ public class DesktopBrainApplication {
                         continue;
                     }
                     lastWasFuzzyListening = false;  // 检测到语音，重置状态
-                    if (text.contains(WAKE_WORD)) {
+                    if (text.contains(props.voice().wakeWord())) {
                         dialogStateMachine.transitionTo(DialogStateMachine.State.LISTENING);
                         mode = Mode.VOICE_DIALOG;
-                        silenceCount = 0;
+                        turnProcessor.resetSilenceCount();
                         System.out.println("\n✨ 已唤醒！进入语音对话模式");
                         ttsService.speakAsync("我在");
-
-                        // 未注册时只提示一次
                         if (voiceprintAvailable && !hasVoiceprints && !enrollmentHinted) {
                             enrollmentHinted = true;
                             System.out.println("💡 （可选）说 '注册声纹' 可设置专属声纹，不注册也能正常使用");
@@ -411,30 +456,42 @@ public class DesktopBrainApplication {
                 // ========== 非 IDLE 状态：精确监听 ==========
                 if (text == null) {
                     if (ttsService.isPlaying()) {
-                        // TTS 播放中：保持 LISTENING，等待自然打断或播放完毕
-                        silenceCount = 0;
+                        turnProcessor.resetSilenceCount();
+                        followUpHintGiven = false;
                     } else if (vadService.isAvailable() && vadService.isSpeech()) {
-                        silenceCount = 0;
+                        turnProcessor.resetSilenceCount();
+                        followUpHintGiven = false;
                     } else {
-                        silenceCount++;
-                        // AI 没在跑 + 5 秒无语音 → 回到 IDLE
-                        if (currentAiTurnId == -1 && silenceCount >= 10
-                                && dialogStateMachine.getState() == DialogStateMachine.State.LISTENING) {
-                            dialogStateMachine.transitionTo(DialogStateMachine.State.IDLE);
-                            mode = Mode.IDLE;
-                            silenceCount = 0;
-                            System.out.println("\n⏰ 5 秒无语音，回到待命");
-                            ttsService.speakAsync("已回到待命模式");
+                        turnProcessor.incrementSilenceCount();
+                        int hintThreshold = props.dialog().followUpSilenceHintMs() / props.voice().eventPollIntervalMs();
+                        int timeoutThreshold = props.dialog().followUpWindowMs() / props.voice().eventPollIntervalMs();
+                        int sc = turnProcessor.getSilenceCount();
+                        if (!turnProcessor.isActive() && dialogStateMachine.getState() == DialogStateMachine.State.LISTENING) {
+                            if (!followUpHintGiven && sc >= hintThreshold && sc < timeoutThreshold) {
+                                followUpHintGiven = true;
+                                playBeep(props.voice().beep().frequency(), props.voice().beep().amplitude());
+                                if (sc >= hintThreshold + 2) {
+                                    System.out.println("\n💬 跟随对话中...（无需重新唤醒）");
+                                }
+                            }
+                            if (sc >= timeoutThreshold) {
+                                dialogStateMachine.transitionTo(DialogStateMachine.State.IDLE);
+                                mode = Mode.IDLE;
+                                turnProcessor.resetSilenceCount();
+                                followUpHintGiven = false;
+                                System.out.println("\n⏰ " + (props.dialog().followUpWindowMs() / 1000) + " 秒无语音，回到待命");
+                                ttsService.speakAsync("已回到待命模式");
+                            }
                         }
                     }
                     continue;
                 }
 
-                silenceCount = 0;
+                turnProcessor.resetSilenceCount();
+                followUpHintGiven = false;
 
                 // ========== SPEAKING / PROCESSING 状态：自然打断 ==========
                 if (state == DialogStateMachine.State.SPEAKING || state == DialogStateMachine.State.PROCESSING) {
-                    // 声纹检查（已注册时只响应本人声音）
                     if (voiceprintAvailable && hasVoiceprints && currentSpeaker == null) {
                         System.out.println("\n🔇 声纹不匹配，忽略打断");
                         continue;
@@ -442,10 +499,9 @@ public class DesktopBrainApplication {
 
                     System.out.println("\n⚡ 自然打断！");
                     dialogStateMachine.transitionTo(DialogStateMachine.State.INTERRUPTED);
-                    interruptCurrentAi();
+                    turnProcessor.interruptCurrentTurn();
                     ttsService.stop();
                     playBeep(400, 80);
-                    // 打断后的内容作为新指令处理（继续往下走）
                 }
 
                 // ---- 声纹标注 ----
@@ -458,21 +514,21 @@ public class DesktopBrainApplication {
                 playBeep(600, 50);
 
                 // ---- 指令处理 ----
-                if (text.contains("退出") || text.contains("再见") || text.contains("结束对话")) {
+                if (containsKeyword(text, props.dialog().exitKeywords())) {
                     dialogStateMachine.transitionTo(DialogStateMachine.State.IDLE);
                     mode = Mode.IDLE;
-                    interruptCurrentAi();
+                    turnProcessor.interruptCurrentTurn();
                     ttsService.stop();
                     System.out.println("👋 对话结束，回到待命");
                     ttsService.speakAsync("再见");
                     continue;
                 }
 
-                if (text.contains("停") || text.contains("打断") || text.contains("取消")) {
-                    interruptCurrentAi();
+                if (containsKeyword(text, props.dialog().interruptKeywords())) {
+                    turnProcessor.interruptCurrentTurn();
                     ttsService.stop();
                     System.out.println("🛑 已中断，请继续说");
-                    silenceCount = 0;
+                    turnProcessor.resetSilenceCount();
                     continue;
                 }
 
@@ -489,8 +545,8 @@ public class DesktopBrainApplication {
                         String supplement = pendingSupplement;
                         pendingSupplement = null;
 
-                        long interruptedId = currentAiTurnId;
-                        interruptCurrentAi();
+                        long interruptedId = turnProcessor.getCurrentTurnId();
+                        turnProcessor.interruptCurrentTurn();
 
                         String combinedInput = lastUserInput + "\n\n--- 补充信息 ---\n" + supplement;
                         System.out.println("🔄 确认补充，中断 AI (turn=" + interruptedId + ")，带补充信息重新执行...");
@@ -498,7 +554,7 @@ public class DesktopBrainApplication {
                         System.out.println("  补充: " + supplement);
 
                         dialogStateMachine.transitionTo(DialogStateMachine.State.PROCESSING);
-                        Thread worker = new Thread(() -> processAITurn(chatClient, tools, combinedInput, ttsService, skillConfig), "ai-worker-supplement");
+                        Thread worker = new Thread(() -> turnProcessor.process(chatClient, allTools, combinedInput, ttsService), "ai-worker-supplement");
                         worker.setDaemon(true);
                         worker.start();
                     } else if (isRejectKeyword(text)) {
@@ -512,7 +568,7 @@ public class DesktopBrainApplication {
                         System.out.println("↩️ 用户说了其他内容，作为新请求处理");
                         lastUserInput = text;
                         dialogStateMachine.transitionTo(DialogStateMachine.State.PROCESSING);
-                        Thread worker = new Thread(() -> processAITurn(chatClient, tools, text, ttsService, skillConfig), "ai-worker");
+                        Thread worker = new Thread(() -> turnProcessor.process(chatClient, allTools, text, ttsService), "ai-worker");
                         worker.setDaemon(true);
                         worker.start();
                     }
@@ -520,7 +576,7 @@ public class DesktopBrainApplication {
                 }
 
                 // ---- AI 执行中：补充信息判断 ----
-                if (currentAiTurnId != -1 && !dialogStateMachine.canInterrupt()) {
+                if (turnProcessor.isActive() && !dialogStateMachine.canInterrupt()) {
                     handleSupplement(chatClient, tools, text, ttsService, skillConfig);
                     continue;
                 }
@@ -530,11 +586,8 @@ public class DesktopBrainApplication {
                 dialogStateMachine.transitionTo(DialogStateMachine.State.PROCESSING);
                 Thread worker = new Thread(() -> {
                     try {
-                        processAITurn(chatClient, tools, text, ttsService, skillConfig);
-                        // AI 处理完进入 SPEAKING（TTS），再回到 LISTENING
+                        turnProcessor.process(chatClient, allTools, text, ttsService);
                         dialogStateMachine.transitionTo(DialogStateMachine.State.SPEAKING);
-                        // 等 TTS 播完：isPlaying() 是 volatile 状态，播完必归位；
-                        // 用户打断时事件线程会调 ttsService.stop()，playAudio 检测 stopFlag 立即退出
                         while (ttsService.isPlaying()) {
                             Thread.sleep(200);
                         }
@@ -584,21 +637,20 @@ public class DesktopBrainApplication {
     }
 
     // ========== 确认/拒绝关键词 ==========
-    private boolean isConfirmKeyword(String text) {
+    private boolean containsKeyword(String text, List<String> keywords) {
         String lower = text.toLowerCase();
-        return lower.contains("对") || lower.contains("是") || lower.contains("确认")
-                || lower.contains("好的") || lower.contains("可以") || lower.contains("加")
-                || lower.contains("用") || lower.contains("继续") || lower.contains("加上")
-                || lower.contains("整")|| lower.contains("行")|| lower.contains("可以")
-                || lower.contains("ok");
+        for (String kw : keywords) {
+            if (lower.contains(kw.toLowerCase())) return true;
+        }
+        return false;
+    }
+
+    private boolean isConfirmKeyword(String text) {
+        return containsKeyword(text, props.dialog().confirmKeywords());
     }
 
     private boolean isRejectKeyword(String text) {
-        String lower = text.toLowerCase();
-        return lower.contains("不对") || lower.contains("不是") || lower.contains("不要")
-                || lower.contains("忽略") || lower.contains("算了") || lower.contains("不用")
-                || lower.contains("取消") || lower.contains("不整") || lower.contains("no")
-                || lower.contains("不行");
+        return containsKeyword(text, props.dialog().rejectKeywords());
     }
 
     /**
@@ -613,8 +665,7 @@ public class DesktopBrainApplication {
 
         // 规则2: 检测补充/转折关键词
         String lower = newInput.toLowerCase();
-        String[] supplementKeywords = {"补充", "对了", "还有", "顺便", "另外", "忘了", "那个",
-                "不对", "更正", "改一下", "等一下", "等会", "哦", "嗯"};
+        String[] supplementKeywords = props.dialog().supplementKeywords().toArray(new String[0]);
         for (String kw : supplementKeywords) {
             if (lower.contains(kw)) return true;
         }
@@ -631,7 +682,7 @@ public class DesktopBrainApplication {
         double ratio = (double) overlap / Math.max(newWords.size(), 1);
 
         // 30% 以上关键词重叠认为相关
-        return ratio >= 0.3;
+        return ratio >= props.semantic().relatedRatioThreshold();
     }
 
     /**
@@ -690,7 +741,7 @@ public class DesktopBrainApplication {
             }
         }
 
-        boolean success = voiceprintService.finishEnrollment(name, SAMPLE_RATE);
+        boolean success = voiceprintService.finishEnrollment(name, props.voice().sampleRate());
         if (success) {
             System.out.println("✅ 声纹注册成功: " + name);
             ttsService.speakAsync("声纹注册成功");
@@ -700,335 +751,15 @@ public class DesktopBrainApplication {
         }
     }
 
-    // ========== 核心：AI 处理（完整 Phase 1 逻辑） ==========
-    private void processAITurn(ChatClient chatClient, ToolCallback[] tools, String userInput, TtsService ttsService, SkillConfig skillConfig) {
-        long myTurnId = aiTurnId.incrementAndGet();
-        currentAiTurnId = myTurnId;
-        silenceCount = 0;
-
-        System.out.println("🤖 思考中...");
-
-        String effectiveInput = userInput;
-        List<ToolCallLog> toolCallLogs = Collections.synchronizedList(new ArrayList<>());
-
-        // 1. 技能匹配
-        String skillInstructions = skillConfig.getInstructions(userInput);
-        if (!skillInstructions.isEmpty()) {
-            effectiveInput = skillInstructions + "\n用户请求：" + userInput;
-            System.out.println("📋 已注入技能: " + skillConfig.getMatchedSkillNames(userInput));
-        }
-
-        // 2. 工具规划（三层缓存）
-        ToolPlanner.PlanResult plan = toolPlanner.plan(userInput, tools);
-        // 工具缺失 → 异步触发生成新工具（不阻塞当前请求，生成完提醒重启）
-        if (!plan.missingDescriptions().isEmpty()) {
-            for (String desc : plan.missingDescriptions()) {
-                System.out.println("⚠️ 缺少工具: " + desc + "（尝试让 AI 自动生成）");
-                triggerToolGeneration(desc, ttsService);
-            }
-        }
-
-        // 3. 命中缓存 → 走缓存逻辑；未命中 → 新规划
-        if (plan.fromCache() && plan.episode() != null) {
-            handleCacheHit(chatClient, tools, effectiveInput, userInput, plan, toolCallLogs, myTurnId, ttsService);
-        } else {
-            handleNewPlan(chatClient, tools, effectiveInput, userInput, plan, toolCallLogs, myTurnId, ttsService);
-        }
-
-        // 记录最近的 AI 回复（用于补充信息判断）
-        lastAiResponse = "处理完成";  // 简化：实际应获取完整 AI 回复
-
-        if (currentAiTurnId == myTurnId) {
-            currentAiTurnId = -1;
-            silenceCount = 0;
-        }
-    }
+    // ========== 动态工具管理 ==========
 
     /**
-     * 异步触发生成新工具（用户设计："工具缺失→自己写工具→提醒重启"）。
-     *
-     * <p>不阻塞当前请求执行（当前请求用兜底工具继续跑），生成完成后 TTS 提醒用户重启生效。
-     * 生成流程：AI 生成源码 → 编译验证 → 持久化到 generated 目录（带编译错误重试）。</p>
+     * 获取合并后的完整工具列表（静态工具 + 运行时动态加载的工具）。
      */
-    private void triggerToolGeneration(String description, TtsService ttsService) {
-        CompletableFuture.runAsync(() -> {
-            try {
-                System.out.println("🔧 开始自动生成工具: " + description);
-                GeneratedToolRegistry.GenerationOutcome outcome =
-                        generatedToolRegistry.generateAndPersist(description);
-                if (outcome.success()) {
-                    String msg = "检测到缺失能力，已自动生成新工具" + outcome.className() + "，重启后生效";
-                    System.out.println("✅ " + msg);
-                    ttsService.speakAsync(msg);
-                } else {
-                    System.out.println("⚠️ 工具自动生成失败: " + outcome.message());
-                    ttsService.speakAsync("工具自动生成失败，" + outcome.message());
-                }
-            } catch (Exception e) {
-                System.err.println("❌ 工具生成异步任务异常: " + e.getMessage());
-            }
-        });
+    private synchronized ToolCallback[] getMergedTools() {
+        return turnProcessor.mergeTools(allTools);
     }
 
-    // ========== 缓存命中处理 ==========
-    private void handleCacheHit(ChatClient chatClient, ToolCallback[] tools,
-                                 String effectiveInput, String userInput,
-                                 ToolPlanner.PlanResult plan, List<ToolCallLog> toolCallLogs,
-                                 long myTurnId, TtsService ttsService) {
-        Episode episode = plan.episode();
-
-        // Step 1: AI 判断计划可用性 + 提取变量
-        PlanMatcher.MatchResult matchResult = planMatcher.match(userInput, episode);
-        if (!matchResult.applicable()) {
-            System.out.println("❌ 计划不适用（" + matchResult.reason() + "），降级为 AI 新规划");
-            handleNewPlan(chatClient, tools, effectiveInput, userInput,
-                    ToolPlanner.PlanResult.ofAIPlan(plan.selectedToolNames(), plan.missingDescriptions()),
-                    toolCallLogs, myTurnId, ttsService);
-            return;
-        }
-
-        Map<String, String> variables = matchResult.variables();
-        System.out.println("✅ 计划可用（变量: " + variables + "）");
-
-        // Step 2: 附加 lesson 到 prompt
-        String augmentedInput = effectiveInput;
-        if (episode.successLesson() != null && !episode.successLesson().isEmpty()) {
-            augmentedInput += "\n\n--- 历史成功经验 ---\n上次类似任务成功经验: " + episode.successLesson();
-        }
-        if (episode.failureLesson() != null && !episode.failureLesson().isEmpty()) {
-            augmentedInput += "\n\n--- 历史失败教训 ---\n注意避免: " + episode.failureLesson();
-        }
-
-        // Step 3: 判断是否可脚本化
-        if (episode.isScriptable()) {
-            System.out.println("🚀 计划稳定度高（可脚本化），跳过 AI 直接执行脚本");
-            PlanExecutor.ExecutionResult execResult = planExecutor.executeScript(episode, variables, tools);
-
-            if (execResult.success()) {
-                if (currentAiTurnId == myTurnId) {
-                    toolPlanner.onCacheHitSuccess(userInput, plan);
-                    String response = "已按脚本完成（" + execResult.executedSteps().size() + " 步）";
-                    System.out.println("🤖 " + response);
-                    ttsService.speakAsync(response);
-                }
-            } else {
-                // 脚本失败 → AI 归因
-                ReflectService.FailureAnalysis analysis = reflectService.reflectFailure(userInput, toolCallLogs, execResult.errorMessage());
-                System.out.println("🔍 脚本归因: " + (analysis.isPlanIssue() ? "计划问题" : "环境问题") +
-                        (analysis.lesson() != null ? "（" + analysis.lesson() + "）" : ""));
-
-                if (!analysis.isPlanIssue()) {
-                    // 环境问题 → 分段继续
-                    int fromStep = execResult.failedStepIndex() + 1;
-                    if (fromStep < episode.toolCalls().size()) {
-                        System.out.println("ℹ️ 脚本环境问题，从第 " + (fromStep + 1) + " 步继续执行");
-                        PlanExecutor.ExecutionResult continueResult = planExecutor.executeFromStep(episode, fromStep, variables, tools);
-                        if (continueResult.success()) {
-                            if (currentAiTurnId == myTurnId) {
-                                toolPlanner.onCacheHitSuccess(userInput, plan);
-                                int totalSteps = execResult.executedSteps().size() + continueResult.executedSteps().size();
-                                String response = "已从失败处继续完成（共 " + totalSteps + " 步）";
-                                System.out.println("🤖 " + response);
-                                ttsService.speakAsync(response);
-                            }
-                        } else {
-                            // 分段继续也失败 → 重新规划
-                            toolPlanner.onCacheHitFailure(userInput, plan, analysis.lesson(), analysis.isPlanIssue());
-                            handleCacheFailure(chatClient, tools, effectiveInput, userInput, plan,
-                                    toolCallLogs, myTurnId, ttsService, execResult.errorMessage());
-                        }
-                    } else {
-                        toolPlanner.onCacheHitFailure(userInput, plan, analysis.lesson(), analysis.isPlanIssue());
-                        handleCacheFailure(chatClient, tools, effectiveInput, userInput, plan,
-                                toolCallLogs, myTurnId, ttsService, execResult.errorMessage());
-                    }
-                } else {
-                    // 计划问题 → 重新规划
-                    toolPlanner.onCacheHitFailure(userInput, plan, analysis.lesson(), analysis.isPlanIssue());
-                    handleCacheFailure(chatClient, tools, effectiveInput, userInput, plan,
-                            toolCallLogs, myTurnId, ttsService, execResult.errorMessage());
-                }
-            }
-        } else {
-            // 非脚本化 → AI 带参考计划执行
-            try {
-                String response = executeWithTools(chatClient, augmentedInput, tools, plan, toolCallLogs);
-                if (currentAiTurnId == myTurnId) {
-                    System.out.println("🤖 " + response);
-                    toolPlanner.onCacheHitSuccess(userInput, plan);
-                    ttsService.speakAsync(response);
-                }
-            } catch (Exception e) {
-                if (currentAiTurnId == myTurnId) {
-                    ReflectService.FailureAnalysis analysis = reflectService.reflectFailure(userInput, toolCallLogs, e.getMessage());
-                    System.out.println("🔍 归因: " + (analysis.isPlanIssue() ? "计划问题" : "环境问题") +
-                            (analysis.lesson() != null ? "（" + analysis.lesson() + "）" : ""));
-                    toolPlanner.onCacheHitFailure(userInput, plan, analysis.lesson(), analysis.isPlanIssue());
-
-                    if (!analysis.isPlanIssue()) {
-                        // 环境问题 → 分段继续
-                        System.out.println("ℹ️ 环境问题导致失败，分段继续执行");
-                        String continuePrompt = buildContinuePrompt(userInput, e.getMessage(), analysis.lesson());
-                        toolCallLogs.clear();
-                        ToolPlanner.PlanResult fallbackPlan = toolPlanner.plan(userInput, tools);
-                        String response = executeWithTools(chatClient, continuePrompt, tools, fallbackPlan, toolCallLogs);
-                        if (currentAiTurnId == myTurnId) {
-                            System.out.println("🤖 " + response);
-                            toolPlanner.onCacheHitSuccess(userInput, plan);
-                            ttsService.speakAsync(response);
-                        }
-                    } else {
-                        // 计划问题 → 重新规划
-                        handleCacheFailure(chatClient, tools, effectiveInput, userInput, plan,
-                                toolCallLogs, myTurnId, ttsService, e.getMessage());
-                    }
-                }
-            }
-        }
-    }
-
-    // ========== 新规划处理（首次 + 降级） ==========
-    private void handleNewPlan(ChatClient chatClient, ToolCallback[] tools,
-                                String effectiveInput, String userInput,
-                                ToolPlanner.PlanResult plan, List<ToolCallLog> toolCallLogs,
-                                long myTurnId, TtsService ttsService) {
-        // 决策4：执行前创建 DRAFT
-        String draftId = toolPlanner.createDraftEpisode(userInput, plan);
-
-        try {
-            String response = executeWithTools(chatClient, effectiveInput, tools, plan, toolCallLogs);
-            if (currentAiTurnId == myTurnId) {
-                System.out.println("🤖 " + response);
-
-                // Reflect 成功
-                String successLesson = reflectService.reflectSuccess(userInput, toolCallLogs, response);
-                if (successLesson != null) {
-                    System.out.println("📝 成功经验: " + successLesson);
-                }
-
-                // DRAFT → ACTIVE
-                toolPlanner.activateDraftEpisode(draftId, toolCallLogs, response, successLesson);
-
-                // 写入内存缓存
-                toolPlanner.cacheToMemory(userInput, plan, draftId, toolCallLogs, response, successLesson);
-
-                ttsService.speakAsync(response);
-            }
-        } catch (Exception e) {
-            if (currentAiTurnId == myTurnId) {
-                // Reflect 失败 + 归因
-                ReflectService.FailureAnalysis analysis = reflectService.reflectFailure(userInput, toolCallLogs, e.getMessage());
-                System.out.println("🔍 失败归因: " + (analysis.isPlanIssue() ? "计划问题" : "环境问题") +
-                        (analysis.lesson() != null ? "（" + analysis.lesson() + "）" : ""));
-
-                // 决策4：失败也保存步骤
-                toolPlanner.failDraftEpisode(draftId, toolCallLogs, analysis.lesson(), -1);
-
-                System.out.println("❌ " + e.getMessage());
-
-                // 环境问题 → 分段继续
-                if (!analysis.isPlanIssue()) {
-                    System.out.println("ℹ️ 环境问题，尝试分段继续");
-                    String continuePrompt = buildContinuePrompt(userInput, e.getMessage(), analysis.lesson());
-                    toolCallLogs.clear();
-                    String response = executeWithTools(chatClient, continuePrompt, tools, plan, toolCallLogs);
-                    if (currentAiTurnId == myTurnId) {
-                        System.out.println("🤖 " + response);
-                        toolPlanner.activateDraftEpisode(draftId, toolCallLogs, response, null);
-                        toolPlanner.cacheToMemory(userInput, plan, draftId, toolCallLogs, response, null);
-                        ttsService.speakAsync(response);
-                    }
-                }
-                // 计划问题 → 已存为 FAILED，让用户知道
-            }
-        }
-    }
-
-    // ========== 缓存失败处理（重新规划） ==========
-    private void handleCacheFailure(ChatClient chatClient, ToolCallback[] tools,
-                                     String effectiveInput, String userInput,
-                                     ToolPlanner.PlanResult oldPlan, List<ToolCallLog> toolCallLogs,
-                                     long myTurnId, TtsService ttsService, String errorReason) {
-        try {
-            // 用失败原因重新规划
-            ToolPlanner.PlanResult newPlan = toolPlanner.replan(userInput, tools, errorReason);
-            newPlan.missingDescriptions().forEach(desc ->
-                    System.out.println("⚠️ 缺少工具: " + desc + "（可补写本地 @Tool）"));
-            System.out.println("📦 重新选用工具: " + newPlan.selectedToolNames().size() + "/" + tools.length);
-
-            // 创建新 draft
-            String newDraftId = toolPlanner.createDraftEpisode(userInput, newPlan);
-
-            String response = executeWithTools(chatClient, effectiveInput, tools, newPlan, toolCallLogs);
-            if (currentAiTurnId == myTurnId) {
-                System.out.println("🤖 " + response);
-
-                // 新计划成功 → Reflect + 存
-                String successLesson = reflectService.reflectSuccess(userInput, toolCallLogs, response);
-                toolPlanner.activateDraftEpisode(newDraftId, toolCallLogs, response, successLesson);
-                toolPlanner.cacheToMemory(userInput, newPlan, newDraftId, toolCallLogs, response, successLesson);
-
-                ttsService.speakAsync(response);
-            }
-        } catch (Exception retryEx) {
-            if (currentAiTurnId == myTurnId) {
-                System.out.println("❌ 重试失败: " + retryEx.getMessage());
-                ttsService.speakAsync("抱歉，我没做好这个任务");
-            }
-        }
-    }
-
-    // ========== AI 执行（过滤工具 + 收集日志） ==========
-    private String executeWithTools(ChatClient chatClient, String input,
-                                    ToolCallback[] allTools, ToolPlanner.PlanResult plan,
-                                    List<ToolCallLog> toolCallLogs) {
-        // 过滤出选中的工具
-        ToolCallback[] selectedTools = Arrays.stream(allTools)
-                .filter(tc -> plan.selectedToolNames().contains(tc.getToolDefinition().name()))
-                .toArray(ToolCallback[]::new);
-
-        // 包装为带日志的工具
-        ToolCallback[] loggedTools = Arrays.stream(selectedTools)
-                .map(tc -> new LoggingToolCallback(tc, toolCallLogs))
-                .toArray(ToolCallback[]::new);
-
-        System.out.println("📦 选用工具: " + selectedTools.length + "/" + allTools.length
-                + (plan.fromCache() ? " (缓存命中)" : ""));
-
-        try {
-            return chatClient.prompt()
-                    .user(input)
-                    .toolCallbacks(loggedTools)
-                    .call()
-                    .content();
-        } catch (Exception e) {
-            if (plan.fromCache()) {
-                throw new RuntimeException("🔄 缓存方案执行失败", e);
-            }
-            throw e;
-        }
-    }
-
-    // ========== 构建分段继续的 prompt ==========
-    private String buildContinuePrompt(String originalInput, String errorMsg, String failureLesson) {
-        StringBuilder sb = new StringBuilder(originalInput);
-        sb.append("\n\n--- 分段继续执行 ---\n");
-        sb.append("上次执行失败: ").append(errorMsg).append("\n");
-        if (failureLesson != null && !failureLesson.isEmpty()) {
-            sb.append("注意: ").append(failureLesson).append("\n");
-        }
-        sb.append("请继续完成上述任务，忽略已完成的步骤。");
-        return sb.toString();
-    }
-
-    // ========== 中断 ==========
-    private boolean interruptCurrentAi() {
-        if (currentAiTurnId != -1) {
-            currentAiTurnId = -1;
-            return true;
-        }
-        return false;
-    }
 
     // ========== 工具方法 ==========
     private void playBeep(int freqHz, int durationMs) {
@@ -1038,7 +769,7 @@ public class DesktopBrainApplication {
             byte[] buf = new byte[samples];
             for (int i = 0; i < samples; i++) {
                 double angle = 2.0 * Math.PI * freqHz * i / sampleRate;
-                buf[i] = (byte) (Math.sin(angle) * 80);
+                buf[i] = (byte) (Math.sin(angle) * (props != null ? props.voice().beep().amplitude() : 80));
             }
             AudioFormat fmt = new AudioFormat(sampleRate, 8, 1, true, false);
             try (Clip clip = AudioSystem.getClip()) {
@@ -1047,7 +778,9 @@ public class DesktopBrainApplication {
                 Thread.sleep(durationMs + 50);
                 clip.stop();
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            System.err.println("⚠️ 提示音播放失败: " + e.getMessage());
+        }
     }
 
     private float calcEnergyFallback(float[] samples) {

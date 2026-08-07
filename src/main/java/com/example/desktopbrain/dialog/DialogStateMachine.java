@@ -37,6 +37,7 @@ public class DialogStateMachine {
 
     private volatile State currentState = State.IDLE;
     private volatile long stateEnterTime = 0;
+    private volatile long lastInteractionTime = System.currentTimeMillis();
 
     /**
      * 转换到新状态
@@ -65,6 +66,16 @@ public class DialogStateMachine {
         return s == State.LISTENING
             || s == State.SPEAKING
             || s == State.INTERRUPTED;
+    }
+
+    /** 标记交互时间（每次收到用户输入时调用） */
+    public void touch() {
+        this.lastInteractionTime = System.currentTimeMillis();
+    }
+
+    /** 获取最后一次交互时间 */
+    public long getLastInteractionTime() {
+        return lastInteractionTime;
     }
 
     /**

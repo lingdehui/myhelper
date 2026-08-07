@@ -1,5 +1,8 @@
 package com.example.desktopbrain.memory.vector.episode;
 
+import com.example.desktopbrain.common.AiResponseUtils;
+import com.example.desktopbrain.common.PromptLoader;
+import com.example.desktopbrain.config.DesktopBrainProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
@@ -31,12 +34,18 @@ public class ReflectService {
 
     private final ChatClient chatClient;
     private final ObjectMapper objectMapper;
+    private final DesktopBrainProperties props;
+    private final PromptLoader promptLoader;
 
-    public ReflectService(ChatClient.Builder chatClientBuilder) {
+    public ReflectService(ChatClient.Builder chatClientBuilder,
+                           DesktopBrainProperties props,
+                           PromptLoader promptLoader) {
         this.chatClient = chatClientBuilder
                 .defaultSystem("你是经验反思总结器，用简洁的一句话总结任务执行的经验教训。")
                 .build();
         this.objectMapper = new ObjectMapper();
+        this.props = props;
+        this.promptLoader = promptLoader;
     }
 
     /**
@@ -46,6 +55,68 @@ public class ReflectService {
      * @param isPlanIssue 是否是计划逻辑问题（true=惩罚计划 / false=环境问题不惩罚）
      */
     public record FailureAnalysis(String lesson, boolean isPlanIssue) {}
+
+    /** 执行校验结果 */
+    public record VerificationResult(
+            boolean success,
+            String reason,
+            /** 校验失败时可独立复用的连续步骤索引链（如 [[0,1], [3]] 表示第0-1步和第3步可复用） */
+            List<List<Integer>> salvageableChains
+    ) {
+        public static VerificationResult ok() { return new VerificationResult(true, "OK", List.of()); }
+        public static VerificationResult failed(String reason, List<List<Integer>> chains) { return new VerificationResult(false, reason, chains); }
+    }
+
+    /**
+     * AI 校验执行效果 + 失败时提取可复用步骤链。
+     *
+     * <p>核心逻辑：工具执行成功 ≠ 实际效果达标。让 AI 判断任务是否真正完成，
+     * 如果没完成，AI 同时指出哪些连续的步骤是可以独立复用的（如"打开浏览器→输入网址"）。
+     * 这些步骤链会被存为 ATOMIC 通用模板，下次不同任务也能复用。</p>
+     *
+     * @param userInput  用户原话
+     * @param toolCalls  执行轨迹（含成功/失败标记）
+     * @param aiResponse AI 最终回复
+     * @return 校验结果；AI 调用失败时默认返回 success=true（不阻塞流程）
+     */
+    public VerificationResult verifyExecution(String userInput, List<ToolCallLog> toolCalls, String aiResponse) {
+        String stepsSummary = formatSteps(toolCalls);
+        String prompt = promptLoader.getVerifyExecution()
+                .formatted(userInput, stepsSummary, AiResponseUtils.truncate(aiResponse, 300));
+
+        try {
+            String response = chatClient.prompt().user(prompt).call().content();
+            return parseVerificationResult(response);
+        } catch (Exception e) {
+            System.err.println("⚠️ 执行校验失败: " + e.getMessage());
+            // AI故障时保守处理：不存错误结果，让上层重试
+            return VerificationResult.failed("校验服务不可用: " + e.getMessage(), List.of());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private VerificationResult parseVerificationResult(String response) {
+        if (response == null || response.isBlank()) return VerificationResult.ok();
+        String json = AiResponseUtils.stripMarkdownCodeBlock(response);
+        try {
+            var parsed = objectMapper.readValue(json, java.util.Map.class);
+            boolean success = !Boolean.FALSE.equals(parsed.get("success"));
+            String reason = (String) parsed.getOrDefault("reason", "");
+
+            List<List<Integer>> chains = List.of();
+            List<List<Object>> rawChains = (List<List<Object>>) parsed.get("salvageableChains");
+            if (rawChains != null && !rawChains.isEmpty()) {
+                chains = rawChains.stream()
+                        .map(c -> c.stream().map(n -> ((Number) n).intValue()).toList())
+                        .toList();
+            }
+
+            return new VerificationResult(success, reason, chains);
+        } catch (Exception e) {
+            System.err.println("⚠️ 校验JSON解析失败: " + e.getMessage());
+            return VerificationResult.failed("校验返回格式错误", List.of());
+        }
+    }
 
     /**
      * 变量签名提取结果。
@@ -86,29 +157,12 @@ public class ReflectService {
         StringBuilder stepsDesc = new StringBuilder();
         for (int i = 0; i < toolCalls.size(); i++) {
             ToolCallLog step = toolCalls.get(i);
-            stepsDesc.append(i).append(". ").append(step.toolName())
-                    .append(" args=").append(truncate(step.args(), 200)).append("\n");
+            stepsDesc.append(i + 1).append(". ").append(step.toolName())
+                    .append(" args=").append(AiResponseUtils.truncate(step.args(), 200)).append("\n");
         }
 
-        String prompt = """
-                分析以下工具调用轨迹，把 args 里的具体值替换为变量占位符，并提取变量签名。
-
-                用户原话: %s
-                工具调用轨迹:
-                %s
-
-                规则:
-                - 把 args 里来自用户输入的具体值（如联系人名、消息内容、文件路径）替换为 $变量名
-                - 变量名用小驼峰英文（如 contact, message, filePath）
-                - 不来自用户输入的固定值（如固定的快捷键、路径分隔符）不要替换
-                - signature 记录每个变量的来源描述
-
-                返回严格 JSON（不要 markdown 标记）:
-                {
-                  "variables": [{"name":"contact","source":"用户输入的联系人名"}],
-                  "steps": [{"index":0,"args":"{\"name\":\"$contact\"}"}]
-                }
-                """.formatted(userInput, stepsDesc);
+        String prompt = promptLoader.getExtractSignature()
+                .formatted(userInput, stepsDesc);
 
         try {
             String response = chatClient.prompt().user(prompt).call().content();
@@ -124,10 +178,7 @@ public class ReflectService {
         if (response == null || response.isBlank()) {
             return SignatureExtraction.fallback(original);
         }
-        String json = response.trim();
-        if (json.startsWith("```")) {
-            json = json.replaceAll("^```\\w*\\n?", "").replaceAll("\\n?```$", "").trim();
-        }
+        String json = AiResponseUtils.stripMarkdownCodeBlock(response);
         try {
             Map<String, Object> parsed = objectMapper.readValue(json, Map.class);
 
@@ -175,21 +226,12 @@ public class ReflectService {
      */
     public String reflectSuccess(String userInput, List<ToolCallLog> toolCalls, String aiResponse) {
         String stepsSummary = formatSteps(toolCalls);
-        String prompt = """
-                请用一句话总结这次任务的关键成功经验（30字内），用于未来类似任务的复用提示。
-
-                用户请求: %s
-                执行步骤:
-                %s
-                AI回复: %s
-
-                只返回经验总结本身，不要前缀、不要解释、不要引号。
-                示例: 先打开微信再搜索联系人，最后输入消息发送
-                """.formatted(userInput, stepsSummary, truncate(aiResponse, 200));
+        String prompt = promptLoader.getReflectSuccess()
+                .formatted(userInput, stepsSummary, AiResponseUtils.truncate(aiResponse, 200));
 
         try {
             String result = chatClient.prompt().user(prompt).call().content();
-            return truncate(result, 100);
+            return AiResponseUtils.truncate(result, 100);
         } catch (Exception e) {
             System.err.println("⚠️ 成功反思失败: " + e.getMessage());
             return null;
@@ -206,21 +248,8 @@ public class ReflectService {
      */
     public FailureAnalysis reflectFailure(String userInput, List<ToolCallLog> toolCalls, String errorMessage) {
         String stepsSummary = formatSteps(toolCalls);
-        String prompt = """
-                分析以下任务失败的原因，判断是计划逻辑问题还是环境问题。
-
-                用户请求: %s
-                执行步骤:
-                %s
-                失败原因: %s
-
-                判断规则:
-                - 计划问题: 步骤顺序错误、缺少必要中间步骤、工具选择错误、参数逻辑错误
-                - 环境问题: 目标不存在、网络中断、权限不够、应用未启动、元素未加载
-
-                返回严格的 JSON（不要 markdown 标记）:
-                {"isPlanIssue": true/false, "lesson": "一句话教训（30字内）"}
-                """.formatted(userInput, stepsSummary, truncate(errorMessage, 300));
+        String prompt = promptLoader.getReflectFailure()
+                .formatted(userInput, stepsSummary, AiResponseUtils.truncate(errorMessage, 300));
 
         try {
             String response = chatClient.prompt().user(prompt).call().content();
@@ -240,15 +269,12 @@ public class ReflectService {
         if (response == null || response.isBlank()) {
             return new FailureAnalysis(null, false);
         }
-        String json = response.trim();
-        if (json.startsWith("```")) {
-            json = json.replaceAll("^```\\w*\\n?", "").replaceAll("\\n?```$", "").trim();
-        }
+        String json = AiResponseUtils.stripMarkdownCodeBlock(response);
         try {
             var parsed = objectMapper.readValue(json, java.util.Map.class);
             boolean isPlanIssue = Boolean.TRUE.equals(parsed.get("isPlanIssue"));
             String lesson = (String) parsed.getOrDefault("lesson", null);
-            return new FailureAnalysis(truncate(lesson, 100), isPlanIssue);
+            return new FailureAnalysis(AiResponseUtils.truncate(lesson, 100), isPlanIssue);
         } catch (Exception e) {
             System.err.println("⚠️ 失败分析 JSON 解析失败: " + e.getMessage());
             return new FailureAnalysis(null, false);
@@ -262,15 +288,9 @@ public class ReflectService {
         for (int i = 0; i < toolCalls.size(); i++) {
             ToolCallLog step = toolCalls.get(i);
             sb.append(i + 1).append(". ")
-              .append(step.toolName()).append("(").append(truncate(step.args(), 100)).append(")")
+              .append(step.toolName()).append("(").append(AiResponseUtils.truncate(step.args(), 100)).append(")")
               .append(step.success() ? " ✅" : " ❌").append("\n");
         }
         return sb.toString();
-    }
-
-    private static String truncate(String s, int max) {
-        if (s == null) return "(null)";
-        String oneLine = s.replace("\n", " ").trim();
-        return oneLine.length() > max ? oneLine.substring(0, max) + "..." : oneLine;
     }
 }

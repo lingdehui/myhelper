@@ -20,9 +20,12 @@ import java.util.Map;
 public class HaToolService {
 
     private final HomeAssistantClient haClient;
+    private final DeviceDiscoveryService discovery;
 
-    public HaToolService(HomeAssistantClient haClient) {
+    public HaToolService(HomeAssistantClient haClient,
+                         DeviceDiscoveryService discovery) {
         this.haClient = haClient;
+        this.discovery = discovery;
     }
 
     // ========== 设备查询工具 ==========
@@ -187,5 +190,50 @@ public class HaToolService {
     public String checkConnection() {
         boolean connected = haClient.isConnected();
         return connected ? "✅ Home Assistant 连接正常" : "❌ 无法连接到 Home Assistant";
+    }
+
+    // ========== 设备发现工具 ==========
+
+    /**
+     * 扫描局域网设备
+     * 项目在原生 Windows 运行，能直接 Ping 内网。
+     */
+    @Tool(description = "扫描局域网，发现 3D打印机/智能设备/Chromecast/摄像头等。" +
+            "支持端口指纹+HTTP响应识别设备型号。返回发现的设备列表和注册状态。")
+    public String scanNetworkDevices() {
+        java.util.List<java.util.Map<String, Object>> devices = discovery.scan();
+        if (devices.isEmpty()) {
+            return "未发现设备。当前子网可能没有开放端口的智能设备。" +
+                    "\n支持识别: OctoPrint(5000), Moonraker(7125), 拓竹(6000), ESPHome(6053), " +
+                    "Chromecast(8008), Node-RED(1880), Web服务(80/8080)";
+        }
+        StringBuilder sb = new StringBuilder("发现 " + devices.size() + " 个设备：\n\n");
+        for (java.util.Map<String, Object> d : devices) {
+            sb.append(String.format("[%s] %s  %s:%s  %s\n",
+                    d.get("type"), d.get("name"), d.get("ip"), d.get("port"),
+                    Boolean.TRUE.equals(d.get("registered")) ? "✓已注册" : "✗未注册"));
+        }
+        return sb.toString().trim();
+    }
+
+    /**
+     * 注册发现的设备到 Home Assistant
+     */
+    @Tool(description = "将 scanNetworkDevices 发现的未注册设备自动注册到 Home Assistant。" +
+            "成功注册后可在 HA 中管理和控制这些设备。")
+    public String registerDiscoveredDevice() {
+        java.util.Map<String, Object> result = discovery.registerToHA();
+
+        @SuppressWarnings("unchecked")
+        java.util.List<java.util.Map<String, Object>> registered =
+                (java.util.List<java.util.Map<String, Object>>) result.get("registered");
+        @SuppressWarnings("unchecked")
+        java.util.List<java.util.Map<String, Object>> failed =
+                (java.util.List<java.util.Map<String, Object>>) result.get("failed");
+
+        StringBuilder sb = new StringBuilder(result.get("summary") + "\n");
+        for (var d : registered) sb.append("✅ ").append(d.get("name")).append(" (").append(d.get("ip")).append(")\n");
+        for (var d : failed) sb.append("❌ ").append(d.get("name")).append(" (").append(d.get("ip")).append(")\n");
+        return sb.toString().trim();
     }
 }

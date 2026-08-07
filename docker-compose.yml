@@ -8,21 +8,22 @@ services:
       - "7474:7474"  # 浏览器访问端口
       - "7687:7687"  # Java代码连接端口 (Bolt协议)
     volumes:
-      - E:/docker/neo4j/data:/data
-      - E:/docker/neo4j/logs:/logs
-      - E:/docker/neo4j/import:/var/lib/neo4j/import
+      - D:/docker/neo4j/data:/data
+      - D:/docker/neo4j/logs:/logs
+      - D:/docker/neo4j/import:/var/lib/neo4j/import
     environment:
       - NEO4J_AUTH=neo4j/ll425972
 
-  # 向量数据库 (先不启动，需要时取消注释)
-  # qdrant:
-  #   image: qdrant/qdrant
-  #   container_name: qdrant
-  #   ports:
-  #     - "6333:6333" # HTTP API
-  #     - "6334:6334" # gRPC API
-  #   volumes:
-  #     - E:/docker/qdrant/data:/qdrant/storage
+  # 向量数据库
+  qdrant:
+    image: qdrant/qdrant
+    container_name: qdrant
+    ports:
+      - "6333:6333" # HTTP API
+      - "6334:6334" # gRPC API
+    volumes:
+      - D:/docker/qdrant/data:/qdrant/storage
+    restart: unless-stopped
 
   # Home Assistant 智能家居中枢
   homeassistant:
@@ -31,5 +32,5 @@ services:
     ports:
       - "8123:8123"
     volumes:
-      - E:/docker/ha/config:/config
+      - D:/docker/ha/config:/config
     restart: unless-stopped

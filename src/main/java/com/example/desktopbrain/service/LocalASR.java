@@ -52,6 +52,7 @@ public class LocalASR {
                 .setTokens(modelDir.resolve("tokens.txt").toString())
                 .setNumThreads(2)
                 .setProvider("cpu")
+                .setDebug(false)
                 .build();
 
         OnlineRecognizerConfig config = OnlineRecognizerConfig.builder()
@@ -83,6 +84,7 @@ public class LocalASR {
                 .setTokens(modelDir.resolve("tokens.txt").toString())
                 .setNumThreads(2)
                 .setProvider("cpu")
+                .setDebug(false)
                 .build();
 
         OfflineRecognizerConfig config = OfflineRecognizerConfig.builder()
@@ -90,11 +92,15 @@ public class LocalASR {
                 .build();
         this.offlineRecognizer = new OfflineRecognizer(config);
 
-        // 预热
-        OfflineStream stream = offlineRecognizer.createStream();
-        stream.acceptWaveform(new float[480], SAMPLE_RATE);
-        offlineRecognizer.decode(stream);
-        stream.release();
+        // 预热（try-catch 保护：零采样可能触发 Paraformer Conv 形状边界问题，不影响实际语音识别）
+        try {
+            OfflineStream stream = offlineRecognizer.createStream();
+            stream.acceptWaveform(new float[480], SAMPLE_RATE);
+            offlineRecognizer.decode(stream);
+            stream.release();
+        } catch (Exception e) {
+            System.err.println("⚠️ Paraformer 预热异常（实际语音可能正常）: " + e.getMessage());
+        }
         System.out.println("✅ 离线 ASR（Paraformer 对话识别）就绪");
     }
 
@@ -183,5 +189,43 @@ public class LocalASR {
     public void shutdown() {
         if (onlineRecognizer != null) onlineRecognizer.release();
         if (offlineRecognizer != null) offlineRecognizer.release();
+    }
+
+    /** 创建流式识别 Stream（持续使用，用完 release() 释放） */
+    public OnlineStream createStream() {
+        return onlineRecognizer.createStream();
+    }
+
+    /**
+     * 流式喂入音频数据，返回当前部分识别结果。
+     * @param stream     已创建的流
+     * @param samples    音频样本
+     * @param sampleRate 采样率
+     * @param isEnd      是否已结束（true 时会调用 inputFinished）
+     * @return 当前部分识别文本
+     */
+    public String feedStream(OnlineStream stream, float[] samples, int sampleRate, boolean isEnd) {
+        int chunkSize = sampleRate * 30 / 1000; // 30ms chunks
+        int paddedLen = ((samples.length + chunkSize - 1) / chunkSize) * chunkSize;
+        float[] padded = new float[paddedLen];
+        System.arraycopy(samples, 0, padded, 0, samples.length);
+
+        for (int start = 0; start < padded.length; start += chunkSize) {
+            float[] chunk = new float[chunkSize];
+            System.arraycopy(padded, start, chunk, 0, chunkSize);
+            stream.acceptWaveform(chunk, sampleRate);
+            while (onlineRecognizer.isReady(stream)) {
+                onlineRecognizer.decode(stream);
+            }
+        }
+
+        if (isEnd) {
+            stream.inputFinished();
+            while (onlineRecognizer.isReady(stream)) {
+                onlineRecognizer.decode(stream);
+            }
+        }
+
+        return onlineRecognizer.getResult(stream).getText();
     }
 }

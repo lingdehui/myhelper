@@ -11,19 +11,33 @@ import java.util.Map;
 /**
  * 嵌入向量服务：调用 Ollama 嵌入 API 生成语义向量
  * 模型：nomic-embed-text（768维），与 Qdrant 配置一致
+ *
+ * <p>嵌入失败时抛 {@link EmbeddingException} 而不是返回零向量。
+ * 调用方应捕获此异常并降级到不使用向量搜索的分支。零向量会导致 Qdrant 返回随机匹配。</p>
  */
 @Service
 public class EmbeddingService {
 
-    private final WebClient ollamaClient;
-
     @Value("${embedding.model:nomic-embed-text}")
     private String model;
 
-    public EmbeddingService() {
+    @Value("${ollama.base-url:http://localhost:11434}")
+    private String ollamaBaseUrl;
+
+    private WebClient ollamaClient;
+
+    @jakarta.annotation.PostConstruct
+    void initClient() {
         this.ollamaClient = WebClient.builder()
-                .baseUrl("http://localhost:11434")
+                .baseUrl(ollamaBaseUrl)
                 .build();
+    }
+
+    /** 嵌入失败时抛出的异常 */
+    public static class EmbeddingException extends RuntimeException {
+        public EmbeddingException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     public List<Float> embed(String text) {
@@ -55,20 +69,14 @@ public class EmbeddingService {
                     }
                     result.add(vector);
                 } else {
-                    System.err.println("⚠️ Ollama 嵌入API返回空: " + text);
-                    result.add(zeroVector());
+                    throw new EmbeddingException("Ollama 嵌入API返回空: " + text, null);
                 }
+            } catch (EmbeddingException e) {
+                throw e;
             } catch (Exception e) {
-                System.err.println("❌ Ollama 嵌入失败: " + e.getMessage());
-                result.add(zeroVector());
+                throw new EmbeddingException("Ollama 嵌入失败: " + e.getMessage(), e);
             }
         }
         return result;
-    }
-
-    private List<Float> zeroVector() {
-        List<Float> v = new ArrayList<>(768);
-        for (int i = 0; i < 768; i++) v.add(0.0f);
-        return v;
     }
 }

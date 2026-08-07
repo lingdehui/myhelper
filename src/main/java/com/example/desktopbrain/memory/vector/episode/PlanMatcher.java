@@ -1,12 +1,16 @@
 package com.example.desktopbrain.memory.vector.episode;
 
+import com.example.desktopbrain.common.AiResponseUtils;
+import com.example.desktopbrain.common.PromptLoader;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 计划匹配器：AI 判断 episode 是否适用于当前输入 + 提取变量值。
@@ -27,12 +31,14 @@ public class PlanMatcher {
 
     private final ChatClient chatClient;
     private final ObjectMapper objectMapper;
+    private final PromptLoader promptLoader;
 
-    public PlanMatcher(ChatClient.Builder chatClientBuilder) {
+    public PlanMatcher(ChatClient.Builder chatClientBuilder, PromptLoader promptLoader) {
         this.chatClient = chatClientBuilder
                 .defaultSystem("你是计划匹配判断器，判断已有计划是否适用于当前用户请求，并提取变量。")
                 .build();
         this.objectMapper = new ObjectMapper();
+        this.promptLoader = promptLoader;
     }
 
     /**
@@ -67,11 +73,17 @@ public class PlanMatcher {
             return MatchResult.notApplicable("计划没有可执行步骤");
         }
 
-        // ATOMIC 通用步骤：直接适用，不需要 AI 判断变量
+        // ATOMIC 通用步骤：检查关键词相关性后才适用
+        // 不能无条件适用，否则 "发微信给张三" 的 ATOMIC 会被匹配到 "打开记事本"
         if (episode.unitType() == Episode.UnitType.ATOMIC && episode.isGeneric()) {
             String reason = "ATOMIC 通用步骤: " + episode.userInput();
-            System.out.println("🧩 ATOMIC 通用步骤直接适用: " + reason);
-            return MatchResult.applicable(Map.of(), reason);
+            if (isSemanticallyRelated(userInput, episode.userInput())) {
+                System.out.println("🧩 ATOMIC 通用步骤适用: " + reason);
+                return MatchResult.applicable(Map.of(), reason);
+            } else {
+                System.out.println("🧩 ATOMIC 通用步骤不匹配当前输入，跳过: " + reason);
+                return MatchResult.notApplicable("ATOMIC 工具链与用户输入不相关");
+            }
         }
 
         // 构造步骤描述
@@ -87,26 +99,8 @@ public class PlanMatcher {
                 ? "（无变量，直接复用即可）"
                 : String.join(", ", episode.signature().keySet());
 
-        String prompt = """
-                判断以下已有计划是否适用于当前用户请求，并提取变量值。
-
-                用户请求: %s
-                计划用途: %s
-                计划步骤:
-                %s
-                需要的变量: %s
-
-                规则:
-                - 如果计划适用，从用户请求中提取变量值
-                - 如果计划完全不相关或无法适配，返回 applicable=false
-                - 变量值应该是用户请求中明确提到的内容
-                - 返回严格的 JSON 格式，不要加 markdown 代码块标记
-
-                返回格式:
-                {"applicable": true, "variables": {"变量名": "变量值"}, "reason": "简要理由"}
-                或
-                {"applicable": false, "variables": {}, "reason": "为什么不适用"}
-                """.formatted(userInput, episode.userInput(), stepsDesc, varList);
+        String prompt = promptLoader.getPlanMatch()
+                .formatted(stripPii(userInput), episode.userInput(), stepsDesc, varList);
 
         try {
             String response = chatClient.prompt().user(prompt).call().content();
@@ -115,6 +109,69 @@ public class PlanMatcher {
             System.err.println("⚠️ PlanMatcher AI 判断失败: " + e.getMessage());
             return MatchResult.notApplicable("AI 判断异常: " + e.getMessage());
         }
+    }
+
+    /**
+     * 轻量级语义相关性检查（免 AI 调用）：提取 ATOMIC 工具链中的关键词，
+     * 检查是否与用户输入有重叠。避免 "发微信" ATOMIC 被匹配到 "打开记事本"。
+     *
+     * @param userInput   用户原话
+     * @param toolChain   工具链描述（如 "findFriend→typeTextViaClipboard"）
+     * @return 是否语义相关
+     */
+    private static boolean isSemanticallyRelated(String userInput, String toolChain) {
+        if (userInput == null || toolChain == null) return false;
+
+        // 1. 提取 ATOMIC 工具链中的中文关键词（从 userInput 字段提取）
+        String inputLower = userInput.toLowerCase();
+        String chainLower = toolChain.toLowerCase();
+
+        // 2. 从工具名拆出英文关键词（camelCase 拆分）
+        //    例: "findFriend" → ["find", "friend"], "typeTextViaClipboard" → ["type", "text", "via", "clipboard"]
+        Set<String> keywords = new HashSet<>();
+        for (String toolName : chainLower.split("→")) {
+            for (String word : toolName.split("(?=[A-Z])")) {
+                if (word.length() >= 2) keywords.add(word.toLowerCase());
+            }
+        }
+
+        // 3. 附加中文语义映射（工具名 → 中文意图关键词）
+        Map<String, List<String>> semanticMap = Map.of(
+            "findfriend", List.of("找", "查", "搜索", "联系人", "微信", "好友"),
+            "type", List.of("发", "输入", "打字", "消息", "发送", "写"),
+            "text", List.of("消息", "文字", "内容"),
+            "clipboard", List.of("粘贴", "复制"),
+            "click", List.of("点击", "按", "点"),
+            "window", List.of("窗口", "界面"),
+            "ocr", List.of("识别", "扫描"),
+            "presskey", List.of("按键", "快捷键"),
+            "mousemove", List.of("鼠标", "移动"),
+            "leftclick", List.of("点击", "左键")
+        );
+
+        // 4. 检查输入与关键词的匹配
+        for (String kw : keywords) {
+            List<String> mapped = semanticMap.getOrDefault(kw, List.of());
+            for (String mk : mapped) {
+                if (inputLower.contains(mk)) return true;
+            }
+            // 英文关键词直接查
+            if (inputLower.contains(kw)) return true;
+        }
+
+        // 5. 中文 bigram 重叠（来自 DesktopBrainApplication 的 extractKeywords 思路）
+        Set<String> inputBigrams = new HashSet<>();
+        for (int i = 0; i < userInput.length() - 1; i++) {
+            String bigram = userInput.substring(i, i + 2);
+            if (!bigram.matches("[\\p{Punct}\\s]+")) inputBigrams.add(bigram);
+        }
+        for (String kw : keywords) {
+            for (String bigram : inputBigrams) {
+                if (bigram.equals(kw)) return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -127,11 +184,7 @@ public class PlanMatcher {
             return MatchResult.notApplicable("AI 返回空");
         }
 
-        // 去掉可能的 ```json ... ``` 标记
-        String json = response.trim();
-        if (json.startsWith("```")) {
-            json = json.replaceAll("^```\\w*\\n?", "").replaceAll("\\n?```$", "").trim();
-        }
+        String json = AiResponseUtils.stripMarkdownCodeBlock(response);
 
         try {
             Map<String, Object> parsed = objectMapper.readValue(json, Map.class);
@@ -156,5 +209,16 @@ public class PlanMatcher {
             System.err.println("⚠️ PlanMatcher JSON 解析失败: " + e.getMessage() + " | 原始: " + json);
             return MatchResult.notApplicable("JSON 解析失败");
         }
+    }
+
+    /**
+     * 脱敏：去掉明显 PII（11位手机号、18位身份证号），保留语义用于匹配。
+     * 传给云端 AI 做 PlanMatcher 时使用。
+     */
+    private static String stripPii(String input) {
+        if (input == null) return null;
+        return input
+                .replaceAll("1[3-9]\\d{9}", "[手机号]")
+                .replaceAll("\\d{17}[\\dXx]", "[身份证]");
     }
 }

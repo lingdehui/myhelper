@@ -63,6 +63,7 @@ public class TtsService {
                     .setVits(vitsConfig)
                     .setNumThreads(2)
                     .setProvider("cpu")
+                    .setDebug(false)
                     .build();
 
             OfflineTtsConfig config = OfflineTtsConfig.builder()
@@ -100,7 +101,8 @@ public class TtsService {
         }
         if (text == null || text.isBlank()) return;
 
-        String clean = text.replace("\n", " ").replace("\r", " ").trim();
+        String clean = stripMarkdown(text);
+        clean = clean.replace("\n", " ").replace("\r", " ").trim();
         if (clean.isEmpty()) return;
         if (clean.length() > 500) clean = clean.substring(0, 500);
 
@@ -120,8 +122,7 @@ public class TtsService {
             for (float s : samples) { if (Math.abs(s) > maxVal) maxVal = Math.abs(s); }
             System.out.println("🔊 TTS: " + clean + " (" + samples.length + " samples, max=" + String.format("%.3f", maxVal) + ", rate=" + (int)ttsSampleRate + "Hz)");
             
-            playQueue.poll();
-            playQueue.offer(audio);
+            playQueue.offer(audio);  // 队列满时丢弃最旧（LinkedBlockingQueue FIFO）
         } catch (Exception e) {
             System.err.println("🔇 TTS generate 异常: " + e.getMessage());
             e.printStackTrace();
@@ -220,5 +221,45 @@ public class TtsService {
         stop();
         if (playbackThread != null) playbackThread.interrupt();
         if (tts != null) tts.release();
+    }
+
+    /**
+     * 剥离 AI 回复中的 markdown 标记，避免 TTS 播报噪音。
+     * 处理：标题(#)、粗体(**)、斜体(*)、代码块(```)、行内代码(`)、
+     * 表格(|)、链接、水平线(---)、HTML标签等。
+     */
+    private static String stripMarkdown(String text) {
+        if (text == null) return "";
+        return text
+                // 代码块
+                .replaceAll("```[\\s\\S]*?```", " ")
+                // 行内代码
+                .replaceAll("`([^`]*)`", "$1")
+                // 标题
+                .replaceAll("(?m)^#{1,6}\\s*", "")
+                // 粗体/斜体
+                .replaceAll("\\*{1,3}([^*]+)\\*{1,3}", "$1")
+                // 删除线
+                .replaceAll("~~([^~]+)~~", "$1")
+                // 水平线
+                .replaceAll("(?m)^[-*_]{3,}\\s*$", " ")
+                // 表格分隔行
+                .replaceAll("(?m)^\\|[-:| ]+\\|$", " ")
+                // 表格管道符
+                .replaceAll("\\|", " ")
+                // 链接 [text](url)
+                .replaceAll("\\[([^]]*)]\\([^)]*\\)", "$1")
+                // 图片 ![alt](url)
+                .replaceAll("!\\[([^]]*)]\\([^)]*\\)", "$1")
+                // HTML 标签
+                .replaceAll("<[^>]+>", " ")
+                // 引用 >
+                .replaceAll("(?m)^>\\s*", "")
+                // 列表标记
+                .replaceAll("(?m)^[\\s]*[-*+]\\s+", "")
+                .replaceAll("(?m)^[\\s]*\\d+[.)]\\s+", "")
+                // 多余空白
+                .replaceAll("\\s{2,}", " ")
+                .trim();
     }
 }

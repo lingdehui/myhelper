@@ -1,5 +1,6 @@
 package com.example.desktopbrain.memory.vector.episode;
 
+import com.example.desktopbrain.config.DesktopBrainProperties;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Service;
 
@@ -20,13 +21,19 @@ import java.util.Map;
  * <h3>失败处理（决策2：失败步重新规划后继续）</h3>
  * <p>逐步执行，某步失败时：
  * <ul>
- *   <li>记录失败步位置（failedStepIndex）</li>
- *   <li>抛出 {@link StepFailureException} 让上层处理（重新规划该步后继续）</li>
+ *   <li>工具抛异常 → 记录失败步位置</li>
+ *   <li>返回字符串含失败标识 → 视为失败（标识来自配置 desktopbrain.execution.failure-markers）</li>
+ *   <li>返回字符串不含失败标识 → 视为成功</li>
  * </ul>
- * 返回已执行的步骤日志，上层可以据此分段继续。</p>
- */
+ * 返回已执行的步骤日志，上层可以据此分段继续。</p> */
 @Service
 public class PlanExecutor {
+
+    private final DesktopBrainProperties props;
+
+    public PlanExecutor(DesktopBrainProperties props) {
+        this.props = props;
+    }
 
     /**
      * 执行结果。
@@ -56,45 +63,11 @@ public class PlanExecutor {
      */
     public ExecutionResult executeScript(Episode episode, Map<String, String> variables,
                                           ToolCallback[] allTools) {
-        List<ToolCallLog> executed = new ArrayList<>();
         List<ToolCallLog> script = episode.toolCalls();
-
         if (script == null || script.isEmpty()) {
-            return ExecutionResult.failed(executed, -1, "脚本为空");
+            return ExecutionResult.failed(new ArrayList<>(), -1, "脚本为空");
         }
-
-        for (int i = 0; i < script.size(); i++) {
-            ToolCallLog step = script.get(i);
-            String toolName = step.toolName();
-            String resolvedArgs = resolveVariables(step.args(), variables);
-
-            // 查找工具
-            ToolCallback tool = findTool(toolName, allTools);
-            if (tool == null) {
-                executed.add(new ToolCallLog(toolName, resolvedArgs,
-                        "工具不存在: " + toolName, false, 0));
-                return ExecutionResult.failed(executed, i, "工具不存在: " + toolName);
-            }
-
-            // 执行
-            // 注意：只通过是否抛异常判断成败，不检查返回内容。
-            // 工具应通过抛异常表示失败（如联系人不存在、网络中断），
-            // 而不是返回错误字符串。返回的错误字符串会被误判为成功。
-            // 后续可加 AI 校验返回内容是否包含错误关键词（如"失败"/"不存在"）。
-            long start = System.currentTimeMillis();
-            try {
-                String result = tool.call(resolvedArgs);
-                long elapsed = System.currentTimeMillis() - start;
-                executed.add(new ToolCallLog(toolName, resolvedArgs, result, true, elapsed));
-            } catch (Exception e) {
-                long elapsed = System.currentTimeMillis() - start;
-                executed.add(new ToolCallLog(toolName, resolvedArgs,
-                        e.getMessage(), false, elapsed));
-                return ExecutionResult.failed(executed, i, e.getMessage());
-            }
-        }
-
-        return ExecutionResult.success(executed);
+        return executeFromStep(episode, 0, variables, allTools);
     }
 
     /** 从失败步之后继续执行剩余步骤（分段继续，决策2） */
@@ -121,6 +94,10 @@ public class PlanExecutor {
             try {
                 String result = tool.call(resolvedArgs);
                 long elapsed = System.currentTimeMillis() - start;
+                if (isFailureResult(result)) {
+                    executed.add(new ToolCallLog(step.toolName(), resolvedArgs, result, false, elapsed));
+                    return ExecutionResult.failed(executed, i, "工具返回失败: " + trimResult(result));
+                }
                 executed.add(new ToolCallLog(step.toolName(), resolvedArgs, result, true, elapsed));
             } catch (Exception e) {
                 long elapsed = System.currentTimeMillis() - start;
@@ -149,5 +126,21 @@ public class PlanExecutor {
             if (tc.getToolDefinition().name().equals(name)) return tc;
         }
         return null;
+    }
+
+    /** 检查工具返回字符串是否包含失败标识（来自配置 desktopbrain.execution.failure-markers） */
+    private boolean isFailureResult(String result) {
+        if (result == null || result.isBlank()) return false;
+        for (String marker : props.execution().failureMarkers()) {
+            if (result.contains(marker)) return true;
+        }
+        return false;
+    }
+
+    /** 截断返回字符串用于错误日志 */
+    private static String trimResult(String result) {
+        if (result == null) return "(null)";
+        String oneLine = result.replace("\n", " ").trim();
+        return oneLine.length() > 100 ? oneLine.substring(0, 100) + "..." : oneLine;
     }
 }

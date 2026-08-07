@@ -48,6 +48,8 @@ import java.util.Map;
  * @param status              生命周期状态：DRAFT（执行中）/ACTIVE（成功可复用）/FAILED（失败但保留步骤）
  * @param canScript           是否可脚本化（successCount≥5 且 stability>0.9 时为 true，PlanExecutor 直接回放）
  * @param failedStepIndex     失败步位置（-1=未失败/成功；≥0=第 N 步失败，用于分段继续）
+ * @param explorationType      探索类型（null=非探索，AUTONOMOUS=自主探索，MANUAL=手动触发）
+ * @param explorationSummary   探索摘要（探索任务完成后填入）
  */
 public record Episode(
         String id,
@@ -69,7 +71,9 @@ public record Episode(
         double stability,
         EpisodeStatus status,
         boolean canScript,
-        int failedStepIndex
+        int failedStepIndex,
+        ExplorationType explorationType,
+        String explorationSummary
 ) {
     /** 单元类型 */
     public enum UnitType {
@@ -83,16 +87,32 @@ public record Episode(
     public enum EpisodeStatus {
         /** 草稿：执行中创建，尚未确认结果 */
         DRAFT,
+        /** 探索进行中 */
+        IN_PROGRESS,
         /** 活跃：执行成功，可被检索复用 */
         ACTIVE,
         /** 失败：执行失败但保留已执行步骤，供后续分析 */
         FAILED
     }
 
+    /** 探索类型（null/非探索，AUTONOMOUS/自主探索，MANUAL/手动触发） */
+    public enum ExplorationType {
+        AUTONOMOUS,
+        MANUAL
+    }
+
     /**
      * Java 端实时计算稳定度（不依赖存储的 stability 字段）。
      */
     public double computedStability() {
+        return calcStability(successCount, failureCount);
+    }
+
+    /**
+     * 静态稳定度计算公式（统一版本，含零除保护）。
+     * 所有调用方都应使用此方法而非自己计算。
+     */
+    public static double calcStability(int successCount, int failureCount) {
         int total = successCount + failureCount;
         return total == 0 ? 0.0 : (double) successCount / total;
     }
@@ -105,5 +125,31 @@ public record Episode(
     /** 是否可脚本化执行（稳定度高时跳过 AI，直接回放 toolCalls） */
     public boolean isScriptable() {
         return canScript && status == EpisodeStatus.ACTIVE && toolCalls != null && !toolCalls.isEmpty();
+    }
+
+    /** 从 Qdrant point 反序列化 Episode（静态共享，避免分散复制） */
+    @SuppressWarnings("unchecked")
+    public static Episode fromQdrantPoint(Map<String, Object> point, com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
+        try {
+            Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+            if (payload == null) return null;
+            String id = String.valueOf(point.get("id"));
+            payload.put("id", id);
+            payload.putIfAbsent("successLesson", null);
+            payload.putIfAbsent("failureLesson", null);
+            payload.putIfAbsent("signature", java.util.Map.of());
+            payload.putIfAbsent("unitType", UnitType.COMPOSITE.name());
+            payload.putIfAbsent("isGeneric", false);
+            payload.putIfAbsent("parentIds", java.util.List.of());
+            payload.putIfAbsent("status", EpisodeStatus.ACTIVE.name());
+            payload.putIfAbsent("canScript", false);
+            payload.putIfAbsent("failedStepIndex", -1);
+            payload.putIfAbsent("explorationType", null);
+            payload.putIfAbsent("explorationSummary", null);
+            return objectMapper.convertValue(payload, Episode.class);
+        } catch (Exception e) {
+            System.err.println("❌ Episode 反序列化失败: " + e.getMessage());
+            return null;
+        }
     }
 }

@@ -1,5 +1,6 @@
 package com.example.desktopbrain.service;
 
+import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.memory.vector.episode.ToolCallLog;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
@@ -36,28 +37,24 @@ public class LoggingToolCallback implements ToolCallback {
     @Override
     public String call(String toolInput) {
         String name = delegate.getToolDefinition().name();
-        System.out.println("  🔧 [" + name + "] 参数: " + preview(toolInput, 300));
+        System.out.println("  🔧 [" + name + "] 参数: " + AiResponseUtils.truncate(toolInput, 300));
 
         long start = System.currentTimeMillis();
         try {
             String result = delegate.call(toolInput);
             long elapsed = System.currentTimeMillis() - start;
-            System.out.println("     ✅ (" + elapsed + "ms) " + preview(result, 300));
+            System.out.println("     ✅ (" + elapsed + "ms) " + AiResponseUtils.truncate(result, 300));
             // 收集到 Episode 轨迹（args/result 截断到 500 字符）
-            collector.add(new ToolCallLog(name, preview(toolInput, 500), preview(result, 500), true, elapsed));
+            collector.add(new ToolCallLog(name, AiResponseUtils.truncate(toolInput, 500),
+                    AiResponseUtils.truncate(result, 500), true, elapsed));
             return result;
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - start;
             System.out.println("     ❌ (" + elapsed + "ms) " + e.getMessage());
             // 失败也收集（result 字段存异常 message）
-            collector.add(new ToolCallLog(name, preview(toolInput, 500), e.getMessage(), false, elapsed));
+            collector.add(new ToolCallLog(name, AiResponseUtils.truncate(toolInput, 500),
+                    e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName(), false, elapsed));
             throw e;
         }
-    }
-
-    private static String preview(String s, int max) {
-        if (s == null) return "(null)";
-        String oneLine = s.replace("\n", " ").trim();
-        return oneLine.length() > max ? oneLine.substring(0, max) + "..." : oneLine;
     }
 }
