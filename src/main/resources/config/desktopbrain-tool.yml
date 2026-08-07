@@ -1,0 +1,24 @@
+# ===== 工具规划 =====
+desktopbrain:
+  tool-planner:
+    max-cache-size: 500
+    failure-threshold: 3
+    fallback-tools:
+      - sleep
+      - listWindows
+      - getActiveWindowTitle
+      - getMousePosition
+      - focusWindow
+      - leftClick
+      - doubleClick
+      - rightClick
+      - typeText
+      - typeTextViaClipboard
+      - pressKey
+      - pressKeyCombination
+      - mouseMove
+      - mouseScroll
+      - clickTextOnScreen
+      - findTextOnScreen
+    always-append-tools:
+      - searchTool

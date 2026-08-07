@@ -82,7 +82,7 @@ public class DesktopBrainApplication {
     }
 
     @Bean
-    public CommandLineRunner run(ChatClient.Builder chatClientBuilder,
+    public CommandLineRunner run(ChatClient chatClient,
                                  ToolCallbackProvider mcpTools,
                                  FriendMatcher friendMatcher,
                                  CapabilityService capabilityService,
@@ -125,10 +125,6 @@ public class DesktopBrainApplication {
             this.allTools = allToolCallbacks;
             turnProcessor.initToolSearch(allToolCallbacks);
             turnProcessor.initDynamicClassLoader();
-
-            ChatClient chatClient = chatClientBuilder
-                    .defaultSystem(promptLoader.getDefaultSystem())
-                    .build();
 
             System.out.println("🤖 桌面助手已启动（贾维斯模式）");
             System.out.println("💡 文字输入：直接对话，回复有语音播报");

@@ -53,13 +53,11 @@ public class ToolCategoryService {
     private volatile long lastSyncVersion = 0;
 
     public ToolCategoryService(WebClient qdrantWebClient,
-                                ChatClient.Builder chatClientBuilder,
+                                ChatClient chatClient,
                                 EmbeddingService embeddingService,
                                 PromptLoader promptLoader) {
         this.qdrant = qdrantWebClient;
-        this.chatClient = chatClientBuilder
-                .defaultSystem("你是工具分类器，根据工具名称和描述将它们分组到语义类别中。")
-                .build();
+        this.chatClient = chatClient;
         this.embeddingService = embeddingService;
         this.objectMapper = new ObjectMapper();
         this.promptLoader = promptLoader;

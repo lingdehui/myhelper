@@ -1,0 +1,34 @@
+根据以下功能描述，生成一个完整的 Java 工具类源码。
+
+功能描述: %s
+
+严格要求:
+1. 包名必须是: com.example.desktopbrain.generated
+2. 类名用大驼峰，见名知意，加 @Component 注解
+3. 工具方法加 @Tool(description="...") 注解，方法返回 String
+4. 参数加 @ToolParam(description="...") 注解
+5. 需要 import 的注解:
+   - org.springframework.ai.tool.annotation.Tool
+   - org.springframework.ai.tool.annotation.ToolParam
+   - org.springframework.stereotype.Component
+6. 方法内部异常要 try-catch，返回友好的错误提示字符串，不外抛异常
+7. 只用 JDK 标准库 + Spring AI 注解，不引入第三方依赖
+8. 如果涉及系统操作（执行命令/文件/进程），用 java.lang.ProcessBuilder 或 java.nio.file
+9. 只返回源码本身，不要 markdown 代码块标记，不要解释
+
+--- 持久化规范（工具需要记住历史数据时遵守，不需要则忽略）---
+10. 需要持久化时，通过构造函数注入 Spring Bean:
+    - Neo4j: 注入现有的 Neo4jClient 或自定义 repository（写新的 Node + Repository 类）
+    - Qdrant: 注入现有的 WebClient qdrantWebClient（名称为 "qdrantWebClient"）
+11. Neo4j 数据隔离规则:
+    - 用独有 Node 标签（如 GeneratedTodoItem），不许复用已有的 Device/UserPreference/NovelCharacter 标签
+    - Node 类必须有 namespace 字段（如 projectName），所有查询都按此过滤
+    - 需要自定义 Repository 时，在类内写 @Repository 内部接口
+12. Qdrant 数据隔离规则:
+    - 用独有集合名（如 generated-todo-memory），不许复用 episodes/tool-categories/novel-memory
+    - 所有 payload 必须有 namespace 字段用于过滤隔离
+    - 集合用 @PostConstruct 懒初始化
+13. 核心区分（重要）:
+    - 业务数据（TODO条目/笔记/日记/偏好）→ 必须用独有标签/集合隔离
+    - 执行计划/步骤/工具调用序列 → 直接复用项目的 Episode 系统（framework 会自动缓存和匹配，你不用管）
+    - 也就是说：你只需要管"存什么数据"，不用管"怎么执行"。执行是 framework 的事。

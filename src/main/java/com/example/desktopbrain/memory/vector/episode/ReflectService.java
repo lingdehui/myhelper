@@ -37,12 +37,10 @@ public class ReflectService {
     private final DesktopBrainProperties props;
     private final PromptLoader promptLoader;
 
-    public ReflectService(ChatClient.Builder chatClientBuilder,
+    public ReflectService(ChatClient chatClient,
                            DesktopBrainProperties props,
                            PromptLoader promptLoader) {
-        this.chatClient = chatClientBuilder
-                .defaultSystem("你是经验反思总结器，用简洁的一句话总结任务执行的经验教训。")
-                .build();
+        this.chatClient = chatClient;
         this.objectMapper = new ObjectMapper();
         this.props = props;
         this.promptLoader = promptLoader;

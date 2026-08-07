@@ -16,12 +16,6 @@ spring:
             robot-mcp:
               url: http://127.0.0.1:8081/mcp
               request-timeout: 30s
-    openai:
-      api-key: sk-5f0c105555904aec8c86953f3a91a528
-      base-url: https://api.deepseek.com
-      chat:
-        options:
-          model: deepseek-v4-pro
   # ===== Neo4j 知识图谱 =====
   neo4j:
     uri: bolt://localhost:7687
@@ -41,6 +35,15 @@ qdrant:
     stability-threshold: 0.6          # 稳定度阈值（success/(success+fail) >= 0.6 才复用）
     failure-threshold: 3              # 连续失败达此阈值自动归档
     top-k: 3                          # 向量检索返回数量
+
+# ===== 双模型配置 =====
+desktopbrain:
+  deepseek:                           # 模型 1: DeepSeek（远程）— 用户对话、工具执行
+    base-url: https://api.deepseek.com
+    api-key: sk-5f0c105555904aec8c86953f3a91a528
+    model: deepseek-v4-pro
+  exploration:                        # 模型 2: Ollama（本地）— 自主探索
+    model: qwen2.5:3b
 
 # ===== Home Assistant 智能家居 =====
 homeassistant:

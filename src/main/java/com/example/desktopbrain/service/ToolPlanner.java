@@ -89,15 +89,13 @@ public class ToolPlanner {
                 }
             });
 
-    public ToolPlanner(ChatClient.Builder chatClientBuilder,
+    public ToolPlanner(ChatClient chatClient,
                         EpisodeCacheService episodeCacheService,
                         ToolCategoryService categoryService,
                         RuleInductionService ruleInductionService,
                         DesktopBrainProperties props,
                         PromptLoader promptLoader) {
-        this.chatClient = chatClientBuilder
-                .defaultSystem("你是工具规划器，根据用户请求选择所需的能力分类，只返回编号。")
-                .build();
+        this.chatClient = chatClient;
         this.episodeCacheService = episodeCacheService;
         this.categoryService = categoryService;
         this.ruleInductionService = ruleInductionService;

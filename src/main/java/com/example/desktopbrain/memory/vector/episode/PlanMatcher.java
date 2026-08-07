@@ -33,10 +33,8 @@ public class PlanMatcher {
     private final ObjectMapper objectMapper;
     private final PromptLoader promptLoader;
 
-    public PlanMatcher(ChatClient.Builder chatClientBuilder, PromptLoader promptLoader) {
-        this.chatClient = chatClientBuilder
-                .defaultSystem("你是计划匹配判断器，判断已有计划是否适用于当前用户请求，并提取变量。")
-                .build();
+    public PlanMatcher(ChatClient chatClient, PromptLoader promptLoader) {
+        this.chatClient = chatClient;
         this.objectMapper = new ObjectMapper();
         this.promptLoader = promptLoader;
     }

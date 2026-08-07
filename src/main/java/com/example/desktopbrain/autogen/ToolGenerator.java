@@ -33,10 +33,8 @@ public class ToolGenerator {
     private final ChatClient chatClient;
     private final PromptLoader promptLoader;
 
-    public ToolGenerator(ChatClient.Builder chatClientBuilder, PromptLoader promptLoader) {
-        this.chatClient = chatClientBuilder
-                .defaultSystem("你是 Java 工具代码生成器，根据功能描述生成可直接编译的 @Tool 工具类源码。")
-                .build();
+    public ToolGenerator(ChatClient chatClient, PromptLoader promptLoader) {
+        this.chatClient = chatClient;
         this.promptLoader = promptLoader;
     }
 
