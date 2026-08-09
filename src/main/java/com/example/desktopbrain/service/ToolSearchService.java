@@ -59,4 +59,22 @@ public class ToolSearchService {
         log.info("🔍 searchTool('{}') → {} 个匹配", keyword, results.size());
         return "找到 " + results.size() + " 个匹配 '" + keyword + "' 的工具:\n" + String.join("\n", results);
     }
+
+    @Tool(description = "一次性列出系统中所有可用工具的名称和简要描述。当需要了解整体能力、做环境盘点、或搜索工具时优先调用此方法，避免多次 searchTool 查询。")
+    public String listAllTools() {
+        if (allTools.length == 0) return "暂无可用工具";
+
+        List<String> result = new ArrayList<>();
+        for (ToolCallback tc : allTools) {
+            String name = tc.getToolDefinition().name();
+            String desc = tc.getToolDefinition().description();
+            String shortDesc = (desc != null && !desc.isBlank())
+                    ? " — " + AiResponseUtils.truncateNotNull(desc, 50)
+                    : "";
+            result.add(name + shortDesc);
+        }
+
+        log.info("📋 listAllTools → {} 个工具", allTools.length);
+        return "共 " + allTools.length + " 个工具:\n" + String.join("\n", result);
+    }
 }

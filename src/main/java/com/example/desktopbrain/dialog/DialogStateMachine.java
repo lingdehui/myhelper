@@ -1,5 +1,7 @@
 package com.example.desktopbrain.dialog;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -24,6 +26,8 @@ import org.springframework.stereotype.Component;
 @Component
 public class DialogStateMachine {
 
+    private static final Logger log = LoggerFactory.getLogger(DialogStateMachine.class);
+
     public enum State {
         IDLE,
         LISTENING,
@@ -44,7 +48,7 @@ public class DialogStateMachine {
      */
     public synchronized void transitionTo(State newState) {
         if (this.currentState != newState) {
-            System.out.println("🔄 对话状态: " + currentState + " → " + newState);
+            log.info("🔄 对话状态: {} → {}", currentState, newState);
             this.currentState = newState;
             this.stateEnterTime = System.currentTimeMillis();
         }

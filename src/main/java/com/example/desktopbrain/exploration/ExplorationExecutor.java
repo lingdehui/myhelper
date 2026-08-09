@@ -3,10 +3,11 @@ package com.example.desktopbrain.exploration;
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.memory.vector.episode.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.ai.chat.client.ChatClient;
+import com.example.desktopbrain.config.ModelRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -27,9 +28,11 @@ import java.util.concurrent.TimeUnit;
 @Service
 public class ExplorationExecutor {
 
+    private static final Logger log = LoggerFactory.getLogger(ExplorationExecutor.class);
+
     private final EpisodeCacheService episodeCache;
     private final FailureExperienceHandler failureHandler;
-    private final ChatClient explorationChatClient;
+    private final ModelRouter modelRouter;
     private final ToolCallback[] tools;
     private final ObjectMapper objectMapper;
 
@@ -38,13 +41,13 @@ public class ExplorationExecutor {
 
     public ExplorationExecutor(EpisodeCacheService episodeCache,
                                 FailureExperienceHandler failureHandler,
-                                @Qualifier("ollama") ChatClient explorationChatClient,
+                                ModelRouter modelRouter,
                                 ToolCallbackProvider mcpTools) {
         this.episodeCache = episodeCache;
         this.failureHandler = failureHandler;
         this.objectMapper = new ObjectMapper();
         this.tools = mcpTools.getToolCallbacks();
-        this.explorationChatClient = explorationChatClient;
+        this.modelRouter = modelRouter;
     }
 
     /**
@@ -80,7 +83,7 @@ public class ExplorationExecutor {
                 }
 
             } catch (Exception e) {
-                System.err.println("❌ 探索执行失败: " + e.getMessage());
+                log.error("❌ 探索执行失败", e);
                 if (episodeId != null) {
                     episodeCache.failDraft(episodeId, toolCallLogs,
                             "探索异常: " + e.getMessage(), -1);
@@ -108,12 +111,12 @@ public class ExplorationExecutor {
         for (int i = 0; i < decision.steps().size(); i++) {
             // 超时检查
             if (System.currentTimeMillis() - startedAt > TimeUnit.MINUTES.toMillis(MAX_DURATION_MINUTES)) {
-                System.out.println("⏰ 探索超时，停止执行（已执行 " + i + "/" + decision.steps().size() + " 步）");
+                log.info("⏰ 探索超时，停止执行（已执行 {}/{} 步）", i, decision.steps().size());
                 break;
             }
 
             String step = decision.steps().get(i);
-            System.out.println("  🔧 [" + (i + 1) + "/" + decision.steps().size() + "] " + step);
+            log.info("  🔧 [{}/{}] {}", i + 1, decision.steps().size(), step);
 
             try {
                 long stepStart = System.currentTimeMillis();
@@ -122,22 +125,22 @@ public class ExplorationExecutor {
                 String stepResult = executeStep(step, decision.method());
 
                 long elapsed = System.currentTimeMillis() - stepStart;
-                ToolCallLog log = new ToolCallLog(
+                ToolCallLog entry = new ToolCallLog(
                         "exploration_step", step, AiResponseUtils.truncate(stepResult, 500),
                         true, elapsed);
-                toolCallLogs.add(log);
-                System.out.println("    ✅ 完成 (" + elapsed + "ms)");
+                toolCallLogs.add(entry);
+                log.info("    ✅ 完成 ({}ms)", elapsed);
 
                 // 记录子步骤（可作为 ATOMIC 被后续复用）
                 recordSubEpisode(step, stepResult, episodeId);
 
             } catch (Exception e) {
                 long elapsed = System.currentTimeMillis() - startedAt;
-                ToolCallLog log = new ToolCallLog(
+                ToolCallLog entry = new ToolCallLog(
                         "exploration_step", step, AiResponseUtils.truncate(e.getMessage(), 500),
                         false, elapsed);
-                toolCallLogs.add(log);
-                System.out.println("    ❌ 失败: " + e.getMessage());
+                toolCallLogs.add(entry);
+                log.warn("    ❌ 失败: {}", e.getMessage());
 
                 // 走失败经验处理
                 failureHandler.handle(decision.learningGoal(),
@@ -156,9 +159,9 @@ public class ExplorationExecutor {
         String prompt = "请执行以下探索步骤：" + step + "\n方法：" + method
                 + "\n只使用工具执行，不要问问题。";
         try {
-            return explorationChatClient.prompt()
+            return modelRouter.exploration().prompt()
                     .user(prompt)
-                    .tools(tools)
+                    .toolCallbacks(tools)
                     .call()
                     .content();
         } catch (Exception e) {
@@ -183,9 +186,9 @@ public class ExplorationExecutor {
                                                   boolean allSuccess) {
         try {
             StringBuilder stepsLog = new StringBuilder();
-            for (ToolCallLog log : toolCallLogs) {
-                stepsLog.append("- ").append(log.toolName()).append(": ")
-                        .append(log.success() ? "成功" : "失败").append("\n");
+            for (ToolCallLog entry : toolCallLogs) {
+                stepsLog.append("- ").append(entry.toolName()).append(": ")
+                        .append(entry.success() ? "成功" : "失败").append("\n");
             }
 
             String prompt = String.format("""
@@ -203,7 +206,7 @@ public class ExplorationExecutor {
                     decision.learningGoal(), decision.expectedOutcome(),
                     decision.successCriteria(), allSuccess, stepsLog);
 
-            String response = explorationChatClient.prompt()
+            String response = modelRouter.exploration().prompt()
                     .user(prompt)
                     .call()
                     .content();
@@ -233,7 +236,7 @@ public class ExplorationExecutor {
             );
 
         } catch (Exception e) {
-            System.err.println("❌ 自我评估失败: " + e.getMessage());
+            log.error("❌ 自我评估失败", e);
             return new ExplorationSelfAssessment(false, "评估异常", false, null, List.of(), null);
         }
     }
@@ -246,7 +249,7 @@ public class ExplorationExecutor {
                 assessment.knowledgeSnippet(),
                 "autonomous_exploration",
                 episodeId);
-        System.out.println("📝 已生成知识片段: " + snippet.title());
+        log.info("📝 已生成知识片段: {}", snippet.title());
         // TODO: 后续实现 KnowledgeSnippetService 持久化到 Qdrant + Neo4j
     }
 }

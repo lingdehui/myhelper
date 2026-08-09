@@ -1,6 +1,8 @@
 package com.example.desktopbrain.memory.vector;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -15,6 +17,8 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 @Service
 public class VectorMemoryService {
+
+    private static final Logger log = LoggerFactory.getLogger(VectorMemoryService.class);
 
     private final WebClient qdrant;
     private final String collectionName;
@@ -66,7 +70,7 @@ public class VectorMemoryService {
                     .toBodilessEntity()
                     .block();
         } catch (Exception e) {
-            System.err.println("❌ Qdrant 存储失败: " + e.getMessage());
+            log.error("❌ Qdrant 存储失败: {}", e.getMessage());
         }
     }
 
@@ -104,7 +108,7 @@ public class VectorMemoryService {
             }
             return results;
         } catch (Exception e) {
-            System.err.println("❌ Qdrant 搜索失败: " + e.getMessage());
+            log.error("❌ Qdrant 搜索失败: {}", e.getMessage());
             return List.of();
         }
     }

@@ -3,6 +3,8 @@ package com.example.desktopbrain.integration;
 import com.example.desktopbrain.common.HaApiPaths;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -20,6 +22,8 @@ import static com.example.desktopbrain.common.HaApiPaths.*;
  */
 @Component
 public class HomeAssistantClient {
+
+    private static final Logger log = LoggerFactory.getLogger(HomeAssistantClient.class);
 
     private final WebClient webClient;
     private final String accessToken;
@@ -53,7 +57,7 @@ public class HomeAssistantClient {
             return objectMapper.readValue(response,
                     objectMapper.getTypeFactory().constructCollectionType(List.class, Map.class));
         } catch (Exception e) {
-            System.err.println("❌ HA 查询所有实体失败: " + e.getMessage());
+            log.error("❌ HA 查询所有实体失败", e);
             return Collections.emptyList();
         }
     }
@@ -71,7 +75,7 @@ public class HomeAssistantClient {
                     .block();
             return objectMapper.readValue(response, Map.class);
         } catch (Exception e) {
-            System.err.println("❌ HA 查询实体 " + entityId + " 失败: " + e.getMessage());
+            log.error("❌ HA 查询实体 {} 失败", entityId, e);
             return null;
         }
     }
@@ -143,7 +147,7 @@ public class HomeAssistantClient {
                     .block();
             return true;
         } catch (Exception e) {
-            System.err.println("❌ HA 调用服务 " + domain + "/" + service + " 失败: " + e.getMessage());
+            log.error("❌ HA 调用服务 {}/{} 失败", domain, service, e);
             return false;
         }
     }

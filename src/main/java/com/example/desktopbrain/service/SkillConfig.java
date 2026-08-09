@@ -1,12 +1,13 @@
 package com.example.desktopbrain.service;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PostConstruct;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.*;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
@@ -24,6 +25,8 @@ import java.util.regex.Pattern;
 @Component
 public class SkillConfig {
 
+    private static final Logger log = LoggerFactory.getLogger(SkillConfig.class);
+
     /** 缓存的技能列表 */
     private volatile List<Skill> skills = new ArrayList<>();
 
@@ -39,11 +42,11 @@ public class SkillConfig {
         // 尝试找到 skills 目录
         skillsDir = findSkillsDir();
         if (skillsDir == null) {
-            System.out.println("ℹ️ 未找到 skills/ 目录，技能配置为空");
+            log.info("ℹ️ 未找到 skills/ 目录，技能配置为空");
             return;
         }
         reload();
-        System.out.println("📋 技能配置就绪 (" + skills.size() + " 个技能，热加载已开启)");
+        log.info("📋 技能配置就绪 ({} 个技能，热加载已开启)", skills.size());
     }
 
     /** 查找 skills 目录（开发期用 classpath，打包后用外部路径） */
@@ -89,7 +92,7 @@ public class SkillConfig {
             }
             skills = loaded;
         } catch (IOException e) {
-            System.err.println("⚠ 技能目录扫描失败: " + e.getMessage());
+            log.error("⚠ 技能目录扫描失败: {}", e.getMessage());
         }
     }
 
@@ -190,9 +193,9 @@ public class SkillConfig {
             }
 
             if (changed) {
-                System.out.println("🔄 检测到技能文件变更，热加载中...");
+                log.info("🔄 检测到技能文件变更，热加载中...");
                 reload();
-                System.out.println("📋 技能已更新 (" + skills.size() + " 个技能)");
+                log.info("📋 技能已更新 ({} 个技能)", skills.size());
             }
         } catch (IOException ignored) {}
     }

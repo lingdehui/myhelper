@@ -5,7 +5,8 @@ desktopbrain:
     idle-threshold-minutes: 30       # 空闲多久后触发探索
     max-duration-minutes: 15         # 单次探索最长耗时
     blackout-hours: []               # 留空=全天可探索
-    model: qwen2.5:3b                # 探索决策用模型
+    base-url: http://localhost:11434/v1      # Ollama 本地 qwen2.5:14b（备）
+    model: qwen2.5:14b                        # 模型1 故障/能力不足时降级
     allowed-domains:                 # 浏览器白名单域名
       - docs.spring.io
       - developer.mozilla.org

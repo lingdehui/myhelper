@@ -3,6 +3,8 @@ package com.example.desktopbrain.memory;
 import com.example.desktopbrain.memory.graph.KnowledgeGraphService;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.example.desktopbrain.memory.vector.VectorMemoryService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -15,6 +17,8 @@ import java.util.Map;
  */
 @Service
 public class MemoryService {
+
+    private static final Logger log = LoggerFactory.getLogger(MemoryService.class);
 
     private final KnowledgeGraphService knowledgeGraph;
     private final VectorMemoryService vectorMemory;
@@ -33,13 +37,13 @@ public class MemoryService {
     /** 注册设备 */
     public void registerDevice(String name, String type, String room) {
         knowledgeGraph.upsertDevice(name, type, room);
-        System.out.println("📊 知识图谱: 已注册设备 " + name + " (" + type + ")");
+        log.info("📊 知识图谱: 已注册设备 {} ({})", name, type);
     }
 
     /** 学习用户偏好 */
     public void learnPreference(String category, String key, String value) {
         knowledgeGraph.learnPreference(category, key, value);
-        System.out.println("📊 知识图谱: 已学习偏好 " + category + " -> " + key + "=" + value);
+        log.info("📊 知识图谱: 已学习偏好 {} -> {}={}", category, key, value);
     }
 
     /** 获取房间设备列表 */
@@ -63,7 +67,7 @@ public class MemoryService {
                 "timestamp", String.valueOf(System.currentTimeMillis())
         );
         vectorMemory.store(content, vector, metadata);
-        System.out.println("🧠 向量记忆: 已存储 (" + type + ") " + summarize(content));
+        log.info("🧠 向量记忆: 已存储 ({}) {}", type, summarize(content));
     }
 
     /**

@@ -1,5 +1,7 @@
 package com.example.desktopbrain.exploration;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -9,6 +11,8 @@ import org.springframework.stereotype.Component;
  */
 @Component
 public class ExplorationTool {
+
+    private static final Logger log = LoggerFactory.getLogger(ExplorationTool.class);
 
     private final AutonomousExplorationService explorationService;
     private final MemoryMaintenanceService maintenanceService;
@@ -30,9 +34,9 @@ public class ExplorationTool {
     public String startAutonomousLearning(
             @ToolParam(description = "学习主题（可选），为空则 AI 自主决定学什么") String topic) {
         if (topic != null && !topic.isBlank()) {
-            System.out.println("📚 手动触发探索，主题: " + topic);
+            log.info("📚 手动触发探索，主题: {}", topic);
         } else {
-            System.out.println("📚 手动触发自主探索");
+            log.info("📚 手动触发自主探索");
         }
         explorationService.forceExplore();
         return "已触发自主探索任务，学习结果会自动沉淀到知识库中。";

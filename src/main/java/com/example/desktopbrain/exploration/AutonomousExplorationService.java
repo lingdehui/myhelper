@@ -6,8 +6,9 @@ import com.example.desktopbrain.memory.vector.episode.EpisodeCacheService;
 import com.example.desktopbrain.memory.vector.episode.FailureExperienceHandler;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.beans.factory.annotation.Qualifier;
+import com.example.desktopbrain.config.ModelRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -21,6 +22,8 @@ import java.util.concurrent.CompletableFuture;
 @Service
 public class AutonomousExplorationService {
 
+    private static final Logger log = LoggerFactory.getLogger(AutonomousExplorationService.class);
+
     private final IdleDetectionService idleDetection;
     private final EpisodeCacheService episodeCache;
     private final FailureExperienceHandler failureHandler;
@@ -29,8 +32,7 @@ public class AutonomousExplorationService {
     private final DesktopBrainProperties props;
     private final ObjectMapper objectMapper;
 
-    /** 探索专用 ChatClient（用小模型） */
-    private final ChatClient explorationChatClient;
+    private final ModelRouter modelRouter;
 
     public AutonomousExplorationService(IdleDetectionService idleDetection,
                                          EpisodeCacheService episodeCache,
@@ -38,7 +40,7 @@ public class AutonomousExplorationService {
                                          ExplorationExecutor executor,
                                          PromptLoader promptLoader,
                                          DesktopBrainProperties props,
-                                         @Qualifier("ollama") ChatClient explorationChatClient) {
+                                         ModelRouter modelRouter) {
         this.idleDetection = idleDetection;
         this.episodeCache = episodeCache;
         this.failureHandler = failureHandler;
@@ -46,14 +48,15 @@ public class AutonomousExplorationService {
         this.promptLoader = promptLoader;
         this.props = props;
         this.objectMapper = new ObjectMapper();
-        this.explorationChatClient = explorationChatClient;
+        this.modelRouter = modelRouter;
     }
 
     /**
      * 定时巡检：每 5 分钟检查一次空闲条件，自动触发探索。
      * 与手动触发（ExplorationTool）共享同一入口。
      */
-    @Scheduled(fixedDelay = 300_000, initialDelay = 60_000)
+    @Scheduled(fixedDelayString = "${desktopbrain.exploration.check-interval-ms:300000}",
+               initialDelayString = "${desktopbrain.exploration.initial-delay-ms:60000}")
     public void scheduledExplore() {
         tryExplore();
     }
@@ -75,7 +78,7 @@ public class AutonomousExplorationService {
     private void doExplore() {
         CompletableFuture.runAsync(() -> {
             try {
-                System.out.println("🔍 开始自主探索会话...");
+                log.info("🔍 开始自主探索会话...");
 
                 // 1. 收集上下文
                 String context = buildContext();
@@ -83,18 +86,17 @@ public class AutonomousExplorationService {
                 // 2. LLM 决策
                 ExplorationDecision decision = decide(context);
                 if (decision == null || "SKIP".equalsIgnoreCase(decision.decision())) {
-                    System.out.println("⏭️ 探索跳过: " + (decision != null ? decision.reason() : "决策失败"));
+                    log.info("⏭️ 探索跳过: {}", decision != null ? decision.reason() : "决策失败");
                     return;
                 }
 
-                System.out.println("📚 探索目标: " + decision.learningGoal()
-                        + " (方法: " + decision.method() + ", 优先级: " + decision.priority() + ")");
+                log.info("📚 探索目标: {} (方法: {}, 优先级: {})", decision.learningGoal(), decision.method(), decision.priority());
 
                 // 3. 异步执行探索（不阻塞）
                 executor.execute(decision);
 
             } catch (Exception e) {
-                System.err.println("❌ 自主探索决策失败: " + e.getMessage());
+                log.error("❌ 自主探索决策失败", e);
             }
         });
     }
@@ -121,20 +123,63 @@ public class AutonomousExplorationService {
                 .replace("{knowledge_count}", String.valueOf(knowledgeCount));
     }
 
+    /** 从 AI 返回的文本中提取 JSON 对象 */
+    private static String extractJson(String text) {
+        if (text == null || text.isBlank()) return null;
+        String s = text.trim();
+        // 0. 去掉可能的思考标签（如 deepseek-r1 的 <｜end▁of▁thinking｜>...）
+        s = s.replaceAll("(?s)___[^_]*___", "");
+        s = s.replaceAll("(?s)^\\s*", "");
+        s = s.trim();
+        // 1. 去掉 markdown 代码块
+        s = s.replaceAll("(?s)```[a-zA-Z]*\\s*", "```"); // normalize ```json → ```
+        if (s.startsWith("```")) {
+            s = s.substring(3);
+            int end = s.lastIndexOf("```");
+            if (end > 0) s = s.substring(0, end);
+        }
+        s = s.trim();
+        // 2. 找第一个 { 或 [ 到对应的结尾
+        int start = s.indexOf('{');
+        if (start < 0) start = s.indexOf('[');
+        if (start < 0) return null;
+        int depth = 0;
+        boolean inString = false;
+        boolean escaped = false;
+        char openChar = s.charAt(start);
+        char closeChar = openChar == '{' ? '}' : ']';
+        for (int i = start; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (inString) {
+                if (escaped) { escaped = false; continue; }
+                if (c == '\\') { escaped = true; continue; }
+                if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == openChar) depth++;
+            else if (c == closeChar) { depth--; if (depth == 0) return s.substring(start, i + 1); }
+        }
+        return null;
+    }
+
     /** 调用小模型做探索决策 */
     private ExplorationDecision decide(String context) {
         try {
-            String response = explorationChatClient.prompt()
+            String response = modelRouter.exploration().prompt()
                     .user(context)
                     .call()
                     .content();
 
-            if (response == null || response.isBlank()) return null;
+            if (response == null || response.isBlank()) {
+                log.warn("⏭️ 探索决策: AI 返回空响应");
+                return null;
+            }
 
-            // 清理 markdown 代码块
-            String json = response.trim();
-            if (json.startsWith("```")) {
-                json = json.replaceAll("```[a-z]*", "").replace("```", "").trim();
+            String json = extractJson(response);
+            if (json == null) {
+                log.warn("⏭️ 探索决策: 无法提取 JSON（前 200 字符）: {}", response.substring(0, Math.min(200, response.length())));
+                return null;
             }
 
             Map<String, Object> map = objectMapper.readValue(json,
@@ -161,7 +206,7 @@ public class AutonomousExplorationService {
             );
 
         } catch (Exception e) {
-            System.err.println("❌ 探索决策 JSON 解析失败: " + e.getMessage());
+            log.error("❌ 探索决策失败: {}", e.getMessage());
             return null;
         }
     }

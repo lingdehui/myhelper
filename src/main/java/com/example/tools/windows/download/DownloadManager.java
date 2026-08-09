@@ -1,5 +1,7 @@
 package com.example.tools.windows.download;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.stereotype.Component;
 
@@ -11,6 +13,8 @@ import java.net.URL;
 
 @Component
 public class DownloadManager {
+
+    private static final Logger log = LoggerFactory.getLogger(DownloadManager.class);
 
     @Tool(description = "从指定 URL 下载文件到本地，支持断点续传和进度显示")
     public String downloadFile(String url, String savePath) {
@@ -36,7 +40,7 @@ public class DownloadManager {
                     if (contentLength > 0) {
                         // 可以在此处发送进度信息
                         int progress = (int) (totalBytes * 100 / contentLength);
-                        System.out.println("下载进度: " + progress + "%");
+                        log.info("下载进度: {}%", progress);
                     }
                 }
             }

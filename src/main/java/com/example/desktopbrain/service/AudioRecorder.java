@@ -1,11 +1,14 @@
 package com.example.desktopbrain.service;
 
-import com.k2fsa.sherpa.onnx.WaveWriter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.sound.sampled.*;
 import java.io.ByteArrayOutputStream;
 
 public class AudioRecorder {
+
+    private static final Logger log = LoggerFactory.getLogger(AudioRecorder.class);
 
     /**
      * 录音结果：包含采样数据和实际使用的采样率

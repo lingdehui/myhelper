@@ -6,7 +6,9 @@ import com.example.desktopbrain.memory.graph.FailurePatternRepository;
 import com.example.desktopbrain.memory.graph.RuleNode;
 import com.example.desktopbrain.memory.graph.RuleRepository;
 import com.example.desktopbrain.memory.vector.episode.EpisodeCacheService;
-import org.springframework.ai.chat.client.ChatClient;
+import com.example.desktopbrain.config.ModelRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -27,18 +29,20 @@ import java.util.regex.Pattern;
 @Service
 public class RuleInductionService {
 
-    private final ChatClient chatClient;
+    private static final Logger log = LoggerFactory.getLogger(RuleInductionService.class);
+
+    private final ModelRouter modelRouter;
     private final RuleRepository ruleRepo;
     private final FailurePatternRepository failurePatternRepo;
     private final EpisodeCacheService episodeCacheService;
     private final PromptLoader promptLoader;
 
-    public RuleInductionService(ChatClient chatClient,
+    public RuleInductionService(ModelRouter modelRouter,
                                  RuleRepository ruleRepo,
                                  FailurePatternRepository failurePatternRepo,
                                  EpisodeCacheService episodeCacheService,
                                  PromptLoader promptLoader) {
-        this.chatClient = chatClient;
+        this.modelRouter = modelRouter;
         this.ruleRepo = ruleRepo;
         this.failurePatternRepo = failurePatternRepo;
         this.episodeCacheService = episodeCacheService;
@@ -50,18 +54,18 @@ public class RuleInductionService {
      *
      * <p>首次运行时没有规则，后续只归纳新增的 FailurePattern（距上次归纳之后产生的）。</p>
      */
-    @Scheduled(cron = "0 0 3 * * ?")
+    @Scheduled(cron = "${desktopbrain.rule-induction.cron:0 0 3 * * ?}")
     public void scheduledInduction() {
-        System.out.println("🧠 开始定时规则归纳...");
+        log.info("🧠 开始定时规则归纳...");
         try {
             int newRules = induceRules();
             if (newRules > 0) {
-                System.out.println("🧠 规则归纳完成，新增 " + newRules + " 条规则");
+                log.info("🧠 规则归纳完成，新增 {} 条规则", newRules);
             } else {
-                System.out.println("🧠 规则归纳完成，无新增规则");
+                log.info("🧠 规则归纳完成，无新增规则");
             }
         } catch (Exception e) {
-            System.err.println("⚠️ 规则归纳失败: " + e.getMessage());
+            log.error("⚠️ 规则归纳失败: {}", e.getMessage());
         }
     }
 
@@ -85,7 +89,7 @@ public class RuleInductionService {
 
         // 4. 没有新材料则跳过
         if (newFailures.isEmpty() && recentSuccesses.isEmpty()) {
-            System.out.println("🧠 无新材料，跳过规则归纳");
+            log.info("🧠 无新材料，跳过规则归纳");
             return 0;
         }
 
@@ -95,9 +99,9 @@ public class RuleInductionService {
         // 6. 调用 LLM
         String response;
         try {
-            response = chatClient.prompt().user(prompt).call().content();
+            response = modelRouter.normal().prompt().user(prompt).call().content();
         } catch (Exception e) {
-            System.err.println("⚠️ LLM 规则归纳调用失败: " + e.getMessage());
+            log.error("⚠️ LLM 规则归纳调用失败: {}", e.getMessage());
             return 0;
         }
 
@@ -117,7 +121,7 @@ public class RuleInductionService {
             if (!existingSummaries.contains(rule.getSummary().trim().toLowerCase())) {
                 ruleRepo.save(rule);
                 newCount++;
-                System.out.println("📜 新规则: [" + String.format("%.0f%%", rule.getConfidence() * 100) + "] " + rule.getSummary());
+                log.info("📜 新规则: [{}%] {}", String.format("%.0f", rule.getConfidence() * 100), rule.getSummary());
             }
         }
 
@@ -131,7 +135,7 @@ public class RuleInductionService {
         try {
             return ruleRepo.findByEnabledTrueOrderByConfidenceDesc();
         } catch (Exception e) {
-            System.err.println("⚠️ 获取活跃规则失败: " + e.getMessage());
+            log.error("⚠️ 获取活跃规则失败: {}", e.getMessage());
             return List.of();
         }
     }

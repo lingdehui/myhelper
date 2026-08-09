@@ -3,6 +3,8 @@ package com.example.desktopbrain.service;
 import com.k2fsa.sherpa.onnx.*;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
@@ -12,6 +14,8 @@ import java.nio.file.Path;
 
 @Service
 public class LocalASR {
+
+    private static final Logger log = LoggerFactory.getLogger(LocalASR.class);
 
     private static final int SAMPLE_RATE = 16000;
 
@@ -63,7 +67,7 @@ public class LocalASR {
 
         // 预热
         recognizeOnline(new float[480], SAMPLE_RATE);
-        System.out.println("✅ 流式 ASR（唤醒词检测）就绪");
+        log.info("✅ 流式 ASR（唤醒词检测）就绪");
     }
 
     // ========== OfflineRecognizer（对话识别，Paraformer）==========
@@ -71,7 +75,7 @@ public class LocalASR {
         Path modelDir = Path.of("models", "asr-offline", "sherpa-onnx-paraformer-zh-small-2024-03-09")
                 .toAbsolutePath();
         if (!Files.exists(modelDir)) {
-            System.out.println("⚠️ Paraformer 模型未找到: " + modelDir + "，离线 ASR 不可用");
+            log.warn("⚠️ Paraformer 模型未找到: {}，离线 ASR 不可用", modelDir);
             return;
         }
 
@@ -92,16 +96,16 @@ public class LocalASR {
                 .build();
         this.offlineRecognizer = new OfflineRecognizer(config);
 
-        // 预热（try-catch 保护：零采样可能触发 Paraformer Conv 形状边界问题，不影响实际语音识别）
+        // 预热：喂 1 秒静音，避免 30ms 短音频触发 Paraformer Conv 层 Invalid input shape: {0}
         try {
             OfflineStream stream = offlineRecognizer.createStream();
-            stream.acceptWaveform(new float[480], SAMPLE_RATE);
+            stream.acceptWaveform(new float[SAMPLE_RATE], SAMPLE_RATE);
             offlineRecognizer.decode(stream);
             stream.release();
         } catch (Exception e) {
-            System.err.println("⚠️ Paraformer 预热异常（实际语音可能正常）: " + e.getMessage());
+            log.warn("⚠️ Paraformer 预热异常（实际语音可能正常）: {}", e.getMessage());
         }
-        System.out.println("✅ 离线 ASR（Paraformer 对话识别）就绪");
+        log.info("✅ 离线 ASR（Paraformer 对话识别）就绪");
     }
 
     // ========== 在线识别（唤醒词检测）==========

@@ -2,8 +2,10 @@ package com.example.desktopbrain.memory.vector.episode;
 
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.PromptLoader;
+import com.example.desktopbrain.config.ModelRouter;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.ai.chat.client.ChatClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.Collections;
@@ -29,12 +31,14 @@ import java.util.Set;
 @Service
 public class PlanMatcher {
 
-    private final ChatClient chatClient;
-    private final ObjectMapper objectMapper;
-    private final PromptLoader promptLoader;
+    private static final Logger log = LoggerFactory.getLogger(PlanMatcher.class);
 
-    public PlanMatcher(ChatClient chatClient, PromptLoader promptLoader) {
-        this.chatClient = chatClient;
+    private final ModelRouter modelRouter;
+    private final PromptLoader promptLoader;
+    private final ObjectMapper objectMapper;
+
+    public PlanMatcher(ModelRouter modelRouter, PromptLoader promptLoader) {
+        this.modelRouter = modelRouter;
         this.objectMapper = new ObjectMapper();
         this.promptLoader = promptLoader;
     }
@@ -76,10 +80,10 @@ public class PlanMatcher {
         if (episode.unitType() == Episode.UnitType.ATOMIC && episode.isGeneric()) {
             String reason = "ATOMIC 通用步骤: " + episode.userInput();
             if (isSemanticallyRelated(userInput, episode.userInput())) {
-                System.out.println("🧩 ATOMIC 通用步骤适用: " + reason);
+                log.info("🧩 ATOMIC 通用步骤适用: {}", reason);
                 return MatchResult.applicable(Map.of(), reason);
             } else {
-                System.out.println("🧩 ATOMIC 通用步骤不匹配当前输入，跳过: " + reason);
+                log.info("🧩 ATOMIC 通用步骤不匹配当前输入，跳过: {}", reason);
                 return MatchResult.notApplicable("ATOMIC 工具链与用户输入不相关");
             }
         }
@@ -101,10 +105,10 @@ public class PlanMatcher {
                 .formatted(stripPii(userInput), episode.userInput(), stepsDesc, varList);
 
         try {
-            String response = chatClient.prompt().user(prompt).call().content();
+            String response = modelRouter.normal().prompt().user(prompt).call().content();
             return parseMatchResult(response);
         } catch (Exception e) {
-            System.err.println("⚠️ PlanMatcher AI 判断失败: " + e.getMessage());
+            log.error("⚠️ PlanMatcher AI 判断失败: {}", e.getMessage());
             return MatchResult.notApplicable("AI 判断异常: " + e.getMessage());
         }
     }
@@ -197,14 +201,14 @@ public class PlanMatcher {
                 }
             }
             if (applicable) {
-                System.out.println("✅ 计划可用（变量: " + variables + "）" + reason);
+                log.info("✅ 计划可用（变量: {}）{}", variables, reason);
                 return MatchResult.applicable(variables, reason);
             } else {
-                System.out.println("❌ 计划不适用: " + reason);
+                log.info("❌ 计划不适用: {}", reason);
                 return MatchResult.notApplicable(reason);
             }
         } catch (Exception e) {
-            System.err.println("⚠️ PlanMatcher JSON 解析失败: " + e.getMessage() + " | 原始: " + json);
+            log.error("⚠️ PlanMatcher JSON 解析失败: {} | 原始: {}", e.getMessage(), json);
             return MatchResult.notApplicable("JSON 解析失败");
         }
     }

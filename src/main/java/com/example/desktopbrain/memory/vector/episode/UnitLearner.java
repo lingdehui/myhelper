@@ -2,7 +2,10 @@ package com.example.desktopbrain.memory.vector.episode;
 
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
+import com.example.desktopbrain.memory.vector.QdrantDtos;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -40,6 +43,8 @@ import java.util.concurrent.CompletableFuture;
  */
 @Service
 public class UnitLearner {
+
+    private static final Logger log = LoggerFactory.getLogger(UnitLearner.class);
 
     private final WebClient qdrant;
     private final EmbeddingService embeddingService;
@@ -122,13 +127,11 @@ public class UnitLearner {
                 if (div.isDiverse) {
                     // 不同任务中反复出现 → 高置信度通用步骤
                     initialStability = 0.7;
-                    System.out.println("  🧩 高置信度 ATOMIC: " + entry.getKey()
-                            + "（" + div.diverseCount + " 种不同任务）");
+                    log.info("  🧩 高置信度 ATOMIC: {}（{} 种不同任务）", entry.getKey(), div.diverseCount);
                 } else {
                     // 相同任务重复出现 → 可能只是任务模式，低置信度
                     initialStability = 0.3;
-                    System.out.println("  🧩 低置信度 ATOMIC: " + entry.getKey()
-                            + "（仅 1 种任务，" + div.totalCount + " 次重复）→ stability=" + initialStability + "，需实际验证");
+                    log.info("  🧩 低置信度 ATOMIC: {}（仅 1 种任务，{} 次重复）→ stability={}，需实际验证", entry.getKey(), div.totalCount, initialStability);
                 }
 
                 // 创建 ATOMIC episode
@@ -138,17 +141,16 @@ public class UnitLearner {
             }
 
             if (created > 0) {
-                System.out.println("🧩 UnitLearner 提取 " + created + " 个通用 ATOMIC 步骤");
+                log.info("🧩 UnitLearner 提取 {} 个通用 ATOMIC 步骤", created);
             }
 
         } catch (Exception e) {
-            System.err.println("⚠️ UnitLearner 提取失败: " + e.getMessage());
+            log.error("⚠️ UnitLearner 提取失败: {}", e.getMessage());
         }
     }
 
     // ========== Qdrant 查询 ==========
 
-    @SuppressWarnings("unchecked")
     private List<Episode> fetchActiveComposites() {
         List<Episode> result = new ArrayList<>();
         try {
@@ -166,40 +168,36 @@ public class UnitLearner {
                 scrollBody.put("filter", filter);
                 if (offset != null) scrollBody.put("offset", offset);
 
-                Map<String, Object> response = qdrant.post()
+                QdrantDtos.ScrollResponse response = qdrant.post()
                         .uri("/collections/" + collectionName + "/points/scroll")
                         .header("Content-Type", "application/json")
                         .bodyValue(scrollBody)
                         .retrieve()
-                        .bodyToMono(Map.class)
+                        .bodyToMono(QdrantDtos.ScrollResponse.class)
                         .block();
 
-                if (response == null) break;
+                if (response == null || response.result() == null) break;
 
-                Map<String, Object> r = (Map<String, Object>) response.get("result");
-                if (r == null) break;
+                List<QdrantDtos.ScoredPoint> points = response.result().points();
+                if (points == null || points.isEmpty()) break;
 
-                List<Map<String, Object>> points =
-                        (List<Map<String, Object>>) r.getOrDefault("points", List.of());
-                if (points.isEmpty()) break;
-
-                for (Map<String, Object> point : points) {
+                for (QdrantDtos.ScoredPoint point : points) {
                     Episode ep = deserializeEpisode(point);
                     if (ep != null && ep.toolCalls() != null && !ep.toolCalls().isEmpty()) {
                         result.add(ep);
                     }
                 }
 
-                offset = (String) r.get("next_page_offset");
-                if (offset == null || offset.isEmpty()) break;
+                String nextOffset = response.result().next_page_offset();
+                offset = (nextOffset != null && !nextOffset.isEmpty()) ? nextOffset : null;
+                if (offset == null) break;
             }
         } catch (Exception e) {
-            System.err.println("⚠️ UnitLearner 查询 ACTIVE episode 失败: " + e.getMessage());
+            log.error("⚠️ UnitLearner 查询 ACTIVE episode 失败: {}", e.getMessage());
         }
         return result;
     }
 
-    @SuppressWarnings("unchecked")
     private Set<String> fetchExistingAtomicSequences() {
         Set<String> sequences = new HashSet<>();
         try {
@@ -212,12 +210,11 @@ public class UnitLearner {
                 }
             }
         } catch (Exception e) {
-            System.err.println("⚠️ UnitLearner 查询已有 ATOMIC 失败: " + e.getMessage());
+            log.error("⚠️ UnitLearner 查询已有 ATOMIC 失败: {}", e.getMessage());
         }
         return sequences;
     }
 
-    @SuppressWarnings("unchecked")
     private List<Episode> fetchAtomics() {
         List<Episode> result = new ArrayList<>();
         try {
@@ -231,25 +228,25 @@ public class UnitLearner {
             ));
             body.put("filter", filter);
 
-            Map<String, Object> response = qdrant.post()
+            QdrantDtos.ScrollResponse response = qdrant.post()
                     .uri("/collections/" + collectionName + "/points/scroll")
                     .header("Content-Type", "application/json")
                     .bodyValue(body)
                     .retrieve()
-                    .bodyToMono(Map.class)
+                    .bodyToMono(QdrantDtos.ScrollResponse.class)
                     .block();
 
-            if (response != null && response.containsKey("result")) {
-                Map<String, Object> r = (Map<String, Object>) response.get("result");
-                List<Map<String, Object>> points =
-                        (List<Map<String, Object>>) r.getOrDefault("points", List.of());
-                for (Map<String, Object> point : points) {
-                    Episode ep = deserializeEpisode(point);
-                    if (ep != null) result.add(ep);
+            if (response != null && response.result() != null) {
+                List<QdrantDtos.ScoredPoint> points = response.result().points();
+                if (points != null) {
+                    for (QdrantDtos.ScoredPoint point : points) {
+                        Episode ep = deserializeEpisode(point);
+                        if (ep != null) result.add(ep);
+                    }
                 }
             }
         } catch (Exception e) {
-            System.err.println("⚠️ UnitLearner 查询 ATOMIC 失败: " + e.getMessage());
+            log.error("⚠️ UnitLearner 查询 ATOMIC 失败: {}", e.getMessage());
         }
         return result;
     }
@@ -336,10 +333,9 @@ public class UnitLearner {
             payload.put("failedStepIndex", -1);
 
             upsertPoint(episodeId, vector, payload);
-            System.out.println("🧩 新增 ATOMIC: " + description
-                    + " (被 " + parentIds.size() + " 个计划引用)");
+            log.info("🧩 新增 ATOMIC: {} (被 {} 个计划引用)", description, parentIds.size());
         } catch (Exception e) {
-            System.err.println("⚠️ ATOMIC 创建失败: " + e.getMessage());
+            log.error("⚠️ ATOMIC 创建失败: {}", e.getMessage());
         }
     }
 
@@ -361,7 +357,7 @@ public class UnitLearner {
                     .toBodilessEntity()
                     .block();
         } catch (Exception e) {
-            System.err.println("❌ ATOMIC upsert 失败: " + e.getMessage());
+            log.error("❌ ATOMIC upsert 失败: {}", e.getMessage());
         }
     }
 
@@ -388,7 +384,7 @@ public class UnitLearner {
         return List.of();
     }
 
-    private Episode deserializeEpisode(Map<String, Object> point) {
+    private Episode deserializeEpisode(QdrantDtos.ScoredPoint point) {
         return Episode.fromQdrantPoint(point, objectMapper);
     }
 }

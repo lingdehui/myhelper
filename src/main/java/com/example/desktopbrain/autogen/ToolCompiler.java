@@ -1,5 +1,7 @@
 package com.example.desktopbrain.autogen;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import javax.tools.JavaCompiler;
@@ -29,6 +31,8 @@ import java.util.List;
  */
 @Service
 public class ToolCompiler {
+
+    private static final Logger log = LoggerFactory.getLogger(ToolCompiler.class);
 
     /** 生成工具的源码目录（在 ComponentScan 范围内，重启后自动扫描） */
     public static final String GENERATED_SOURCE_DIR = "src/main/java/com/example/desktopbrain/generated";
@@ -121,7 +125,7 @@ public class ToolCompiler {
             Files.createDirectories(targetDir);
             Path targetFile = targetDir.resolve(className + ".java");
             Files.writeString(targetFile, source);
-            System.out.println("📦 工具源码已持久化: " + targetFile);
+            log.info("📦 工具源码已持久化: {}", targetFile);
             return CompileResult.ok(className, targetFile);
         } catch (Exception e) {
             return CompileResult.fail(className, "持久化源码失败: " + e.getMessage());
@@ -138,7 +142,7 @@ public class ToolCompiler {
     public Path compileForRuntime(String sourceCode, String className) {
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
-            System.err.println("❌ 运行时编译失败: JDK JavaCompiler 不可用");
+            log.warn("❌ 运行时编译失败: JDK JavaCompiler 不可用");
             return null;
         }
         try {
@@ -153,17 +157,17 @@ public class ToolCompiler {
 
             boolean ok = doCompile(compiler, sourceFile, classDir);
             if (!ok) {
-                System.err.println("❌ 运行时编译失败: " + className);
+                log.error("❌ 运行时编译失败: {}", className);
                 return null;
             }
 
             // 编译完删除 .java 文件（源码已在 GENERATED_SOURCE_DIR 持久化）
             try { Files.deleteIfExists(sourceFile); } catch (Exception ignored) {}
 
-            System.out.println("⚡ 运行时编译完成: " + className + " → " + classDir);
+            log.info("⚡ 运行时编译完成: {} → {}", className, classDir);
             return classDir;
         } catch (Exception e) {
-            System.err.println("❌ 运行时编译异常: " + e.getMessage());
+            log.error("❌ 运行时编译异常", e);
             return null;
         }
     }
@@ -183,7 +187,7 @@ public class ToolCompiler {
         boolean ok = task.call();
         if (!ok) {
             String err = errorWriter.toString().trim();
-            if (!err.isEmpty()) System.err.println("⚠️ 编译错误:\n" + err);
+            if (!err.isEmpty()) log.warn("⚠️ 编译错误:\n{}", err);
         }
         return ok;
     }

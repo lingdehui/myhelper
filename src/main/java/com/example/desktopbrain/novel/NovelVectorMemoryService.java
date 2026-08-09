@@ -3,6 +3,8 @@ package com.example.desktopbrain.novel;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -15,6 +17,8 @@ import java.util.*;
  */
 @Service
 public class NovelVectorMemoryService {
+
+    private static final Logger log = LoggerFactory.getLogger(NovelVectorMemoryService.class);
 
     private final WebClient qdrant;
     private final EmbeddingService embeddingService;
@@ -51,12 +55,12 @@ public class NovelVectorMemoryService {
                         .retrieve()
                         .toBodilessEntity()
                         .block();
-                System.out.println("📖 Qdrant 集合 '" + collectionName + "' 已创建");
+                log.info("📖 Qdrant 集合 '{}' 已创建", collectionName);
             } else {
-                System.out.println("📖 Qdrant 集合 '" + collectionName + "' 已存在");
+                log.info("📖 Qdrant 集合 '{}' 已存在", collectionName);
             }
         } catch (Exception e) {
-            System.err.println("⚠️ novel-memory 集合初始化失败: " + e.getMessage());
+            log.warn("⚠️ novel-memory 集合初始化失败", e);
         }
     }
 
@@ -87,7 +91,7 @@ public class NovelVectorMemoryService {
                     .toBodilessEntity()
                     .block();
         } catch (Exception e) {
-            System.err.println("❌ 保存章节摘要到 Qdrant 失败: " + e.getMessage());
+            log.error("❌ 保存章节摘要到 Qdrant 失败", e);
         }
     }
 
@@ -127,7 +131,7 @@ public class NovelVectorMemoryService {
             }
             return results;
         } catch (Exception e) {
-            System.err.println("❌ novel-memory 搜索失败: " + e.getMessage());
+            log.error("❌ novel-memory 搜索失败", e);
             return List.of();
         }
     }

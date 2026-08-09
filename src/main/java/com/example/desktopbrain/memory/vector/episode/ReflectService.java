@@ -3,8 +3,10 @@ package com.example.desktopbrain.memory.vector.episode;
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.PromptLoader;
 import com.example.desktopbrain.config.DesktopBrainProperties;
+import com.example.desktopbrain.config.ModelRouter;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.ai.chat.client.ChatClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -32,15 +34,17 @@ import java.util.Map;
 @Service
 public class ReflectService {
 
-    private final ChatClient chatClient;
-    private final ObjectMapper objectMapper;
+    private static final Logger log = LoggerFactory.getLogger(ReflectService.class);
+
+    private final ModelRouter modelRouter;
     private final DesktopBrainProperties props;
     private final PromptLoader promptLoader;
+    private final ObjectMapper objectMapper;
 
-    public ReflectService(ChatClient chatClient,
+    public ReflectService(ModelRouter modelRouter,
                            DesktopBrainProperties props,
                            PromptLoader promptLoader) {
-        this.chatClient = chatClient;
+        this.modelRouter = modelRouter;
         this.objectMapper = new ObjectMapper();
         this.props = props;
         this.promptLoader = promptLoader;
@@ -83,10 +87,10 @@ public class ReflectService {
                 .formatted(userInput, stepsSummary, AiResponseUtils.truncate(aiResponse, 300));
 
         try {
-            String response = chatClient.prompt().user(prompt).call().content();
+            String response = modelRouter.normal().prompt().user(prompt).call().content();
             return parseVerificationResult(response);
         } catch (Exception e) {
-            System.err.println("⚠️ 执行校验失败: " + e.getMessage());
+            log.error("⚠️ 执行校验失败: {}", e.getMessage());
             // AI故障时保守处理：不存错误结果，让上层重试
             return VerificationResult.failed("校验服务不可用: " + e.getMessage(), List.of());
         }
@@ -111,7 +115,7 @@ public class ReflectService {
 
             return new VerificationResult(success, reason, chains);
         } catch (Exception e) {
-            System.err.println("⚠️ 校验JSON解析失败: " + e.getMessage());
+            log.error("⚠️ 校验JSON解析失败: {}", e.getMessage());
             return VerificationResult.failed("校验返回格式错误", List.of());
         }
     }
@@ -163,10 +167,10 @@ public class ReflectService {
                 .formatted(userInput, stepsDesc);
 
         try {
-            String response = chatClient.prompt().user(prompt).call().content();
+            String response = modelRouter.normal().prompt().user(prompt).call().content();
             return parseSignatureExtraction(response, toolCalls);
         } catch (Exception e) {
-            System.err.println("⚠️ 签名提取失败，原样保留 toolCalls: " + e.getMessage());
+            log.error("⚠️ 签名提取失败，原样保留 toolCalls: {}", e.getMessage());
             return SignatureExtraction.fallback(toolCalls);
         }
     }
@@ -189,6 +193,12 @@ public class ReflectService {
                 signature.put(name, source);
             }
 
+            // 过滤荒谬签名：超过 5 个变量 或 全是 keywordN 模式 → 拒绝
+            if (signature.size() > 5 || signature.keySet().stream().allMatch(k -> k.matches("keyword\\d+"))) {
+                log.info("⚠️ 签名提取不适用（{} 个变量/自动编号），保留原样", signature.size());
+                return SignatureExtraction.fallback(original);
+            }
+
             // 解析模板化后的 args，重建 toolCalls
             Map<Integer, String> templatedArgs = new java.util.HashMap<>();
             List<Map<String, Object>> steps = (List<Map<String, Object>>) parsed.getOrDefault("steps", List.of());
@@ -206,10 +216,10 @@ public class ReflectService {
                         orig.result(), orig.success(), orig.durationMs()));
             }
 
-            System.out.println("✅ 提取变量签名: " + signature.keySet());
+            log.info("✅ 提取变量签名: {}", signature.keySet());
             return new SignatureExtraction(signature, templated);
         } catch (Exception e) {
-            System.err.println("⚠️ 签名 JSON 解析失败: " + e.getMessage());
+            log.error("⚠️ 签名 JSON 解析失败: {}", e.getMessage());
             return SignatureExtraction.fallback(original);
         }
     }
@@ -228,10 +238,10 @@ public class ReflectService {
                 .formatted(userInput, stepsSummary, AiResponseUtils.truncate(aiResponse, 200));
 
         try {
-            String result = chatClient.prompt().user(prompt).call().content();
+            String result = modelRouter.normal().prompt().user(prompt).call().content();
             return AiResponseUtils.truncate(result, 100);
         } catch (Exception e) {
-            System.err.println("⚠️ 成功反思失败: " + e.getMessage());
+            log.error("⚠️ 成功反思失败: {}", e.getMessage());
             return null;
         }
     }
@@ -250,10 +260,10 @@ public class ReflectService {
                 .formatted(userInput, stepsSummary, AiResponseUtils.truncate(errorMessage, 300));
 
         try {
-            String response = chatClient.prompt().user(prompt).call().content();
+            String response = modelRouter.normal().prompt().user(prompt).call().content();
             return parseFailureAnalysis(response);
         } catch (Exception e) {
-            System.err.println("⚠️ 失败反思失败: " + e.getMessage());
+            log.error("⚠️ 失败反思失败: {}", e.getMessage());
             // 默认当作环境问题（不惩罚计划）
             return new FailureAnalysis(null, false);
         }
@@ -274,7 +284,7 @@ public class ReflectService {
             String lesson = (String) parsed.getOrDefault("lesson", null);
             return new FailureAnalysis(AiResponseUtils.truncate(lesson, 100), isPlanIssue);
         } catch (Exception e) {
-            System.err.println("⚠️ 失败分析 JSON 解析失败: " + e.getMessage());
+            log.error("⚠️ 失败分析 JSON 解析失败: {}", e.getMessage());
             return new FailureAnalysis(null, false);
         }
     }

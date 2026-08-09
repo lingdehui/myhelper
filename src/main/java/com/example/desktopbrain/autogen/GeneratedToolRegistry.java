@@ -1,6 +1,8 @@
 package com.example.desktopbrain.autogen;
 
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
 import org.springframework.context.ApplicationContext;
@@ -40,6 +42,8 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Service
 public class GeneratedToolRegistry {
+
+    private static final Logger log = LoggerFactory.getLogger(GeneratedToolRegistry.class);
 
     private final ToolGenerator toolGenerator;
     private final ToolCompiler toolCompiler;
@@ -98,11 +102,11 @@ public class GeneratedToolRegistry {
                         new GeneratedToolInfo(className, desc != null ? desc : className, f, 0));
             }
             if (!files.isEmpty()) {
-                System.out.println("🔧 已加载 " + files.size() + " 个生成工具记录: "
-                        + generatedTools.values().stream().map(GeneratedToolInfo::className).toList());
+                log.info("🔧 已加载 {} 个生成工具记录: {}", files.size(),
+                        generatedTools.values().stream().map(GeneratedToolInfo::className).toList());
             }
         } catch (Exception e) {
-            System.err.println("⚠️ 扫描生成工具目录失败: " + e.getMessage());
+            log.warn("⚠️ 扫描生成工具目录失败", e);
         }
     }
 
@@ -124,9 +128,9 @@ public class GeneratedToolRegistry {
                     new URL[]{classDir.toUri().toURL()},
                     getClass().getClassLoader()
             );
-            System.out.println("⚡ 动态 ClassLoader 就绪 (" + classDir + ")");
+            log.info("⚡ 动态 ClassLoader 就绪 ({})", classDir);
         } catch (Exception e) {
-            System.err.println("⚠️ 初始化动态 ClassLoader 失败: " + e.getMessage());
+            log.warn("⚠️ 初始化动态 ClassLoader 失败", e);
         }
     }
 
@@ -144,7 +148,7 @@ public class GeneratedToolRegistry {
         GeneratedToolInfo existing = generatedTools.get(hash);
         if (existing != null) {
             String msg = "工具已存在（" + existing.className() + "），跳过重复生成";
-            System.out.println("ℹ️ " + msg);
+            log.info("ℹ️ {}", msg);
             return new GenerationOutcome(true, msg, existing.className());
         }
 
@@ -173,14 +177,14 @@ public class GeneratedToolRegistry {
 
                 String msg = "已生成新工具 " + generated.className()
                         + (runtimeLoaded ? "（已即时生效）" : "（重启后生效）");
-                System.out.println("✅ " + msg);
+                log.info("✅ {}", msg);
                 return new GenerationOutcome(true, msg, generated.className());
             }
 
             // 编译失败，记录错误信息作为下次生成的反馈
             feedback = result.errorMessage();
-            System.out.println("⚠️ 第 " + (attempt + 1) + " 次生成编译失败，"
-                    + (attempt < maxRetries ? "将带错误信息重试" : "已达最大重试次数"));
+            log.info("⚠️ 第 {} 次生成编译失败，{}", attempt + 1,
+                    (attempt < maxRetries ? "将带错误信息重试" : "已达最大重试次数"));
         }
 
         return new GenerationOutcome(false, "工具生成失败（编译错误，重试 " + maxRetries + " 次仍未通过）", null);
@@ -236,13 +240,13 @@ public class GeneratedToolRegistry {
             // 5. 注册到动态工具列表
             for (ToolCallback tc : callbacks) {
                 dynamicTools.add(tc);
-                System.out.println("  ⚡ 动态注册工具: " + tc.getToolDefinition().name());
+                log.info("  ⚡ 动态注册工具: {}", tc.getToolDefinition().name());
             }
 
-            System.out.println("⚡ 工具 " + className + " 已即时生效（" + callbacks.length + " 个方法）");
+            log.info("⚡ 工具 {} 已即时生效（{} 个方法）", className, callbacks.length);
             return true;
         } catch (Exception e) {
-            System.err.println("⚠️ 运行时动态加载失败（降级为重启后生效）: " + e.getMessage());
+            log.warn("⚠️ 运行时动态加载失败（降级为重启后生效）", e);
             return false;
         }
     }
@@ -267,10 +271,10 @@ public class GeneratedToolRegistry {
         try {
             Files.deleteIfExists(entry.get().getValue().sourceFile());
             generatedTools.remove(entry.get().getKey());
-            System.out.println("🗑️ 已删除生成工具: " + className + "（重启后完全移除）");
+            log.info("🗑️ 已删除生成工具: {}（重启后完全移除）", className);
             return true;
         } catch (Exception e) {
-            System.err.println("❌ 删除生成工具失败: " + e.getMessage());
+            log.error("❌ 删除生成工具失败", e);
             return false;
         }
     }

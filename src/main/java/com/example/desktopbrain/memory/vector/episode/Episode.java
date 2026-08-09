@@ -3,6 +3,10 @@ package com.example.desktopbrain.memory.vector.episode;
 import java.util.List;
 import java.util.Map;
 
+import com.example.desktopbrain.memory.vector.QdrantDtos;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * 一次完整的任务执行轨迹（ExpeL/MUSE 经验学习的最小单元）。
  *
@@ -75,6 +79,7 @@ public record Episode(
         ExplorationType explorationType,
         String explorationSummary
 ) {
+    private static final Logger log = LoggerFactory.getLogger(Episode.class);
     /** 单元类型 */
     public enum UnitType {
         /** 复合计划：包含有序步骤（toolCalls 脚本），可变量化复用 */
@@ -128,12 +133,11 @@ public record Episode(
     }
 
     /** 从 Qdrant point 反序列化 Episode（静态共享，避免分散复制） */
-    @SuppressWarnings("unchecked")
-    public static Episode fromQdrantPoint(Map<String, Object> point, com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
+    public static Episode fromQdrantPoint(QdrantDtos.ScoredPoint point, com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
         try {
-            Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+            Map<String, Object> payload = point.payload();
             if (payload == null) return null;
-            String id = String.valueOf(point.get("id"));
+            String id = point.id();
             payload.put("id", id);
             payload.putIfAbsent("successLesson", null);
             payload.putIfAbsent("failureLesson", null);
@@ -148,7 +152,7 @@ public record Episode(
             payload.putIfAbsent("explorationSummary", null);
             return objectMapper.convertValue(payload, Episode.class);
         } catch (Exception e) {
-            System.err.println("❌ Episode 反序列化失败: " + e.getMessage());
+            log.error("❌ Episode 反序列化失败: {}", e.getMessage());
             return null;
         }
     }

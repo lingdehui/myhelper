@@ -1,6 +1,9 @@
 server:
   port: 8082
 spring:
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: false
   config:
     import:
       - classpath:config/desktopbrain-voice.yml
@@ -16,12 +19,15 @@ spring:
             robot-mcp:
               url: http://127.0.0.1:8081/mcp
               request-timeout: 30s
+    openai:
+      api-key: sk-f2fcd2a4bdb44f02a410c3f030d6fb8b
+      base-url: https://api.deepseek.com
   # ===== Neo4j 知识图谱 =====
   neo4j:
     uri: bolt://localhost:7687
     authentication:
       username: neo4j
-      password: ll425972
+      password: neo4j123
 
 # ===== Qdrant 向量数据库 =====
 qdrant:
@@ -38,12 +44,12 @@ qdrant:
 
 # ===== 双模型配置 =====
 desktopbrain:
-  deepseek:                           # 模型 1: DeepSeek（远程）— 用户对话、工具执行
-    base-url: https://api.deepseek.com
-    api-key: sk-5f0c105555904aec8c86953f3a91a528
-    model: deepseek-v4-pro
-  exploration:                        # 模型 2: Ollama（本地）— 自主探索
-    model: qwen2.5:3b
+  #  deepseek:                           # 模型 1: DeepSeek（远程）— 用户对话、工具执行
+  #    base-url: https://api.deepseek.com
+  #    api-key: sk-f2fcd2a4bdb44f02a410c3f030d6fb8b
+  #    model: deepseek-v4-pro
+  exploration:                        # 模型 2: 本地 Ollama qwen2.5:14b — 模型1 故障/能力不足时降级（见 desktopbrain-exploration.yml）
+    model: qwen2.5:14b
 
 # ===== Home Assistant 智能家居 =====
 homeassistant:

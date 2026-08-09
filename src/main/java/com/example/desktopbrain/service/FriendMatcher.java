@@ -3,6 +3,8 @@ package com.example.desktopbrain.service;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -19,6 +21,8 @@ import java.util.*;
  */
 @Component
 public class FriendMatcher {
+
+    private static final Logger log = LoggerFactory.getLogger(FriendMatcher.class);
 
     private static final Path DATA_PATH = Path.of("wechat-friends.json").toAbsolutePath();
     private final ObjectMapper mapper = new ObjectMapper();
@@ -40,12 +44,12 @@ public class FriendMatcher {
                 List<Friend> list = mapper.readValue(DATA_PATH.toFile(),
                         new TypeReference<List<Friend>>() {});
                 this.friends = List.copyOf(list);
-                System.out.println("📇 联系人匹配器就绪 (" + friends.size() + " 位好友)");
+                log.info("📇 联系人匹配器就绪 ({} 位好友)", friends.size());
             } catch (IOException e) {
-                System.err.println("⚠️ wechat-friends.json 解析失败: " + e.getMessage());
+                log.error("⚠️ wechat-friends.json 解析失败: {}", e.getMessage());
             }
         } else {
-            System.out.println("ℹ️ wechat-friends.json 不存在，联系人匹配器使用空列表");
+            log.info("ℹ️ wechat-friends.json 不存在，联系人匹配器使用空列表");
         }
     }
 

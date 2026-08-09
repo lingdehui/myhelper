@@ -6,7 +6,9 @@ import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
-import org.springframework.ai.chat.client.ChatClient;
+import com.example.desktopbrain.config.ModelRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -38,8 +40,10 @@ import java.util.*;
 @Service
 public class ToolCategoryService {
 
+    private static final Logger log = LoggerFactory.getLogger(ToolCategoryService.class);
+
     private final WebClient qdrant;
-    private final ChatClient chatClient;
+    private final ModelRouter modelRouter;
     private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper;
     private final PromptLoader promptLoader;
@@ -53,11 +57,11 @@ public class ToolCategoryService {
     private volatile long lastSyncVersion = 0;
 
     public ToolCategoryService(WebClient qdrantWebClient,
-                                ChatClient chatClient,
+                                ModelRouter modelRouter,
                                 EmbeddingService embeddingService,
                                 PromptLoader promptLoader) {
         this.qdrant = qdrantWebClient;
-        this.chatClient = chatClient;
+        this.modelRouter = modelRouter;
         this.embeddingService = embeddingService;
         this.objectMapper = new ObjectMapper();
         this.promptLoader = promptLoader;
@@ -91,12 +95,12 @@ public class ToolCategoryService {
                         .retrieve()
                         .toBodilessEntity()
                         .block();
-                System.out.println("📦 Qdrant 集合 '" + COLLECTION_NAME + "' 已创建（向量维度: " + vectorSize + "）");
+                log.info("📦 Qdrant 集合 '" + COLLECTION_NAME + "' 已创建（向量维度: " + vectorSize + "）");
             } else {
-                System.out.println("📦 Qdrant 集合 '" + COLLECTION_NAME + "' 已存在");
+                log.info("📦 Qdrant 集合 '" + COLLECTION_NAME + "' 已存在");
             }
         } catch (Exception e) {
-            System.err.println("⚠️ tool-categories 初始化失败（工具分类将降级）: " + e.getMessage());
+            log.error("⚠️ tool-categories 初始化失败（工具分类将降级）: " + e.getMessage());
         }
     }
 
@@ -107,13 +111,20 @@ public class ToolCategoryService {
      * 每个分类作为独立 point，向量 = 分类描述的 embedding。支持交叉分类（同一工具可出现在多个分类中）。</p>
      *
      * @param allTools 所有可用工具（MCP + 本地 + 生成的）
-     * @return 分类数量（失败返回 0）
+     * @param force true=强制刷新（新工具生成时），false=有缓存则跳过（启动时）
+     * @return 分类数量（失败返回 0，跳过返回 -1）
      */
-    public int syncCategories(ToolCallback[] allTools) {
+    public int syncCategories(ToolCallback[] allTools, boolean force) {
         if (allTools == null || allTools.length == 0) return 0;
 
         // 兜底确保集合已创建（@PostConstruct 可能因 Qdrant 未就绪而静默失败）
         ensureCollection();
+
+        // 非强制模式：已有分类缓存则跳过
+        if (!force && hasCategories()) {
+            log.info("📦 工具分类已缓存，跳过 AI 同步");
+            return -1;
+        }
 
         try {
             // 构建工具列表字符串供 AI 分类
@@ -129,13 +140,20 @@ public class ToolCategoryService {
 
             String prompt = promptLoader.getToolCategorySync().formatted(toolList);
 
-            String response = chatClient.prompt().user(prompt).call().content();
+            log.info("{}🔄 工具分类同步: {} 个工具 → AI 分组...{}", "\u001b[36m", allTools.length, "\u001b[0m");
+            String response = modelRouter.normal().prompt().user(prompt).call().content();
             if (response == null || response.isBlank()) return 0;
 
             String json = AiResponseUtils.stripMarkdownCodeBlock(response);
 
             List<Map<String, Object>> categories =
                     objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
+
+            // 分类过多则精简合并
+            if (categories.size() > 20) {
+                log.info("📦 分类数量 {} > 20，触发精简合并...", categories.size());
+                categories = consolidateCategories(categories, toolList.toString());
+            }
 
             long version = System.currentTimeMillis();
 
@@ -191,12 +209,12 @@ public class ToolCategoryService {
             deleteAllCategoryPoints();
 
             this.lastSyncVersion = version;
-            System.out.println("✅ 工具分类同步完成: " + count + " 类, "
+            log.info("✅ 工具分类同步完成: " + count + " 类, "
                     + allTools.length + " 个工具");
             return count;
 
         } catch (Exception e) {
-            System.err.println("❌ 工具分类同步失败: " + e.getMessage());
+            log.error("❌ 工具分类同步失败: " + e.getMessage());
             return 0;
         }
     }
@@ -257,12 +275,12 @@ public class ToolCategoryService {
 
             results.sort((a, b) -> Double.compare(b.score(), a.score()));
             int totalUnique = dedupTools.size();
-            System.out.println("🔍 向量分类匹配: " + results.size() + " 类 → "
+            log.info("🔍 向量分类匹配: " + results.size() + " 类 → "
                     + totalUnique + " 个工具");
             return results;
 
         } catch (Exception e) {
-            System.err.println("❌ 工具分类搜索失败: " + e.getMessage());
+            log.error("❌ 工具分类搜索失败: " + e.getMessage());
             return List.of();
         }
     }
@@ -285,8 +303,57 @@ public class ToolCategoryService {
                     .toBodilessEntity()
                     .block();
         } catch (Exception e) {
-            System.err.println("⚠️ 清理旧分类失败: " + e.getMessage());
+            log.error("⚠️ 清理旧分类失败: " + e.getMessage());
         }
+    }
+
+    /**
+     * 分类过多时用 AI 精简合并为不超过 15 个粗粒度分类。
+     */
+    private List<Map<String, Object>> consolidateCategories(
+            List<Map<String, Object>> categories, String toolList) {
+        try {
+            StringBuilder catList = new StringBuilder();
+            for (Map<String, Object> cat : categories) {
+                catList.append("- ").append(cat.get("name"))
+                        .append(": ").append(cat.getOrDefault("desc", ""))
+                        .append(" → 工具: ").append(cat.getOrDefault("tools", "[]"))
+                        .append("\n");
+            }
+            String prompt = promptLoader.getCategoryConsolidation().formatted(catList, toolList);
+            String response = modelRouter.normal().prompt().user(prompt).call().content();
+            if (response == null || response.isBlank()) return categories;
+
+            String json = AiResponseUtils.stripMarkdownCodeBlock(response);
+            List<Map<String, Object>> merged =
+                    objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
+            if (merged == null || merged.isEmpty()) return categories;
+
+            log.info("📦 精简后: {} → {} 类", categories.size(), merged.size());
+            return merged;
+        } catch (Exception e) {
+            log.warn("⚠️ 分类精简失败，使用原始分类: {}", e.getMessage());
+            return categories;
+        }
+    }
+
+    private boolean hasCategories() {
+        try {
+            String countJson = qdrant.post()
+                    .uri("/collections/" + COLLECTION_NAME + "/points/count")
+                    .header("Content-Type", "application/json")
+                    .bodyValue("{}")
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+            if (countJson != null) {
+                int count = objectMapper.readTree(countJson).path("result").path("count").asInt(0);
+                return count > 0;
+            }
+        } catch (Exception e) {
+            log.debug("检查分类缓存失败: {}", e.getMessage());
+        }
+        return false;
     }
 
     private void upsertBatch(Map<String, Object> body) {
@@ -299,7 +366,7 @@ public class ToolCategoryService {
                     .toBodilessEntity()
                     .block();
         } catch (Exception e) {
-            System.err.println("❌ tool-categories 批量 upsert 失败: " + e.getMessage());
+            log.error("❌ tool-categories 批量 upsert 失败: " + e.getMessage());
         }
     }
 

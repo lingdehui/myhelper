@@ -8,7 +8,9 @@ import com.example.desktopbrain.memory.vector.category.ToolCategoryService;
 import com.example.desktopbrain.memory.vector.episode.Episode;
 import com.example.desktopbrain.memory.vector.episode.EpisodeCacheService;
 import com.example.desktopbrain.memory.vector.episode.ToolCallLog;
-import org.springframework.ai.chat.client.ChatClient;
+import com.example.desktopbrain.config.ModelRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -53,7 +55,9 @@ import java.util.*;
 @Component
 public class ToolPlanner {
 
-    private final ChatClient chatClient;
+    private static final Logger log = LoggerFactory.getLogger(ToolPlanner.class);
+
+    private final ModelRouter modelRouter;
     private final EpisodeCacheService episodeCacheService;
     private final ToolCategoryService categoryService;
     private final RuleInductionService ruleInductionService;
@@ -89,13 +93,13 @@ public class ToolPlanner {
                 }
             });
 
-    public ToolPlanner(ChatClient chatClient,
+    public ToolPlanner(ModelRouter modelRouter,
                         EpisodeCacheService episodeCacheService,
                         ToolCategoryService categoryService,
                         RuleInductionService ruleInductionService,
                         DesktopBrainProperties props,
                         PromptLoader promptLoader) {
-        this.chatClient = chatClient;
+        this.modelRouter = modelRouter;
         this.episodeCacheService = episodeCacheService;
         this.categoryService = categoryService;
         this.ruleInductionService = ruleInductionService;
@@ -145,8 +149,8 @@ public class ToolPlanner {
         // ===== Layer 1: 内存缓存（精确匹配，最快）=====
         CacheEntry entry = cache.get(key);
         if (entry != null) {
-            System.out.println("💾 命中内存缓存（失败计数: " + entry.failureCount + "/" + props.toolPlanner().failureThreshold()
-                    + (entry.episodeId != null ? ", episode=" + entry.episodeId.substring(0, 8) + "..." : "") + "）");
+            log.info("💾 命中内存缓存（失败计数: {}/{}{}）", entry.failureCount, props.toolPlanner().failureThreshold(),
+                    (entry.episodeId != null ? ", episode=" + entry.episodeId.substring(0, 8) + "..." : ""));
             // L1 命中但仍检索失败警告（轻量，不额外 embed）
             List<EpisodeCacheService.FailureSearchResult> warnL1 = episodeCacheService.searchFailurePatterns(userInput, 3);
             return new PlanResult(entry.selectedToolNames, entry.missingDescriptions,
@@ -158,9 +162,9 @@ public class ToolPlanner {
         List<EpisodeCacheService.FailureSearchResult> warnings = episodeCacheService.searchFailurePatterns(userInput, 3);
 
         if (!warnings.isEmpty()) {
-            System.out.println("⚠️ 发现 " + warnings.size() + " 条相关失败警告: "
-                    + warnings.stream().map(w -> w.type() + "(" + String.format("%.0f%%", w.score() * 100) + ")")
-                    .reduce((a, b) -> a + ", " + b).orElse(""));
+            log.info("⚠️ 发现 {} 条相关失败警告: {}", warnings.size(),
+                    warnings.stream().map(w -> w.type() + "(" + String.format("%.0f%%", w.score() * 100) + ")")
+                            .reduce((a, b) -> a + ", " + b).orElse(""));
         }
 
         if (ep.isPresent()) {
@@ -168,8 +172,8 @@ public class ToolPlanner {
             // 回填内存缓存（带 episode 引用，含 lesson），下次相同输入直接内存命中
             cache.put(key, new CacheEntry(episode.selectedToolNames(), episode.missingDescriptions(),
                     episode.id(), episode));
-            System.out.println("💾 命中 Episode 缓存（稳定度: " + String.format("%.2f", episode.computedStability())
-                    + ", episode=" + episode.id().substring(0, 8) + "...）");
+            log.info("💾 命中 Episode 缓存（稳定度: {}, episode={}...）", String.format("%.2f", episode.computedStability()),
+                    episode.id().substring(0, 8));
             return new PlanResult(episode.selectedToolNames(), episode.missingDescriptions(),
                     true, episode.id(), episode, warnings);
         }
@@ -206,7 +210,7 @@ public class ToolPlanner {
 
         // 环境问题：不惩罚内存缓存，计划本身没问题，保留供下次使用
         if (!isPlanIssue) {
-            System.out.println("ℹ️ 环境问题导致失败，不惩罚计划，保留缓存（分段继续）");
+            log.info("ℹ️ 环境问题导致失败，不惩罚计划，保留缓存（分段继续）");
             return false;
         }
 
@@ -217,10 +221,10 @@ public class ToolPlanner {
         entry.failureCount++;
         if (entry.failureCount >= props.toolPlanner().failureThreshold()) {
             cache.remove(key);
-            System.out.println("🗑️ 缓存连续失败 " + props.toolPlanner().failureThreshold() + " 次（计划问题），已清除旧方案");
+            log.info("🗑️ 缓存连续失败 {} 次（计划问题），已清除旧方案", props.toolPlanner().failureThreshold());
             return true;
         }
-        System.out.println("⚠️ 缓存方案失败（计划问题，第 " + entry.failureCount + " 次/" + props.toolPlanner().failureThreshold() + "），保留缓存，本次重新规划");
+        log.info("⚠️ 缓存方案失败（计划问题，第 {} 次/{}），保留缓存，本次重新规划", entry.failureCount, props.toolPlanner().failureThreshold());
         return false;
     }
 
@@ -256,7 +260,7 @@ public class ToolPlanner {
                         newSuccess, failure, old.archived(), old.timestamp(), newStability,
                         old.status(), canScript, old.failedStepIndex(), old.explorationType(), old.explorationSummary());
                 if (canScript && !wasScriptable) {
-                    System.out.println("🚀 内存缓存 episode 升级为可脚本化（id=" + old.id().substring(0, 8) + "...）");
+                    log.info("🚀 内存缓存 episode 升级为可脚本化（id={}...）", old.id().substring(0, 8));
                 }
             }
         }
@@ -325,9 +329,9 @@ public class ToolPlanner {
                 Episode.EpisodeStatus.ACTIVE, false, -1, null, null);
         cache.put(AiResponseUtils.normalizeKey(userInput), new CacheEntry(
                 plan.selectedToolNames(), plan.missingDescriptions(), episodeId, memEpisode));
-        System.out.println("💾 已写入内存缓存（" + plan.selectedToolNames().size()
-                + " 个工具，episode=" + episodeId.substring(0, 8) + "..."
-                + (successLesson != null ? ", 经验: " + AiResponseUtils.truncate(successLesson, 40) : "") + "）");
+        log.info("💾 已写入内存缓存（{} 个工具，episode={}...{}）", plan.selectedToolNames().size(),
+                episodeId.substring(0, 8),
+                (successLesson != null ? ", 经验: " + AiResponseUtils.truncate(successLesson, 40) : ""));
     }
 
     /**
@@ -339,8 +343,8 @@ public class ToolPlanner {
      * @param allTools 所有可用工具
      * @return 分类数量
      */
-    public int syncCategories(ToolCallback[] allTools) {
-        return categoryService.syncCategories(allTools);
+    public int syncCategories(ToolCallback[] allTools, boolean force) {
+        return categoryService.syncCategories(allTools, force);
     }
 
     /** 内部：调 AI 规划（让 AI 从完整工具列表中直接选工具名） */
@@ -394,9 +398,9 @@ public class ToolPlanner {
 
         String planResponse;
         try {
-            planResponse = chatClient.prompt().user(prompt).call().content();
+            planResponse = modelRouter.normal().prompt().user(prompt).call().content();
         } catch (Exception e) {
-            System.out.println("⚠️ 规划失败，使用兜底工具: " + e.getMessage());
+            log.info("⚠️ 规划失败，使用兜底工具: {}", e.getMessage());
             return PlanResult.ofAIPlan(new ArrayList<>(props.toolPlanner().fallbackTools()), List.of());
         }
 
@@ -444,7 +448,7 @@ public class ToolPlanner {
             List<String> keywordTools = findToolsByKeywords(missing, allTools);
             if (!keywordTools.isEmpty()) {
                 neededTools.addAll(keywordTools);
-                System.out.println("🔎 关键词兜底匹配: " + keywordTools.size() + " 个工具");
+                log.info("🔎 关键词兜底匹配: {} 个工具", keywordTools.size());
                 missing.clear();
             }
         }
@@ -453,7 +457,7 @@ public class ToolPlanner {
         for (String tool : props.toolPlanner().alwaysAppendTools()) {
             neededTools.add(tool);
         }
-        System.out.println("📦 AI 选中 " + neededTools.size() + " 个工具" + (missing.isEmpty() ? "" : ", 缺失: " + missing));
+        log.info("📦 AI 选中 {} 个工具{}", neededTools.size(), (missing.isEmpty() ? "" : ", 缺失: " + missing));
         return PlanResult.ofAIPlan(new ArrayList<>(neededTools), missing);
     }
 
@@ -520,6 +524,6 @@ public class ToolPlanner {
 
     public void clearCache() {
         cache.clear();
-        System.out.println("🗑️ 工具规划缓存已清除");
+        log.info("🗑️ 工具规划缓存已清除");
     }
 }

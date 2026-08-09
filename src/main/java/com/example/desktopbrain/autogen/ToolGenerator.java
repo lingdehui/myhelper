@@ -2,7 +2,9 @@ package com.example.desktopbrain.autogen;
 
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.PromptLoader;
-import org.springframework.ai.chat.client.ChatClient;
+import com.example.desktopbrain.config.ModelRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
@@ -30,11 +32,13 @@ import org.springframework.stereotype.Service;
 @Service
 public class ToolGenerator {
 
-    private final ChatClient chatClient;
+    private static final Logger log = LoggerFactory.getLogger(ToolGenerator.class);
+
+    private final ModelRouter modelRouter;
     private final PromptLoader promptLoader;
 
-    public ToolGenerator(ChatClient chatClient, PromptLoader promptLoader) {
-        this.chatClient = chatClient;
+    public ToolGenerator(ModelRouter modelRouter, PromptLoader promptLoader) {
+        this.modelRouter = modelRouter;
         this.promptLoader = promptLoader;
     }
 
@@ -56,7 +60,7 @@ public class ToolGenerator {
         String prompt = promptLoader.getToolGenerator().formatted(toolDescription);
 
         try {
-            String source = chatClient.prompt().user(prompt).call().content();
+            String source = modelRouter.normal().prompt().user(prompt).call().content();
             if (source == null || source.isBlank()) return null;
 
             // 去掉可能的 markdown 代码块标记
@@ -64,14 +68,14 @@ public class ToolGenerator {
 
             String className = extractClassName(source);
             if (className == null) {
-                System.err.println("❌ 生成的源码无法提取类名");
+                log.warn("❌ 生成的源码无法提取类名");
                 return null;
             }
 
-            System.out.println("✅ AI 已生成工具源码: " + className);
+            log.info("✅ AI 已生成工具源码: {}", className);
             return new GeneratedSource(className, source);
         } catch (Exception e) {
-            System.err.println("❌ 工具源码生成失败: " + e.getMessage());
+            log.error("❌ 工具源码生成失败", e);
             return null;
         }
     }

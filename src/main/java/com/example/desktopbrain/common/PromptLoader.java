@@ -49,6 +49,9 @@ public class PromptLoader {
     @Value("classpath:prompts/autonomous-exploration.txt")
     private Resource autonomousExploration;
 
+    @Value("classpath:prompts/category-consolidation.txt")
+    private Resource categoryConsolidation;
+
     public String getDefaultSystem()        { return read(defaultSystem); }
     public String getPlanning()             { return read(planning); }
     public String getReplanning()           { return read(replanning); }
@@ -60,6 +63,7 @@ public class PromptLoader {
     public String getToolGenerator()        { return read(toolGenerator); }
     public String getToolCategorySync()     { return read(toolCategorySync); }
     public String getAutonomousExploration() { return read(autonomousExploration); }
+    public String getCategoryConsolidation() { return read(categoryConsolidation); }
 
     private String read(Resource resource) {
         try {

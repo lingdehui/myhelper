@@ -4,6 +4,8 @@ import com.k2fsa.sherpa.onnx.OnlineStream;
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor;
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig;
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -25,6 +27,8 @@ import java.util.concurrent.ConcurrentHashMap;
 @Service
 public class VoiceprintService {
 
+    private static final Logger log = LoggerFactory.getLogger(VoiceprintService.class);
+
     @Value("${sherpa.speaker.model:models/speaker-embedding/model.onnx}")
     private String speakerModelPath;
 
@@ -39,8 +43,8 @@ public class VoiceprintService {
     @PostConstruct
     public void init() {
         if (!new File(speakerModelPath).exists()) {
-            System.out.println("⚠️ 声纹模型不存在，声纹识别功能禁用: " + speakerModelPath);
-            System.out.println("   下载: ollama pull 或从 sherpa-onnx 模型库获取 3D-Speaker 模型");
+            log.info("⚠️ 声纹模型不存在，声纹识别功能禁用: {}", speakerModelPath);
+            log.info("   下载: ollama pull 或从 sherpa-onnx 模型库获取 3D-Speaker 模型");
             return;
         }
 
@@ -55,9 +59,9 @@ public class VoiceprintService {
             manager = new SpeakerEmbeddingManager(extractor.getDim());
 
             initialized = true;
-            System.out.println("🎙️ 声纹识别已就绪（维度=" + extractor.getDim() + "，阈值=" + similarityThreshold + "）");
+            log.info("🎙️ 声纹识别已就绪（维度={}，阈值={}）", extractor.getDim(), similarityThreshold);
         } catch (Exception e) {
-            System.err.println("⚠️ 声纹识别初始化失败: " + e.getMessage());
+            log.error("⚠️ 声纹识别初始化失败: {}", e.getMessage());
         }
     }
 
@@ -92,7 +96,7 @@ public class VoiceprintService {
 
             return extractor.compute(stream);
         } catch (Exception e) {
-            System.err.println("声纹提取失败: " + e.getMessage());
+            log.error("声纹提取失败: {}", e.getMessage());
             return null;
         } finally {
             stream.release();

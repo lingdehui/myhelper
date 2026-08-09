@@ -4,7 +4,9 @@ import com.example.desktopbrain.autogen.GeneratedToolRegistry;
 import com.example.desktopbrain.config.DesktopBrainProperties;
 import com.example.desktopbrain.service.SkillConfig;
 import com.example.desktopbrain.memory.vector.episode.*;
-import org.springframework.ai.chat.client.ChatClient;
+import com.example.desktopbrain.config.ModelRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.stereotype.Component;
 
@@ -29,6 +31,8 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 @Component
 public class TurnProcessor {
+
+    private static final Logger log = LoggerFactory.getLogger(TurnProcessor.class);
 
     // ========== 依赖 ==========
     private final ToolPlanner toolPlanner;
@@ -103,8 +107,8 @@ public class TurnProcessor {
     }
 
     /** 触发工具分类同步 */
-    public int syncCategories(ToolCallback[] tools) {
-        return toolPlanner.syncCategories(tools);
+    public int syncCategories(ToolCallback[] tools, boolean force) {
+        return toolPlanner.syncCategories(tools, force);
     }
 
     /** 合并静态工具 + 动态生成工具（供外部获取完整工具列表） */
@@ -119,12 +123,12 @@ public class TurnProcessor {
     /**
      * 处理一次 AI Turn（文字或语音输入）。
      *
-     * @param chatClient AI ChatClient（每次重建以确保工具列表新鲜）
+     * @param modelRouter 模型路由器
      * @param baseTools  基础工具列表（MCP + 本地 @Tool）
      * @param userInput  用户输入
      * @param ttsService TTS 服务（用于播报）
      */
-    public void process(ChatClient chatClient, ToolCallback[] baseTools,
+    public void process(ModelRouter modelRouter, ToolCallback[] baseTools,
                          String userInput, TtsService ttsService) {
         long myTurnId = aiTurnId.incrementAndGet();
         currentAiTurnId = myTurnId;
@@ -134,7 +138,7 @@ public class TurnProcessor {
         ToolCallback[] tools = mergeDynamicTools(baseTools);
         syncCategoriesIfNewTools(tools);
 
-        System.out.println("🤖 思考中...");
+        log.info("🤖 思考中...");
 
         String effectiveInput = userInput;
         List<ToolCallLog> toolCallLogs = Collections.synchronizedList(new ArrayList<>());
@@ -143,7 +147,7 @@ public class TurnProcessor {
         String skillInstructions = skillConfig.getInstructions(userInput);
         if (!skillInstructions.isEmpty()) {
             effectiveInput = skillInstructions + "\n用户请求：" + userInput;
-            System.out.println("📋 已注入技能: " + skillConfig.getMatchedSkillNames(userInput));
+            log.info("📋 已注入技能: {}", skillConfig.getMatchedSkillNames(userInput));
         }
 
         // 2. 工具规划（三层缓存）
@@ -155,15 +159,15 @@ public class TurnProcessor {
             for (String desc : plan.missingDescriptions()) {
                 List<String> found = ToolPlanner.findToolsByKeywords(List.of(desc), tools);
                 if (!found.isEmpty()) {
-                    System.out.println("🔎 缓存 MISSING '" + desc + "' → 已有工具: " + found);
+                    log.info("🔎 缓存 MISSING '{}' → 已有工具: {}", desc, found);
                     plan.selectedToolNames().addAll(found);
                 } else {
                     unresolved.add(desc);
                     if (!plan.fromCache()) {
-                        System.out.println("⚠️ 缺少工具: " + desc + "（尝试让 AI 自动生成）");
+                        log.info("⚠️ 缺少工具: {}（尝试让 AI 自动生成）", desc);
                         triggerToolGeneration(desc, ttsService);
                     } else {
-                        System.out.println("⚠️ 缓存命中但缺少工具: " + desc + "（让 AI 用 searchTool 查找）");
+                        log.info("⚠️ 缓存命中但缺少工具: {}（让 AI 用 searchTool 查找）", desc);
                     }
                 }
             }
@@ -173,13 +177,13 @@ public class TurnProcessor {
         // 3. 命中缓存 → 走缓存逻辑；未命中 → 新规划
         try {
             if (plan.fromCache() && plan.episode() != null) {
-                handleCacheHit(chatClient, tools, effectiveInput, userInput, plan, toolCallLogs, myTurnId, ttsService);
+                handleCacheHit(modelRouter, tools, effectiveInput, userInput, plan, toolCallLogs, myTurnId, ttsService);
             } else {
-                handleNewPlan(chatClient, tools, effectiveInput, userInput, plan, toolCallLogs, myTurnId, ttsService);
+                handleNewPlan(modelRouter, tools, effectiveInput, userInput, plan, toolCallLogs, myTurnId, ttsService);
             }
         } catch (Exception e) {
-            System.err.println("❌ AI 调用失败（模型可能暂时不可用）: " + e.getMessage());
-            System.out.println("🤖 抱歉，模型暂时不可用，请稍后再试。");
+            log.error("❌ AI 调用失败（模型可能暂时不可用）", e);
+            log.info("🤖 抱歉，模型暂时不可用，请稍后再试。");
         }
 
         if (currentAiTurnId == myTurnId) {
@@ -207,9 +211,9 @@ public class TurnProcessor {
         int currentDynamicCount = generatedToolRegistry.getDynamicTools().length;
         if (currentDynamicCount > lastDynamicToolCount) {
             lastDynamicToolCount = currentDynamicCount;
-            System.out.println("🔄 检测到新动态工具，重同步分类...");
-            int catCount = toolPlanner.syncCategories(currentTools);
-            if (catCount > 0) System.out.println("📁 工具分类已重同步: " + catCount + " 类（含 " + currentDynamicCount + " 个动态工具）");
+            log.info("🔄 检测到新动态工具，重同步分类（强制刷新）...");
+            int catCount = toolPlanner.syncCategories(currentTools, true);
+            if (catCount > 0) log.info("📁 工具分类已重同步: {} 类（含 {} 个动态工具）", catCount, currentDynamicCount);
         }
     }
 
@@ -220,7 +224,7 @@ public class TurnProcessor {
     private void triggerToolGeneration(String description, TtsService ttsService) {
         CompletableFuture.runAsync(() -> {
             try {
-                System.out.println("🔧 开始自动生成工具: " + description);
+                log.info("🔧 开始自动生成工具: {}", description);
                 GeneratedToolRegistry.GenerationOutcome outcome =
                         generatedToolRegistry.generateAndPersist(description);
                 if (outcome.success()) {
@@ -229,11 +233,11 @@ public class TurnProcessor {
                         ttsService.speakAsync("检测到缺失能力，" + msg);
                     }
                 } else {
-                    System.out.println("⚠️ 工具自动生成失败: " + outcome.message());
+                    log.info("⚠️ 工具自动生成失败: {}", outcome.message());
                     ttsService.speakAsync("工具自动生成失败，" + outcome.message());
                 }
             } catch (Exception e) {
-                System.err.println("❌ 工具生成异步任务异常: " + e.getMessage());
+                log.error("❌ 工具生成异步任务异常", e);
             }
         });
     }
@@ -242,7 +246,7 @@ public class TurnProcessor {
     // 缓存命中处理
     // ========================================================================
 
-    private void handleCacheHit(ChatClient chatClient, ToolCallback[] tools,
+    private void handleCacheHit(ModelRouter modelRouter, ToolCallback[] tools,
                                  String effectiveInput, String userInput,
                                  ToolPlanner.PlanResult plan, List<ToolCallLog> toolCallLogs,
                                  long myTurnId, TtsService ttsService) {
@@ -251,15 +255,15 @@ public class TurnProcessor {
         // Step 1: AI 判断计划可用性 + 提取变量
         PlanMatcher.MatchResult matchResult = planMatcher.match(userInput, episode);
         if (!matchResult.applicable()) {
-            System.out.println("❌ 计划不适用（" + matchResult.reason() + "），降级为 AI 新规划");
-            handleNewPlan(chatClient, tools, effectiveInput, userInput,
+            log.info("❌ 计划不适用（{}），降级为 AI 新规划", matchResult.reason());
+            handleNewPlan(modelRouter, tools, effectiveInput, userInput,
                     ToolPlanner.PlanResult.ofAIPlan(plan.selectedToolNames(), plan.missingDescriptions()),
                     toolCallLogs, myTurnId, ttsService);
             return;
         }
 
         Map<String, String> variables = matchResult.variables();
-        System.out.println("✅ 计划可用（变量: " + variables + "）");
+        log.info("✅ 计划可用（变量: {}）", variables);
 
         // Step 2: 附加 lesson + 失败警告到 prompt
         String augmentedInput = effectiveInput;
@@ -285,22 +289,22 @@ public class TurnProcessor {
 
         // Step 3: 判断是否可脚本化
         if (episode.isScriptable()) {
-            handleScriptableExecution(chatClient, tools, effectiveInput, userInput, plan, episode,
+            handleScriptableExecution(modelRouter, tools, effectiveInput, userInput, plan, episode,
                     variables, toolCallLogs, myTurnId, ttsService);
         } else {
-            handleAiExecutionWithPlan(chatClient, tools, augmentedInput, userInput, plan,
+            handleAiExecutionWithPlan(modelRouter, tools, augmentedInput, userInput, plan,
                     effectiveInput, toolCallLogs, myTurnId, ttsService);
         }
     }
 
     /** 脚本化执行 */
-    private void handleScriptableExecution(ChatClient chatClient, ToolCallback[] tools,
+    private void handleScriptableExecution(ModelRouter modelRouter, ToolCallback[] tools,
                                             String effectiveInput, String userInput,
                                             ToolPlanner.PlanResult plan, Episode episode,
                                             Map<String, String> variables,
                                             List<ToolCallLog> toolCallLogs,
                                             long myTurnId, TtsService ttsService) {
-        System.out.println("🚀 计划稳定度高（可脚本化），跳过 AI 直接执行脚本");
+        log.info("🚀 计划稳定度高（可脚本化），跳过 AI 直接执行脚本");
         PlanExecutor.ExecutionResult execResult = planExecutor.executeScript(episode, variables, tools);
 
         if (execResult.success()) {
@@ -308,20 +312,20 @@ public class TurnProcessor {
             if (currentAiTurnId == myTurnId) {
                 toolPlanner.onCacheHitSuccess(userInput, plan);
                 String response = "已按脚本完成（" + execResult.executedSteps().size() + " 步）";
-                System.out.println("🤖 " + response);
+                log.info("🤖 {}", response);
                 ttsService.speakAsync(response);
             }
         } else {
             toolCallLogs.addAll(execResult.executedSteps());
             ReflectService.FailureAnalysis analysis = reflectService.reflectFailure(userInput, toolCallLogs, execResult.errorMessage());
-            System.out.println("🔍 脚本归因: " + (analysis.isPlanIssue() ? "计划问题" : "环境问题") +
+            log.info("🔍 脚本归因: {}{}", (analysis.isPlanIssue() ? "计划问题" : "环境问题"),
                     (analysis.lesson() != null ? "（" + analysis.lesson() + "）" : ""));
             failureExperienceHandler.handle(userInput, analysis.lesson(), analysis.isPlanIssue(), false, plan.selectedToolNames());
 
             if (!analysis.isPlanIssue()) {
                 int fromStep = execResult.failedStepIndex() + 1;
                 if (fromStep < episode.toolCalls().size()) {
-                    System.out.println("ℹ️ 脚本环境问题，从第 " + (fromStep + 1) + " 步继续执行");
+                    log.info("ℹ️ 脚本环境问题，从第 {} 步继续执行", (fromStep + 1));
                     PlanExecutor.ExecutionResult continueResult = planExecutor.executeFromStep(episode, fromStep, variables, tools);
                     if (continueResult.success()) {
                         toolCallLogs.addAll(continueResult.executedSteps());
@@ -336,51 +340,51 @@ public class TurnProcessor {
                 }
             }
             toolPlanner.onCacheHitFailure(userInput, plan, analysis.lesson(), analysis.isPlanIssue());
-            handleCacheFailure(chatClient, tools, effectiveInput, userInput, plan,
+            handleCacheFailure(modelRouter, tools, effectiveInput, userInput, plan,
                     toolCallLogs, myTurnId, ttsService, execResult.errorMessage());
         }
     }
 
     /** AI 带参考计划执行 */
-    private void handleAiExecutionWithPlan(ChatClient chatClient, ToolCallback[] tools,
+    private void handleAiExecutionWithPlan(ModelRouter modelRouter, ToolCallback[] tools,
                                             String augmentedInput, String userInput,
                                             ToolPlanner.PlanResult plan, String effectiveInput,
                                             List<ToolCallLog> toolCallLogs,
                                             long myTurnId, TtsService ttsService) {
         try {
-            String response = executeWithTools(chatClient, augmentedInput, tools, plan, toolCallLogs);
+            String response = executeWithTools(modelRouter, augmentedInput, tools, plan, toolCallLogs);
             if (currentAiTurnId == myTurnId) {
                 var verify = reflectService.verifyExecution(userInput, toolCallLogs, response);
                 if (!verify.success()) {
-                    System.out.println("🔍 校验未通过: " + verify.reason());
+                    log.info("🔍 校验未通过: {}", verify.reason());
                     if (!verify.salvageableChains().isEmpty()) {
                         toolPlanner.saveSalvageableChains(userInput, toolCallLogs,
                                 verify.salvageableChains(), plan.episode().id());
                     }
                     throw new RuntimeException("校验未通过: " + verify.reason());
                 }
-                System.out.println("🤖 " + response);
+                log.info("🤖 {}", response);
                 toolPlanner.onCacheHitSuccess(userInput, plan);
                 ttsService.speakAsync(response);
             }
         } catch (Exception e) {
             if (currentAiTurnId == myTurnId) {
                 ReflectService.FailureAnalysis analysis = reflectService.reflectFailure(userInput, toolCallLogs, e.getMessage());
-                System.out.println("🔍 归因: " + (analysis.isPlanIssue() ? "计划问题" : "环境问题") +
+                log.info("🔍 归因: {}{}", (analysis.isPlanIssue() ? "计划问题" : "环境问题"),
                         (analysis.lesson() != null ? "（" + analysis.lesson() + "）" : ""));
                 toolPlanner.onCacheHitFailure(userInput, plan, analysis.lesson(), analysis.isPlanIssue());
                 failureExperienceHandler.handle(userInput, analysis.lesson(), analysis.isPlanIssue(), false, plan.selectedToolNames());
 
                 if (!analysis.isPlanIssue()) {
-                    System.out.println("ℹ️ 环境问题导致失败，分段继续执行");
+                    log.info("ℹ️ 环境问题导致失败，分段继续执行");
                     String continuePrompt = buildContinuePrompt(userInput, e.getMessage(), analysis.lesson());
                     toolCallLogs.clear();
                     ToolPlanner.PlanResult fallbackPlan = toolPlanner.plan(userInput, tools);
-                    String resp = executeWithTools(chatClient, continuePrompt, tools, fallbackPlan, toolCallLogs);
+                    String resp = executeWithTools(modelRouter, continuePrompt, tools, fallbackPlan, toolCallLogs);
                     if (currentAiTurnId == myTurnId) {
                         var verify = reflectService.verifyExecution(userInput, toolCallLogs, resp);
                         if (!verify.success()) {
-                            System.out.println("⚠️ 分段继续校验未通过: " + verify.reason());
+                            log.info("⚠️ 分段继续校验未通过: {}", verify.reason());
                             if (!verify.salvageableChains().isEmpty()) {
                                 toolPlanner.saveSalvageableChains(userInput, toolCallLogs,
                                         verify.salvageableChains(), plan.episode().id());
@@ -388,13 +392,13 @@ public class TurnProcessor {
                             failureExperienceHandler.handle(userInput, verify.reason(), true,
                                     !verify.salvageableChains().isEmpty(), plan.selectedToolNames());
                         } else {
-                            System.out.println("🤖 " + resp);
+                            log.info("🤖 {}", resp);
                             toolPlanner.onCacheHitSuccess(userInput, plan);
                             ttsService.speakAsync(resp);
                         }
                     }
                 } else {
-                    handleCacheFailure(chatClient, tools, effectiveInput, userInput, plan,
+                    handleCacheFailure(modelRouter, tools, effectiveInput, userInput, plan,
                             toolCallLogs, myTurnId, ttsService, e.getMessage());
                 }
             }
@@ -405,21 +409,21 @@ public class TurnProcessor {
     // 新规划处理（首次 + 降级）
     // ========================================================================
 
-    private void handleNewPlan(ChatClient chatClient, ToolCallback[] tools,
+    private void handleNewPlan(ModelRouter modelRouter, ToolCallback[] tools,
                                 String effectiveInput, String userInput,
                                 ToolPlanner.PlanResult plan, List<ToolCallLog> toolCallLogs,
                                 long myTurnId, TtsService ttsService) {
         String draftId = toolPlanner.createDraftEpisode(userInput, plan);
         if (draftId == null) {
-            System.out.println("⚠️ DRAFT 创建失败（Qdrant 不可用），本次不保存 Episode");
+            log.info("⚠️ DRAFT 创建失败（Qdrant 不可用），本次不保存 Episode");
         }
 
         try {
-            String response = executeWithTools(chatClient, effectiveInput, tools, plan, toolCallLogs);
+            String response = executeWithTools(modelRouter, effectiveInput, tools, plan, toolCallLogs);
             if (currentAiTurnId == myTurnId) {
                 var verify = reflectService.verifyExecution(userInput, toolCallLogs, response);
                 if (!verify.success()) {
-                    System.out.println("🔍 校验未通过: " + verify.reason());
+                    log.info("🔍 校验未通过: {}", verify.reason());
                     if (!verify.salvageableChains().isEmpty()) {
                         toolPlanner.saveSalvageableChains(userInput, toolCallLogs,
                                 verify.salvageableChains(), draftId);
@@ -427,10 +431,10 @@ public class TurnProcessor {
                     throw new RuntimeException("校验未通过: " + verify.reason());
                 }
 
-                System.out.println("🤖 " + response);
+                log.info("🤖 {}", response);
                 String successLesson = reflectService.reflectSuccess(userInput, toolCallLogs, response);
                 if (successLesson != null) {
-                    System.out.println("📝 成功经验: " + successLesson);
+                    log.info("📝 成功经验: {}", successLesson);
                 }
 
                 if (draftId != null) {
@@ -442,20 +446,20 @@ public class TurnProcessor {
         } catch (Exception e) {
             if (currentAiTurnId == myTurnId) {
                 ReflectService.FailureAnalysis analysis = reflectService.reflectFailure(userInput, toolCallLogs, e.getMessage());
-                System.out.println("🔍 失败归因: " + (analysis.isPlanIssue() ? "计划问题" : "环境问题") +
+                log.info("🔍 失败归因: {}{}", (analysis.isPlanIssue() ? "计划问题" : "环境问题"),
                         (analysis.lesson() != null ? "（" + analysis.lesson() + "）" : ""));
                 toolPlanner.failDraftEpisode(draftId, toolCallLogs, analysis.lesson(), -1);
                 failureExperienceHandler.handle(userInput, analysis.lesson(), analysis.isPlanIssue(), false, plan.selectedToolNames());
-                System.out.println("❌ " + e.getMessage());
+                log.info("❌ {}", e.getMessage());
 
                 if (!analysis.isPlanIssue()) {
                     String continuePrompt = buildContinuePrompt(userInput, e.getMessage(), analysis.lesson());
                     toolCallLogs.clear();
-                    String resp = executeWithTools(chatClient, continuePrompt, tools, plan, toolCallLogs);
+                    String resp = executeWithTools(modelRouter, continuePrompt, tools, plan, toolCallLogs);
                     if (currentAiTurnId == myTurnId) {
                         var verify = reflectService.verifyExecution(userInput, toolCallLogs, resp);
                         if (!verify.success()) {
-                            System.out.println("⚠️ 分段继续校验未通过: " + verify.reason());
+                            log.info("⚠️ 分段继续校验未通过: {}", verify.reason());
                             if (!verify.salvageableChains().isEmpty()) {
                                 toolPlanner.saveSalvageableChains(userInput, toolCallLogs,
                                         verify.salvageableChains(), draftId);
@@ -463,7 +467,7 @@ public class TurnProcessor {
                             failureExperienceHandler.handle(userInput, verify.reason(), true,
                                     !verify.salvageableChains().isEmpty(), plan.selectedToolNames());
                         } else {
-                            System.out.println("🤖 " + resp);
+                            log.info("🤖 {}", resp);
                             toolPlanner.activateDraftEpisode(draftId, toolCallLogs, resp, null);
                             toolPlanner.cacheToMemory(userInput, plan, draftId, toolCallLogs, resp, null);
                             ttsService.speakAsync(resp);
@@ -478,29 +482,29 @@ public class TurnProcessor {
     // 缓存失败处理（重新规划）
     // ========================================================================
 
-    private void handleCacheFailure(ChatClient chatClient, ToolCallback[] tools,
+    private void handleCacheFailure(ModelRouter modelRouter, ToolCallback[] tools,
                                      String effectiveInput, String userInput,
                                      ToolPlanner.PlanResult oldPlan, List<ToolCallLog> toolCallLogs,
                                      long myTurnId, TtsService ttsService, String errorReason) {
         try {
             ToolPlanner.PlanResult newPlan = toolPlanner.replan(userInput, tools, errorReason);
             newPlan.missingDescriptions().forEach(desc ->
-                    System.out.println("⚠️ 缺少工具: " + desc + "（可补写本地 @Tool）"));
-            System.out.println("📦 重新选用工具: " + newPlan.selectedToolNames().size() + "/" + tools.length);
+                    log.info("⚠️ 缺少工具: {}（可补写本地 @Tool）", desc));
+            log.info("📦 重新选用工具: {}/{}", newPlan.selectedToolNames().size(), tools.length);
 
             String newDraftId = toolPlanner.createDraftEpisode(userInput, newPlan);
-            String response = executeWithTools(chatClient, effectiveInput, tools, newPlan, toolCallLogs);
+            String response = executeWithTools(modelRouter, effectiveInput, tools, newPlan, toolCallLogs);
             if (currentAiTurnId == myTurnId) {
                 var verify = reflectService.verifyExecution(userInput, toolCallLogs, response);
                 if (!verify.success()) {
-                    System.out.println("🔍 重规划校验未通过: " + verify.reason());
+                    log.info("🔍 重规划校验未通过: {}", verify.reason());
                     if (!verify.salvageableChains().isEmpty()) {
                         toolPlanner.saveSalvageableChains(userInput, toolCallLogs,
                                 verify.salvageableChains(), newDraftId);
                     }
                     throw new RuntimeException("重规划校验未通过: " + verify.reason());
                 }
-                System.out.println("🤖 " + response);
+                log.info("🤖 {}", response);
                 String successLesson = reflectService.reflectSuccess(userInput, toolCallLogs, response);
                 toolPlanner.activateDraftEpisode(newDraftId, toolCallLogs, response, successLesson);
                 toolPlanner.cacheToMemory(userInput, newPlan, newDraftId, toolCallLogs, response, successLesson);
@@ -508,7 +512,7 @@ public class TurnProcessor {
             }
         } catch (Exception retryEx) {
             if (currentAiTurnId == myTurnId) {
-                System.out.println("❌ 重试失败: " + retryEx.getMessage());
+                log.info("❌ 重试失败: {}", retryEx.getMessage());
                 failureExperienceHandler.handle(userInput, retryEx.getMessage(), true, false, oldPlan.selectedToolNames());
                 ttsService.speakAsync("抱歉，我没做好这个任务");
             }
@@ -519,7 +523,7 @@ public class TurnProcessor {
     // AI 执行（过滤工具 + 收集日志）
     // ========================================================================
 
-    private String executeWithTools(ChatClient chatClient, String input,
+    private String executeWithTools(ModelRouter modelRouter, String input,
                                     ToolCallback[] allTools, ToolPlanner.PlanResult plan,
                                     List<ToolCallLog> toolCallLogs) {
         var selectedNames = new LinkedHashSet<>(plan.selectedToolNames());
@@ -532,11 +536,11 @@ public class TurnProcessor {
                 .map(tc -> new LoggingToolCallback(tc, toolCallLogs))
                 .toArray(ToolCallback[]::new);
 
-        System.out.println("📦 选用工具: " + selectedTools.length + "/" + allTools.length
-                + (plan.fromCache() ? " (缓存命中)" : ""));
+        log.info("📦 选用工具: {}/{}{}", selectedTools.length, allTools.length,
+                (plan.fromCache() ? " (缓存命中)" : ""));
 
         try {
-            return chatClient.prompt().user(input).toolCallbacks(loggedTools).call().content();
+            return modelRouter.normal().prompt().user(input).toolCallbacks(loggedTools).call().content();
         } catch (Exception e) {
             if (plan.fromCache()) {
                 throw new RuntimeException("🔄 缓存方案执行失败", e);
@@ -555,4 +559,8 @@ public class TurnProcessor {
         sb.append("请继续完成上述任务，忽略已完成的步骤。");
         return sb.toString();
     }
+
+    // ============================================================
+    // 工具分类缓存同步
+    // ============================================================
 }

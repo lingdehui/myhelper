@@ -1,6 +1,9 @@
 package com.example.desktopbrain.config;
 
+import jakarta.validation.constraints.NotEmpty;
+import jakarta.validation.constraints.NotNull;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
 
 import java.util.List;
 
@@ -8,23 +11,24 @@ import java.util.List;
  * 桌面助手统一配置属性（对应 application.yml 中的 desktopbrain.* 段）。
  * 消除各 Service 中散落的硬编码常量，统一由此注入。
  */
+@Validated
 @ConfigurationProperties(prefix = "desktopbrain")
 public record DesktopBrainProperties(
-        Voice voice,
-        Vad vad,
-        Dialog dialog,
-        Voiceprint voiceprint,
-        ToolPlanner toolPlanner,
-        Execution execution,
-        Semantic semantic,
+        @NotNull Voice voice,
+        @NotNull Dialog dialog,
+        @NotNull ToolPlanner toolPlanner,
+        @NotNull Semantic semantic,
         DeepSeek deepseek,
-        Exploration exploration,
+        @NotNull Exploration exploration,
+        Voiceprint voiceprint,
+        Vad vad,
+        Execution execution,
         MemoryMaintenance memoryMaintenance
 ) {
 
     /** 语音交互参数 */
     public record Voice(
-            String wakeWord,
+            @NotEmpty String wakeWord,
             int sampleRate,
             double energyThreshold,
             int minSpeechDurationMs,
@@ -90,12 +94,13 @@ public record DesktopBrainProperties(
             String model
     ) {}
 
-    /** 自主探索引擎参数（模型 2: Ollama） */
+    /** 自主探索引擎参数（模型 2: DeepSeek 云端备用） */
     public record Exploration(
             boolean enabled,
             int idleThresholdMinutes,
             int maxDurationMinutes,
             List<Integer> blackoutHours,
+            String baseUrl,
             String model,
             List<String> allowedDomains
     ) {}

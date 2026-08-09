@@ -6,8 +6,11 @@ import com.example.desktopbrain.common.QdrantFields;
 import com.example.desktopbrain.memory.graph.FailurePatternNode;
 import com.example.desktopbrain.memory.graph.FailurePatternRepository;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
+import com.example.desktopbrain.memory.vector.QdrantDtos;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -41,6 +44,8 @@ import static com.example.desktopbrain.common.QdrantFields.*;
  */
 @Service
 public class EpisodeCacheService {
+
+    private static final Logger log = LoggerFactory.getLogger(EpisodeCacheService.class);
 
     private final WebClient qdrant;
     private final EmbeddingService embeddingService;
@@ -113,16 +118,16 @@ public class EpisodeCacheService {
                         .retrieve()
                         .toBodilessEntity()
                         .block();
-                System.out.println("📦 Qdrant 集合 '" + collectionName + "' 已创建（向量维度: " + vectorSize + "）");
+                log.info("📦 Qdrant 集合 '{}' 已创建（向量维度: {}）", collectionName, vectorSize);
             } else {
-                System.out.println("📦 Qdrant 集合 '" + collectionName + "' 已存在");
+                log.info("📦 Qdrant 集合 '{}' 已存在", collectionName);
                 // 清理遗留的 DRAFT points（前次运行未完成的执行）
                 cleanupDraftPoints();
             }
             // 同时初始化 failure-patterns collection
             initFailurePatternsCollection();
         } catch (Exception e) {
-            System.err.println("⚠️ Episode collection 初始化失败（episode 系统将降级）: " + e.getMessage());
+            log.warn("⚠️ Episode collection 初始化失败（episode 系统将降级）", e);
         }
     }
 
@@ -146,12 +151,12 @@ public class EpisodeCacheService {
                         .retrieve()
                         .toBodilessEntity()
                         .block();
-                System.out.println("📦 Qdrant 集合 '" + failurePatternsCollection + "' 已创建（向量维度: " + vectorSize + "）");
+                log.info("📦 Qdrant 集合 '{}' 已创建（向量维度: {}）", failurePatternsCollection, vectorSize);
             } else {
-                System.out.println("📦 Qdrant 集合 '" + failurePatternsCollection + "' 已存在");
+                log.info("📦 Qdrant 集合 '{}' 已存在", failurePatternsCollection);
             }
         } catch (Exception e) {
-            System.err.println("⚠️ FailurePatterns collection 初始化失败: " + e.getMessage());
+            log.warn("⚠️ FailurePatterns collection 初始化失败", e);
         }
     }
 
@@ -160,7 +165,6 @@ public class EpisodeCacheService {
      * Qdrant 重启后，之前的 DRAFT 不再有对应的内存 episodeId，
      * 永远无法被 activate/fail，必须清理。
      */
-    @SuppressWarnings("unchecked")
     private void cleanupDraftPoints() {
         try {
             // 1. scroll 获取所有 DRAFT points 的 ID
@@ -173,43 +177,39 @@ public class EpisodeCacheService {
             scrollBody.put(WITH_VECTOR, false);
             scrollBody.put(LIMIT, 1000);
 
-            Map<String, Object> response = qdrant.post()
+            QdrantDtos.ScrollResponse response = qdrant.post()
                     .uri("/collections/" + collectionName + "/points/scroll")
                     .header(CONTENT_TYPE, APPLICATION_JSON)
                     .bodyValue(scrollBody)
                     .retrieve()
-                    .bodyToMono(Map.class)
+                    .bodyToMono(QdrantDtos.ScrollResponse.class)
                     .block();
 
-            if (response == null) return;
-            Map<String, Object> result = (Map<String, Object>) response.get(RESULT);
-            if (result == null) return;
-            List<Map<String, Object>> points = (List<Map<String, Object>>) result.getOrDefault(POINTS, List.of());
-            if (points.isEmpty()) return;
+            if (response == null || response.result() == null) return;
+            List<QdrantDtos.ScoredPoint> points = response.result().points();
+            if (points == null || points.isEmpty()) return;
 
             List<String> draftIds = new ArrayList<>();
-            for (Map<String, Object> p : points) {
-                Object id = p.get(ID);
-                if (id != null) draftIds.add(String.valueOf(id));
+            for (QdrantDtos.ScoredPoint p : points) {
+                if (p.id() != null) draftIds.add(p.id());
             }
 
             // 2. 批量删除
             Map<String, Object> deleteBody = Map.of("points", draftIds);
-            Map<String, Object> deleteResp = qdrant.post()
+            QdrantDtos.DeleteResponse deleteResp = qdrant.post()
                     .uri("/collections/" + collectionName + "/points/delete?wait=true")
                     .header(CONTENT_TYPE, APPLICATION_JSON)
                     .bodyValue(deleteBody)
                     .retrieve()
-                    .bodyToMono(Map.class)
+                    .bodyToMono(QdrantDtos.DeleteResponse.class)
                     .block();
 
-            if (deleteResp != null) {
-                Map<String, Object> deleteResult = (Map<String, Object>) deleteResp.get("result");
-                String status = deleteResult != null ? String.valueOf(deleteResult.getOrDefault("status", "ok")) : "ok";
-                System.out.println("🧹 清理遗留 DRAFT points: " + draftIds.size() + " 个 (" + status + ")");
+            if (deleteResp != null && deleteResp.result() != null) {
+                String status = deleteResp.result().status();
+                log.info("🧹 清理遗留 DRAFT points: {} 个 ({})", draftIds.size(), status);
             }
         } catch (Exception e) {
-            System.err.println("⚠️ DRAFT 清理失败（不影响正常功能）: " + e.getMessage());
+            log.warn("⚠️ DRAFT 清理失败（不影响正常功能）", e);
         }
     }
 
@@ -236,23 +236,21 @@ public class EpisodeCacheService {
             body.put(SCORE_THRESHOLD, (float) similarityThreshold);
             body.put(FILTER, filter);
 
-            @SuppressWarnings("unchecked")
-            Map<String, Object> response = qdrant.post()
+            QdrantDtos.SearchResponse response = qdrant.post()
                     .uri("/collections/" + collectionName + "/points/search")
                     .header(CONTENT_TYPE, APPLICATION_JSON)
                     .bodyValue(body)
                     .retrieve()
-                    .bodyToMono(Map.class)
+                    .bodyToMono(QdrantDtos.SearchResponse.class)
                     .block();
 
             if (response == null) return Optional.empty();
 
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> points = (List<Map<String, Object>>) response.getOrDefault("result", List.of());
+            List<QdrantDtos.ScoredPoint> points = response.result() != null ? response.result() : List.of();
             if (points.isEmpty()) return Optional.empty();
 
             List<Episode> episodes = new ArrayList<>();
-            for (Map<String, Object> point : points) {
+            for (QdrantDtos.ScoredPoint point : points) {
                 Episode ep = deserializeEpisode(point);
                 if (ep != null) episodes.add(ep);
             }
@@ -260,10 +258,10 @@ public class EpisodeCacheService {
 
             episodes.sort((a, b) -> Double.compare(b.computedStability(), a.computedStability()));
             Episode best = episodes.get(0);
-            System.out.println("💾 命中 Episode 缓存（稳定度: " + best.computedStability() + "）");
+            log.info("💾 命中 Episode 缓存（稳定度: {}）", best.computedStability());
             return Optional.of(best);
         } catch (Exception e) {
-            System.err.println("❌ Qdrant 搜索失败: " + e.getMessage());
+            log.error("❌ Qdrant 搜索失败", e);
             return Optional.empty();
         }
     }
@@ -312,10 +310,10 @@ public class EpisodeCacheService {
             payload.put("failedStepIndex", -1);
 
             upsertPoint(episodeId, vector, payload);
-            System.out.println("📝 已创建 DRAFT Episode（id=" + episodeId.substring(0, 8) + "...）");
+            log.info("📝 已创建 DRAFT Episode（id={}...）", episodeId.substring(0, 8));
             return episodeId;
         } catch (Exception e) {
-            System.err.println("❌ DRAFT Episode 创建失败: " + e.getMessage());
+            log.error("❌ DRAFT Episode 创建失败", e);
             return null;
         }
     }
@@ -365,16 +363,16 @@ public class EpisodeCacheService {
                 update.put("failedStepIndex", -1);
 
                 setPayload(episodeId, update);
-                System.out.println("✅ DRAFT→ACTIVE（id=" + episodeId.substring(0, 8)
-                        + "..., success=" + newSuccess + ", stability=" + String.format("%.2f", newStability)
-                        + (canScript ? ", 🚀可脚本化" : "")
-                        + (successLesson != null ? ", 经验: " + AiResponseUtils.truncate(successLesson, 40) : "")
-                        + (!signature.isEmpty() ? ", 变量: " + signature.keySet() : "") + "）");
+                log.info("✅ DRAFT→ACTIVE（id={}..., success={}, stability={}{}{}{}）",
+                        episodeId.substring(0, 8), newSuccess, String.format("%.2f", newStability),
+                        canScript ? ", 🚀可脚本化" : "",
+                        successLesson != null ? ", 经验: " + AiResponseUtils.truncate(successLesson, 40) : "",
+                        !signature.isEmpty() ? ", 变量: " + signature.keySet() : "");
 
                 // 异步触发通用步骤提取（"越用越聪明"：积累 episode 后自动发现可复用 ATOMIC）
                 unitLearner.learnAsync();
             } catch (Exception e) {
-                System.err.println("❌ DRAFT→ACTIVE 失败: " + e.getMessage());
+                log.error("❌ DRAFT→ACTIVE 失败", e);
             }
         });
     }
@@ -402,12 +400,13 @@ public class EpisodeCacheService {
                 update.put("status", Episode.EpisodeStatus.FAILED.name());
 
                 setPayload(episodeId, update);
-                System.out.println("❌ DRAFT→FAILED（id=" + episodeId.substring(0, 8)
-                        + "..., 已保存 " + (toolCalls != null ? toolCalls.size() : 0) + " 步"
-                        + ", 失败步: " + failedStepIndex
-                        + (failureLesson != null ? ", 教训: " + AiResponseUtils.truncate(failureLesson, 40) : "") + "）");
+                log.info("❌ DRAFT→FAILED（id={}..., 已保存 {} 步, 失败步: {}{}）",
+                        episodeId.substring(0, 8),
+                        (toolCalls != null ? toolCalls.size() : 0),
+                        failedStepIndex,
+                        failureLesson != null ? ", 教训: " + AiResponseUtils.truncate(failureLesson, 40) : "");
             } catch (Exception e) {
-                System.err.println("❌ DRAFT→FAILED 失败: " + e.getMessage());
+                log.error("❌ DRAFT→FAILED 失败", e);
             }
         });
     }
@@ -458,18 +457,19 @@ public class EpisodeCacheService {
                     }
 
                     setPayload(episodeId, payloadUpdate);
-                    System.out.println("⚠️ Episode 计划失败+1（id=" + episodeId.substring(0, 8)
-                            + "..., failure=" + newFailure + ", stability=" + String.format("%.2f", newStability)
-                            + (shouldArchive ? ", 已归档" : "")
-                            + (failureLesson != null ? ", 教训: " + AiResponseUtils.truncate(failureLesson, 40) : "") + "）");
-                } else {
-                    // 环境问题 → 不惩罚计划，只存教训
-                    setPayload(episodeId, payloadUpdate);
-                    System.out.println("ℹ️ Episode 环境失败（不惩罚计划，id=" + episodeId.substring(0, 8)
-                            + "..., 教训: " + (failureLesson != null ? AiResponseUtils.truncate(failureLesson, 40) : "无") + "）");
+                log.info("⚠️ Episode 计划失败+1（id={}..., failure={}, stability={}{}{}）",
+                        episodeId.substring(0, 8), newFailure, String.format("%.2f", newStability),
+                        shouldArchive ? ", 已归档" : "",
+                        failureLesson != null ? ", 教训: " + AiResponseUtils.truncate(failureLesson, 40) : "");
+            } else {
+                // 环境问题 → 不惩罚计划，只存教训
+                setPayload(episodeId, payloadUpdate);
+                log.info("ℹ️ Episode 环境失败（不惩罚计划，id={}..., 教训: {}）",
+                        episodeId.substring(0, 8),
+                        failureLesson != null ? AiResponseUtils.truncate(failureLesson, 40) : "无");
                 }
             } catch (Exception e) {
-                System.err.println("❌ Episode 失败更新失败: " + e.getMessage());
+                log.error("❌ Episode 失败更新失败", e);
             }
         });
     }
@@ -498,22 +498,21 @@ public class EpisodeCacheService {
                 payloadUpdate.put("stability", newStability);
                 if (canScript && !ep.canScript()) {
                     payloadUpdate.put("canScript", true);
-                    System.out.println("🚀 Episode 升级为可脚本化（id=" + episodeId.substring(0, 8) + "...）");
+                    log.info("🚀 Episode 升级为可脚本化（id={}...）", episodeId.substring(0, 8));
                 }
 
                 setPayload(episodeId, payloadUpdate);
-                System.out.println("✅ Episode 成功+1（id=" + episodeId.substring(0, 8)
-                        + "..., success=" + newSuccess + ", stability=" + String.format("%.2f", newStability)
-                        + (canScript ? ", 🚀可脚本化" : "") + "）");
+                log.info("✅ Episode 成功+1（id={}..., success={}, stability={}{}）",
+                        episodeId.substring(0, 8), newSuccess, String.format("%.2f", newStability),
+                        canScript ? ", 🚀可脚本化" : "");
             } catch (Exception e) {
-                System.err.println("❌ Episode 成功计数更新失败: " + e.getMessage());
+                log.error("❌ Episode 成功计数更新失败", e);
             }
         });
     }
 
     // ========== 内部工具方法 ==========
 
-    @SuppressWarnings("unchecked")
     private Optional<Episode> fetchEpisode(String episodeId) {
         try {
             Map<String, Object> body = Map.of(
@@ -521,19 +520,19 @@ public class EpisodeCacheService {
                     "with_payload", true,
                     "with_vector", false
             );
-            Map<String, Object> response = qdrant.post()
+            QdrantDtos.SearchResponse response = qdrant.post()
                     .uri("/collections/" + collectionName + "/points")
                     .header(CONTENT_TYPE, APPLICATION_JSON)
                     .bodyValue(body)
                     .retrieve()
-                    .bodyToMono(Map.class)
+                    .bodyToMono(QdrantDtos.SearchResponse.class)
                     .block();
             if (response == null) return Optional.empty();
-            List<Map<String, Object>> points = (List<Map<String, Object>>) response.getOrDefault("result", List.of());
+            List<QdrantDtos.ScoredPoint> points = response.result() != null ? response.result() : List.of();
             if (points.isEmpty()) return Optional.empty();
             return Optional.ofNullable(deserializeEpisode(points.get(0)));
         } catch (Exception e) {
-            System.err.println("❌ Qdrant 读取 episode 失败: " + e.getMessage());
+            log.error("❌ Qdrant 读取 episode 失败", e);
             return Optional.empty();
         }
     }
@@ -547,7 +546,7 @@ public class EpisodeCacheService {
                 try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
             }
         }
-        System.err.println("⚠️ fetchEpisode 重试 " + maxRetries + " 次后仍未找到: " + episodeId.substring(0, 8) + "...");
+        log.warn("⚠️ fetchEpisode 重试 {} 次后仍未找到: {}...", maxRetries, episodeId.substring(0, 8));
         return Optional.empty();
     }
 
@@ -586,8 +585,7 @@ public class EpisodeCacheService {
     /**
      * 把 Qdrant 返回的 point 反序列化为 Episode（映射全部字段含 lesson）。
      */
-    @SuppressWarnings("unchecked")
-    private Episode deserializeEpisode(Map<String, Object> point) {
+    private Episode deserializeEpisode(QdrantDtos.ScoredPoint point) {
         return Episode.fromQdrantPoint(point, objectMapper);
     }
 
@@ -655,9 +653,9 @@ public class EpisodeCacheService {
                 payload.put("failedStepIndex", -1);
 
                 upsertPoint(episodeId, vector, payload);
-                System.out.println("🧩 已提取可复用步骤链: " + stepDesc + " (id=" + episodeId.substring(0, 8) + "...)");
+                log.info("🧩 已提取可复用步骤链: {} (id={}...)", stepDesc, episodeId.substring(0, 8));
             } catch (Exception e) {
-                System.err.println("⚠️ 提取步骤链失败: " + e.getMessage());
+                log.warn("⚠️ 提取步骤链失败", e);
             }
         }
     }
@@ -667,7 +665,6 @@ public class EpisodeCacheService {
      *
      * <p>scroll 出 status=ACTIVE 且 archived=false 且 stability>=0.5 的最近 N 条，返回摘要信息。</p>
      */
-    @SuppressWarnings("unchecked")
     public List<String> getRecentSuccessfulEpisodeSummaries(int limit) {
         try {
             Map<String, Object> filter = Map.of(MUST, List.of(
@@ -681,22 +678,21 @@ public class EpisodeCacheService {
             scrollBody.put(WITH_VECTOR, false);
             scrollBody.put(LIMIT, limit);
 
-            Map<String, Object> response = qdrant.post()
+            QdrantDtos.ScrollResponse response = qdrant.post()
                     .uri("/collections/" + collectionName + "/points/scroll")
                     .header(CONTENT_TYPE, APPLICATION_JSON)
                     .bodyValue(scrollBody)
                     .retrieve()
-                    .bodyToMono(Map.class)
+                    .bodyToMono(QdrantDtos.ScrollResponse.class)
                     .block();
 
-            if (response == null) return List.of();
-            Map<String, Object> result = (Map<String, Object>) response.get(RESULT);
-            if (result == null) return List.of();
-            List<Map<String, Object>> points = (List<Map<String, Object>>) result.getOrDefault(POINTS, List.of());
+            if (response == null || response.result() == null) return List.of();
+            List<QdrantDtos.ScoredPoint> points = response.result().points();
+            if (points == null || points.isEmpty()) return List.of();
 
             List<String> summaries = new ArrayList<>();
-            for (Map<String, Object> p : points) {
-                Map<String, Object> payload = (Map<String, Object>) p.get("payload");
+            for (QdrantDtos.ScoredPoint p : points) {
+                Map<String, Object> payload = p.payload();
                 if (payload == null) continue;
                 String userInput = (String) payload.getOrDefault("userInput", "");
                 String successLesson = (String) payload.getOrDefault("successLesson", "");
@@ -706,7 +702,7 @@ public class EpisodeCacheService {
             }
             return summaries;
         } catch (Exception e) {
-            System.err.println("⚠️ 获取成功 Episode 摘要失败: " + e.getMessage());
+            log.warn("⚠️ 获取成功 Episode 摘要失败", e);
             return List.of();
         }
     }
@@ -737,7 +733,7 @@ public class EpisodeCacheService {
                 payload.put("toolNames", toolNames != null ? toolNames : List.of());
 
                 upsertPointToCollection(failurePatternsCollection, pointId, vector, payload);
-                System.out.println("💾 失败模式已持久化: " + pattern.type() + " (id=" + pointId.substring(0, 8) + "...)");
+                log.info("💾 失败模式已持久化: {} (id={}...)", pattern.type(), pointId.substring(0, 8));
 
                 // 同时写入 Neo4j 知识图谱
                 try {
@@ -745,12 +741,12 @@ public class EpisodeCacheService {
                             pattern.type(), pattern.description(), pattern.mitigation(),
                             pattern.count(), pattern.detectedAt());
                     failurePatternRepo.save(node);
-                    System.out.println("🧠 失败模式已写入 Neo4j: " + pattern.type());
+                    log.info("🧠 失败模式已写入 Neo4j: {}", pattern.type());
                 } catch (Exception neoEx) {
-                    System.err.println("⚠️ FailurePattern Neo4j 写入失败: " + neoEx.getMessage());
+                    log.warn("⚠️ FailurePattern Neo4j 写入失败", neoEx);
                 }
             } catch (Exception e) {
-                System.err.println("❌ FailurePattern 持久化失败: " + e.getMessage());
+                log.error("❌ FailurePattern 持久化失败", e);
             }
         });
     }
@@ -762,7 +758,6 @@ public class EpisodeCacheService {
      * @param topK  返回条数
      * @return 匹配的 FailurePattern 列表（含 Qdrant score）；出错时返回空列表
      */
-    @SuppressWarnings("unchecked")
     public List<FailureSearchResult> searchFailurePatterns(String query, int topK) {
         try {
             List<Float> queryVector = embeddingService.embed(query);
@@ -773,23 +768,23 @@ public class EpisodeCacheService {
             body.put(WITH_PAYLOAD, true);
             body.put(SCORE_THRESHOLD, 0.55f);
 
-            Map<String, Object> response = qdrant.post()
+            QdrantDtos.SearchResponse response = qdrant.post()
                     .uri("/collections/" + failurePatternsCollection + "/points/search")
                     .header(CONTENT_TYPE, APPLICATION_JSON)
                     .bodyValue(body)
                     .retrieve()
-                    .bodyToMono(Map.class)
+                    .bodyToMono(QdrantDtos.SearchResponse.class)
                     .block();
 
             if (response == null) return List.of();
 
-            List<Map<String, Object>> points = (List<Map<String, Object>>) response.getOrDefault("result", List.of());
+            List<QdrantDtos.ScoredPoint> points = response.result() != null ? response.result() : List.of();
             if (points.isEmpty()) return List.of();
 
             List<FailureSearchResult> results = new ArrayList<>();
-            for (Map<String, Object> point : points) {
-                double score = ((Number) point.getOrDefault(SCORE, 0.0)).doubleValue();
-                Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+            for (QdrantDtos.ScoredPoint point : points) {
+                double score = point.score();
+                Map<String, Object> payload = point.payload();
                 if (payload == null) continue;
 
                 results.add(new FailureSearchResult(
@@ -804,7 +799,7 @@ public class EpisodeCacheService {
             }
             return results;
         } catch (Exception e) {
-            System.err.println("❌ FailurePattern 搜索失败: " + e.getMessage());
+            log.error("❌ FailurePattern 搜索失败", e);
             return List.of();
         }
     }

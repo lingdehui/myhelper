@@ -7,6 +7,8 @@ import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig;
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import javax.sound.sampled.*;
@@ -23,12 +25,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Component
 public class TtsService {
 
+    private static final Logger log = LoggerFactory.getLogger(TtsService.class);
+
     private OfflineTts tts;
     private volatile float ttsSampleRate;
     private final LinkedBlockingQueue<GeneratedAudio> playQueue = new LinkedBlockingQueue<>(5);
     private final AtomicBoolean stopFlag = new AtomicBoolean(false);
     private Thread playbackThread;
     private volatile boolean playing = false;
+
+    private final NativeJniGate jniGate;
+
+    public TtsService(NativeJniGate jniGate) {
+        this.jniGate = jniGate;
+    }
 
     public boolean isPlaying() { return playing; }
 
@@ -41,7 +51,7 @@ public class TtsService {
 
             // 首次启动才解压，后续秒启
             if (!Files.exists(modelDir.resolve("model.onnx"))) {
-                System.out.println("📦 首次启动，解压 TTS 模型到 " + modelDir);
+                log.info("📦 首次启动，解压 TTS 模型到 {}", modelDir);
                 String[] files = {"model.onnx", "tokens.txt", "lexicon.txt"};
                 for (String f : files) {
                     extractResource("models/tts-zh/" + f, modelDir.resolve(f));
@@ -77,17 +87,17 @@ public class TtsService {
             // 预热：首次生成有 JNI/模型初始化开销
             GeneratedAudio warmup = tts.generate("测试");
             if (warmup != null && warmup.getSamples().length > 0) {
-                System.out.println("🔊 预热完成 (" + warmup.getSamples().length + " samples)");
+                log.info("🔊 预热完成 ({} samples)", warmup.getSamples().length);
             }
 
             playbackThread = new Thread(this::playbackLoop, "tts-playback");
             playbackThread.setDaemon(true);
             playbackThread.start();
 
-            System.out.println("🔊 TTS 引擎就绪 (" + (int) ttsSampleRate + " Hz)");
+            log.info("🔊 TTS 引擎就绪 ({} Hz)", (int) ttsSampleRate);
         } catch (Exception e) {
-            System.out.println("⚠️ TTS 初始化失败: " + e.getMessage() + "，将跳过语音输出");
-            e.printStackTrace();
+            log.warn("⚠️ TTS 初始化失败: {}，将跳过语音输出", e.getMessage());
+            log.error("TTS 初始化异常", e);
         }
     }
 
@@ -96,7 +106,7 @@ public class TtsService {
      */
     public void speakAsync(String text) {
         if (tts == null) {
-            System.err.println("🔇 TTS 未初始化");
+            log.error("🔇 TTS 未初始化");
             return;
         }
         if (text == null || text.isBlank()) return;
@@ -106,26 +116,29 @@ public class TtsService {
         if (clean.isEmpty()) return;
         if (clean.length() > 500) clean = clean.substring(0, 500);
 
+        jniGate.lock();
         try {
             GeneratedAudio audio = tts.generate(clean);
             if (audio == null) {
-                System.err.println("🔇 TTS generate 返回 null: " + clean);
+                log.error("🔇 TTS generate 返回 null: {}", clean);
                 return;
             }
             if (audio.getSamples().length == 0) {
-                System.err.println("🔇 TTS generate 返回空音频: " + clean);
+                log.error("🔇 TTS generate 返回空音频: {}", clean);
                 return;
             }
             // 打印前几个采样值确认音频非空
             float[] samples = audio.getSamples();
             float maxVal = 0;
             for (float s : samples) { if (Math.abs(s) > maxVal) maxVal = Math.abs(s); }
-            System.out.println("🔊 TTS: " + clean + " (" + samples.length + " samples, max=" + String.format("%.3f", maxVal) + ", rate=" + (int)ttsSampleRate + "Hz)");
+            log.info("🔊 TTS: {} ({} samples, max={}, rate={}Hz)", clean, samples.length, String.format("%.3f", maxVal), (int)ttsSampleRate);
             
             playQueue.offer(audio);  // 队列满时丢弃最旧（LinkedBlockingQueue FIFO）
         } catch (Exception e) {
-            System.err.println("🔇 TTS generate 异常: " + e.getMessage());
-            e.printStackTrace();
+            log.error("🔇 TTS generate 异常: {}", e.getMessage());
+            log.error("TTS generate 异常", e);
+        } finally {
+            jniGate.unlock();
         }
     }
 
@@ -171,7 +184,7 @@ public class TtsService {
                 line.start();
 
                 playing = true;
-                System.out.println("🔊 开始播放 (" + pcm.length + " bytes, " + sampleRate + "Hz)");
+                log.info("🔊 开始播放 ({} bytes, {}Hz)", pcm.length, sampleRate);
 
                 int bufferSize = Math.min(pcm.length, 4096);
                 int offset = 0;
@@ -186,14 +199,14 @@ public class TtsService {
                 } else {
                     line.drain();
                     line.stop();
-                    System.out.println("🔊 播放完成");
+                    log.info("🔊 播放完成");
                 }
                 playing = false;
             }
         } catch (Exception e) {
             playing = false;
-            System.err.println("🔇 TTS 播放失败: " + e.getMessage());
-            e.printStackTrace();
+            log.error("🔇 TTS 播放失败: {}", e.getMessage());
+            log.error("TTS 播放异常", e);
         }
     }
 
@@ -246,7 +259,7 @@ public class TtsService {
                 // 表格分隔行
                 .replaceAll("(?m)^\\|[-:| ]+\\|$", " ")
                 // 表格管道符
-                .replaceAll("\\|", " ")
+                .replaceAll("\\|", "，")
                 // 链接 [text](url)
                 .replaceAll("\\[([^]]*)]\\([^)]*\\)", "$1")
                 // 图片 ![alt](url)
@@ -255,9 +268,15 @@ public class TtsService {
                 .replaceAll("<[^>]+>", " ")
                 // 引用 >
                 .replaceAll("(?m)^>\\s*", "")
-                // 列表标记
-                .replaceAll("(?m)^[\\s]*[-*+]\\s+", "")
+                // 列表标记（含 · 和 •）
+                .replaceAll("(?m)^[\\s]*[-*+·•]\\s+", "")
                 .replaceAll("(?m)^[\\s]*\\d+[.)]\\s+", "")
+                // Emoji 数字/符号 (1️⃣ 2️⃣ 等) + 全角冒号/括号/数字等 TTS 不发音的字符
+                .replaceAll("[\\p{So}\\p{Sk}]", "")
+                // 中文全角括号、斜杠等在 markdown 语境中无意义
+                .replaceAll("[\\s]*[/＞＞]+[\\s]*", "、")
+                .replaceAll("[（）]", "")
+                .replaceAll("[:：#]", "，")
                 // 多余空白
                 .replaceAll("\\s{2,}", " ")
                 .trim();

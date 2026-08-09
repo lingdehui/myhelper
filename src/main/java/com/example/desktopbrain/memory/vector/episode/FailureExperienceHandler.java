@@ -1,5 +1,7 @@
 package com.example.desktopbrain.memory.vector.episode;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
@@ -21,6 +23,8 @@ import java.util.concurrent.LinkedBlockingDeque;
  */
 @Component
 public class FailureExperienceHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(FailureExperienceHandler.class);
 
     /** 失败类型 → 时间戳队列（滑动窗口） */
     private final ConcurrentHashMap<String, LinkedBlockingDeque<Long>> slidingWindows = new ConcurrentHashMap<>();
@@ -80,7 +84,7 @@ public class FailureExperienceHandler {
                                             boolean isPlanIssue, boolean hasSalvaged,
                                             List<String> selectedToolNames) {
         if (failureLesson == null || failureLesson.isBlank()) {
-            System.out.println("📊 失败计数: 跳过（无教训内容）");
+            log.info("📊 失败计数: 跳过（无教训内容）");
             return Optional.empty();
         }
 
@@ -104,8 +108,7 @@ public class FailureExperienceHandler {
         // 构建日志语境
         String context = isPlanIssue ? "计划问题" : "环境问题";
         String salvagedTag = hasSalvaged ? " | 已提取 ATOMIC" : "";
-        System.out.printf("📊 失败计数 [%s]: %d/%d（%s%s）%n",
-                failureType, count, PATTERN_THRESHOLD, context, salvagedTag);
+        log.info("📊 失败计数 [{}]: {}/{}（{}{}）", failureType, count, PATTERN_THRESHOLD, context, salvagedTag);
 
         // 达到阈值 → 生成 FailurePattern
         if (count >= PATTERN_THRESHOLD && !patternCache.contains(failureType)) {
@@ -120,7 +123,7 @@ public class FailureExperienceHandler {
             );
 
             window.clear(); // 重置窗口，避免短期重复触发
-            System.out.println("⚠️ 生成失败模式: " + pattern.description());
+            log.info("⚠️ 生成失败模式: {}", pattern.description());
 
             // 持久化到 Qdrant + Neo4j（异步，不阻塞主流程）
             episodeCacheService.saveFailurePattern(pattern, selectedToolNames);

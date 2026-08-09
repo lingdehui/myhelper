@@ -1,5 +1,7 @@
 package com.example.desktopbrain.config;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.stereotype.Component;
 
@@ -10,6 +12,8 @@ import org.springframework.stereotype.Component;
 @Component
 public class DockerInitializer implements CommandLineRunner {
 
+    private static final Logger log = LoggerFactory.getLogger(DockerInitializer.class);
+
     @Override
     public void run(String... args) throws Exception {
         // 检查并启动 Neo4j
@@ -18,7 +22,7 @@ public class DockerInitializer implements CommandLineRunner {
         // 检查并启动 Home Assistant
         ensureContainerRunning("homeassistant", "docker compose up -d homeassistant");
         
-        System.out.println("✅ 所有必要的 Docker 服务已就绪");
+        log.info("✅ 所有必要的 Docker 服务已就绪");
     }
 
     /**
@@ -36,29 +40,29 @@ public class DockerInitializer implements CommandLineRunner {
             String status = new String(p.getInputStream().readAllBytes()).trim();
 
             if ("true".equalsIgnoreCase(status)) {
-                System.out.println("✅ " + containerName + " 已在运行");
+                log.info("✅ {} 已在运行", containerName);
                 return;
             }
 
             // 如果容器存在但已停止，直接启动
             if (!status.isEmpty()) {
-                System.out.println("📦 " + containerName + " 已停止，正在启动...");
+                log.info("📦 {} 已停止，正在启动...", containerName);
                 Runtime.getRuntime().exec("docker start " + containerName);
                 waitForContainer(containerName, 3000);
-                System.out.println("✅ " + containerName + " 启动成功");
+                log.info("✅ {} 启动成功", containerName);
                 return;
             }
 
             // 容器不存在，用 docker compose 创建并启动
-            System.out.println("📦 " + containerName + " 未创建，正在通过 docker compose 启动...");
+            log.info("📦 {} 未创建，正在通过 docker compose 启动...", containerName);
             Process composeProcess = Runtime.getRuntime().exec(startCommand);
             composeProcess.waitFor();
             waitForContainer(containerName, 5000);
-            System.out.println("✅ " + containerName + " 创建并启动成功");
+            log.info("✅ {} 创建并启动成功", containerName);
 
         } catch (Exception e) {
-            System.err.println("⚠️ 无法启动 " + containerName + ": " + e.getMessage());
-            System.err.println("   请确保 Docker Desktop 正在运行，并手动执行: docker compose up -d");
+            log.error("⚠️ 无法启动 {}: {}", containerName, e.getMessage());
+            log.error("   请确保 Docker Desktop 正在运行，并手动执行: docker compose up -d");
         }
     }
 

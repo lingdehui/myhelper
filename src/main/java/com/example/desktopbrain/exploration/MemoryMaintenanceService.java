@@ -2,7 +2,10 @@ package com.example.desktopbrain.exploration;
 
 import com.example.desktopbrain.config.DesktopBrainProperties;
 import com.example.desktopbrain.memory.vector.episode.Episode;
+import com.example.desktopbrain.memory.vector.QdrantDtos;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -31,6 +34,8 @@ import java.util.stream.Collectors;
  */
 @Service
 public class MemoryMaintenanceService {
+
+    private static final Logger log = LoggerFactory.getLogger(MemoryMaintenanceService.class);
 
     private final WebClient qdrant;
     private final DesktopBrainProperties props;
@@ -62,7 +67,7 @@ public class MemoryMaintenanceService {
         try {
             cleanup();
         } catch (Exception e) {
-            System.err.println("❌ 记忆维护失败: " + e.getMessage());
+            log.error("❌ 记忆维护失败", e);
         }
     }
 
@@ -77,22 +82,20 @@ public class MemoryMaintenanceService {
         // 1. 计算占用率
         double usageRate = calculateUsageRate();
         if (usageRate < mm.threshold()) {
-            System.out.println("📊 记忆占用率 " + fmt(usageRate)
-                    + " < 阈值 " + fmtPct(mm.threshold()) + "，无需清理");
+            log.info("📊 记忆占用率 {} < 阈值 {}，无需清理", fmt(usageRate), fmtPct(mm.threshold()));
             return;
         }
 
-        System.out.println("🧹 记忆占用率 " + fmt(usageRate)
-                + " ≥ 阈值 " + fmtPct(mm.threshold()) + "，触发价值评分清理...");
+        log.info("🧹 记忆占用率 {} ≥ 阈值 {}，触发价值评分清理...", fmt(usageRate), fmtPct(mm.threshold()));
 
         // 2. 滚动获取所有 Episode
         List<Episode> allEpisodes = scrollAllEpisodes();
         if (allEpisodes.isEmpty()) {
-            System.out.println("  ℹ️ 无 Episode 可清理");
+            log.info("  ℹ️ 无 Episode 可清理");
             return;
         }
 
-        System.out.println("  📋 共加载 " + allEpisodes.size() + " 条 Episode，开始评分...");
+        log.info("  📋 共加载 {} 条 Episode，开始评分...", allEpisodes.size());
 
         // 3. 计算价值评分，筛选删除候选
         List<CleanupCandidate> candidates = new ArrayList<>();
@@ -126,7 +129,7 @@ public class MemoryMaintenanceService {
         }
 
         if (candidates.isEmpty()) {
-            System.out.println("  ℹ️ 无符合条件的低价值 Episode");
+            log.info("  ℹ️ 无符合条件的低价值 Episode");
             return;
         }
 
@@ -137,25 +140,24 @@ public class MemoryMaintenanceService {
         List<CleanupCandidate> toDelete = candidates.subList(0, removeCount);
 
         // 5. 打印清理摘要
-        System.out.println("  📊 清理摘要:");
-        System.out.println("    候选数: " + candidates.size() + " 条，计划删除: " + removeCount + " 条");
-        System.out.println("    分值范围: [" + fmtRaw(toDelete.get(0).valueScore())
-                + " ~ " + fmtRaw(toDelete.get(toDelete.size() - 1).valueScore()) + "]");
+        log.info("  📊 清理摘要:");
+        log.info("    候选数: {} 条，计划删除: {} 条", candidates.size(), removeCount);
+        log.info("    分值范围: [{} ~ {}]", fmtRaw(toDelete.get(0).valueScore()),
+                fmtRaw(toDelete.get(toDelete.size() - 1).valueScore()));
 
         // 打印前 5 条
         int preview = Math.min(5, toDelete.size());
         for (int i = 0; i < preview; i++) {
             CleanupCandidate c = toDelete.get(i);
-            System.out.println("    [" + fmtRaw(c.valueScore()) + "] \""
-                    + c.title() + "\" (" + c.sourceType() + ", " + c.ageDays() + "天)");
+            log.info("    [{}] \"{}\" ({}, {}天)", fmtRaw(c.valueScore()), c.title(), c.sourceType(), c.ageDays());
         }
 
         // 6. 批量删除
         List<String> ids = toDelete.stream().map(CleanupCandidate::episodeId).collect(Collectors.toList());
         int deleted = batchDelete(ids);
 
-        System.out.println("  📦 已删除 " + deleted + " 条低价值 Episode");
-        System.out.println("✅ 记忆维护完成（价值评分模式）");
+        log.info("  📦 已删除 {} 条低价值 Episode", deleted);
+        log.info("✅ 记忆维护完成（价值评分模式）");
     }
 
     // ========================================================================
@@ -226,20 +228,20 @@ public class MemoryMaintenanceService {
     /** 添加永久保护 */
     public void protectMemory(String episodeId) {
         protectedIds.put(episodeId, 0L);
-        System.out.println("🛡️ 已标记永久保护: " + episodeId);
+        log.info("🛡️ 已标记永久保护: {}", episodeId);
     }
 
     /** 添加限期保护（N 天后自动失效） */
     public void protectMemory(String episodeId, int days) {
         long expireAt = System.currentTimeMillis() + days * 86_400_000L;
         protectedIds.put(episodeId, expireAt);
-        System.out.println("🛡️ 已标记保护 " + days + " 天: " + episodeId);
+        log.info("🛡️ 已标记保护 {} 天: {}", days, episodeId);
     }
 
     /** 移除保护 */
     public void unprotectMemory(String episodeId) {
         protectedIds.remove(episodeId);
-        System.out.println("🔓 已移除保护: " + episodeId);
+        log.info("🔓 已移除保护: {}", episodeId);
     }
 
     /** 检查是否受保护（自动清理过期保护） */
@@ -309,13 +311,12 @@ public class MemoryMaintenanceService {
 
             return Math.min((double) totalPoints / MAX_POINTS, 1.0);
         } catch (Exception e) {
-            System.err.println("⚠️ 占用率计算失败: " + e.getMessage());
+            log.warn("⚠️ 占用率计算失败", e);
             return 0.0;
         }
     }
 
     /** 滚动获取所有 Episode（含 payload，无 vector） */
-    @SuppressWarnings("unchecked")
     private List<Episode> scrollAllEpisodes() {
         List<Episode> all = new ArrayList<>();
         String nextOffset = null;
@@ -328,41 +329,37 @@ public class MemoryMaintenanceService {
                 body.put("with_vector", false);
                 if (nextOffset != null) body.put("offset", nextOffset);
 
-                Map<String, Object> response = qdrant.post()
+                QdrantDtos.ScrollResponse response = qdrant.post()
                         .uri("/collections/episodes/points/scroll")
                         .header("Content-Type", "application/json")
                         .bodyValue(body)
                         .retrieve()
-                        .bodyToMono(Map.class)
+                        .bodyToMono(QdrantDtos.ScrollResponse.class)
                         .block();
 
-                if (response == null) break;
+                if (response == null || response.result() == null) break;
 
-                Map<String, Object> result = (Map<String, Object>) response.get("result");
-                if (result == null) break;
-
-                List<Map<String, Object>> points =
-                        (List<Map<String, Object>>) result.getOrDefault("points", List.of());
-                for (Map<String, Object> point : points) {
-                    Episode ep = Episode.fromQdrantPoint(point, objectMapper);
-                    if (ep != null) all.add(ep);
+                List<QdrantDtos.ScoredPoint> points = response.result().points();
+                if (points != null) {
+                    for (QdrantDtos.ScoredPoint point : points) {
+                        Episode ep = Episode.fromQdrantPoint(point, objectMapper);
+                        if (ep != null) all.add(ep);
+                    }
                 }
 
-                Object offsetObj = result.get("next_page_offset");
-                nextOffset = (offsetObj instanceof String && !((String) offsetObj).isEmpty())
-                        ? (String) offsetObj : null;
+                String nxt = response.result().next_page_offset();
+                nextOffset = (nxt != null && !nxt.isEmpty()) ? nxt : null;
 
             } while (nextOffset != null);
 
         } catch (Exception e) {
-            System.err.println("⚠️ 滚动获取 Episode 失败: " + e.getMessage());
+            log.warn("⚠️ 滚动获取 Episode 失败", e);
         }
 
         return all;
     }
 
     /** 批量删除 Qdrant points */
-    @SuppressWarnings("unchecked")
     private int batchDelete(List<String> ids) {
         if (ids.isEmpty()) return 0;
         try {
@@ -376,7 +373,7 @@ public class MemoryMaintenanceService {
                     .block();
             return ids.size();
         } catch (Exception e) {
-            System.err.println("⚠️ 批量删除失败: " + e.getMessage());
+            log.warn("⚠️ 批量删除失败", e);
             return 0;
         }
     }

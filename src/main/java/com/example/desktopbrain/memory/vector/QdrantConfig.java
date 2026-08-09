@@ -39,39 +39,4 @@ public class QdrantConfig {
     public int qdrantVectorSize() {
         return vectorSize;
     }
-
-    /** 初始化集合（如果不存在则创建） */
-    @Bean
-    public boolean qdrantInitCollection(WebClient qdrantWebClient) {
-        try {
-            // 检查集合是否存在
-            var exists = qdrantWebClient.get()
-                    .uri("/collections/" + collectionName)
-                    .retrieve()
-                    .toBodilessEntity()
-                    .map(r -> true)
-                    .onErrorReturn(false)
-                    .block();
-
-            if (Boolean.FALSE.equals(exists)) {
-                var body = String.format("""
-                        {"vectors": {"size": %d, "distance": "Cosine"}}
-                        """, vectorSize);
-                qdrantWebClient.put()
-                        .uri("/collections/" + collectionName)
-                        .header("Content-Type", "application/json")
-                        .bodyValue(body)
-                        .retrieve()
-                        .toBodilessEntity()
-                        .block();
-                System.out.println("📦 Qdrant 集合 '" + collectionName + "' 已创建（向量维度: " + vectorSize + "）");
-            } else {
-                System.out.println("📦 Qdrant 集合 '" + collectionName + "' 已存在");
-            }
-            return true;
-        } catch (Exception e) {
-            System.err.println("⚠️ Qdrant 初始化失败: " + e.getMessage());
-            return false;
-        }
-    }
 }
