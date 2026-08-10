@@ -3,6 +3,7 @@ package com.example.desktopbrain.autogen;
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.PromptLoader;
 import com.example.desktopbrain.config.ModelRouter;
+import com.example.desktopbrain.config.SystemEnvironmentService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -36,10 +37,13 @@ public class ToolGenerator {
 
     private final ModelRouter modelRouter;
     private final PromptLoader promptLoader;
+    private final SystemEnvironmentService envService;
 
-    public ToolGenerator(ModelRouter modelRouter, PromptLoader promptLoader) {
+    public ToolGenerator(ModelRouter modelRouter, PromptLoader promptLoader,
+                          SystemEnvironmentService envService) {
         this.modelRouter = modelRouter;
         this.promptLoader = promptLoader;
+        this.envService = envService;
     }
 
     /**
@@ -57,7 +61,8 @@ public class ToolGenerator {
      * @return 生成的源码 + 类名；AI 调用失败时返回 null
      */
     public GeneratedSource generate(String toolDescription) {
-        String prompt = promptLoader.getToolGenerator().formatted(toolDescription);
+        String prompt = promptLoader.getToolGenerator()
+                .formatted(envService.getOsInfo(), toolDescription);
 
         try {
             String source = modelRouter.normal().prompt().user(prompt).call().content();

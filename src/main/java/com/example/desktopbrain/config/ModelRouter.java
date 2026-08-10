@@ -12,18 +12,20 @@ import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.client.ReactorClientHttpRequestFactory;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
+import java.time.Duration;
 import java.util.stream.Collectors;
 
 /**
  * 模型路由器 — 所有 AI 调用的唯一入口。
  *
  * <pre>
- *   - 模型1（主）：deepseek-v4-pro，处理所有对话和探索
- *   - 模型2（备）：deepseek-chat，以下场景自动介入：
+ *   - 模型1（主）：本地 Ollama（AutoDL RTX3090，通过SSH隧道），处理所有对话和探索
+ *   - 模型2（备）：DeepSeek API，以下场景自动介入：
  *       ① 模型1 网络故障 → 模型2 直接接管
  *       ② 模型1 回复不充分（无法解决/太复杂）→ 咨询模型2 → 模型1 综合后回复
  *   - 探索与普通对话共用同一路由，不再区分模型
@@ -34,28 +36,34 @@ public class ModelRouter {
 
     private static final Logger log = LoggerFactory.getLogger(ModelRouter.class);
 
-    private final ChatClient model1;      // DeepSeek v4-pro（主）
-    private final ChatClient failover;    // 模型1 → 网络故障 → 模型2
+    private final ChatClient model1;      // 本地 Ollama qwen3:30b（主）
+    private final ChatClient failover;    // 模型1 → 网络故障/能力不足 → 模型2 DeepSeek
+    private final boolean sameModel;      // 模型1和模型2是同一个对象（模型2未配置时）
 
-    private static final String C1 = "\u001b[34m"; // 蓝色=模型1 deepseek-v4-pro
-    private static final String C2 = "\u001b[33m"; // 黄色=模型2 deepseek-chat（备）
+    private static final String C1 = "\u001b[32m"; // 绿色=模型1 本地Ollama
+    private static final String C2 = "\u001b[34m"; // 蓝色=模型2 DeepSeek API（备）
     private static final String R  = "\u001b[0m";  // 重置
 
     public ModelRouter(DesktopBrainProperties props,
                        @Qualifier("model1") OpenAiChatModel model1Raw,
                        @Qualifier("model2") OpenAiChatModel model2Raw) {
-        String model1Name = props.deepseek().model();
-        String model2Name = props.exploration().model();
-        String model1Url = props.deepseek().baseUrl();
-        String model2Url = props.exploration().baseUrl();
+        String model1Name = props.exploration().model();
+        String model2Name = props.deepseek() != null ? props.deepseek().model() : "(未配置)";
+        String model1Url = props.exploration().baseUrl();
+        String model2Url = props.deepseek() != null ? props.deepseek().baseUrl() : "(未配置)";
 
-        log.info("{}🔧 [ModelRouter] 模型1 DeepSeek: {} | model={}{}", C1, model1Url, model1Name, R);
+        log.info("{}🔧 [ModelRouter] 模型1 本地Ollama: {} | model={}{}", C1, model1Url, model1Name, R);
         log.info("{}🔧 [ModelRouter] 模型2 DeepSeek: {} | model={}{}", C2, model2Url, model2Name, R);
 
         this.model1 = ChatClient.builder(model1Raw).build();
+        this.sameModel = (model1Raw == model2Raw);
 
-        // 故障转移 + 智能咨询：模型1 不充分时咨询模型2
-        this.failover = ChatClient.builder(new ChatModel() {
+        if (sameModel) {
+            log.info("{}⚠️ [ModelRouter] 模型1与模型2为同一实例，跳过故障转移/咨询逻辑{}", C1, R);
+            this.failover = ChatClient.builder(model1Raw).build();
+        } else {
+            // 故障转移 + 智能咨询：模型1 不充分时咨询模型2
+            this.failover = ChatClient.builder(new ChatModel() {
             @Override
             public ChatResponse call(Prompt prompt) {
                 // ======== Phase 1: 模型1 ========
@@ -159,13 +167,40 @@ public class ModelRouter {
                         || (e.getCause() != null && isNetworkError(e.getCause()));
             }
         }).build();
+        }
     }
 
     // ============================================================
     // 模型工厂方法（在 DesktopBrainConfig 中调用）
     // ============================================================
 
+    /** 模型1：本地 Ollama qwen3:30b（SSH隧道 → AutoDL RTX3090） */
     static OpenAiChatModel buildModel1(DesktopBrainProperties props) {
+        // Netty ReactorClientHttpRequestFactory 替代 HttpURLConnection
+        ReactorClientHttpRequestFactory factory = new ReactorClientHttpRequestFactory();
+        factory.setConnectTimeout(Duration.ofSeconds(10));
+        factory.setReadTimeout(Duration.ofMinutes(10));  // CPU 跑 30B 模型 + 大 prompt 很慢
+
+        OpenAiApi api = OpenAiApi.builder()
+                .baseUrl(props.exploration().baseUrl())
+                .apiKey("ollama")
+                .completionsPath("/chat/completions")
+                .restClientBuilder(RestClient.builder()
+                        .requestFactory(factory)
+                        .defaultHeader("Accept", "application/json")
+                        .defaultHeader("Content-Type", "application/json"))
+                .build();
+        log.info("{}🔧 [ModelRouter] 本地Ollama模型: {}/chat/completions | model={}{}", C1, props.exploration().baseUrl(), props.exploration().model(), R);
+        return OpenAiChatModel.builder()
+                .openAiApi(api)
+                .defaultOptions(OpenAiChatOptions.builder()
+                        .model(props.exploration().model())
+                        .build())
+                .build();
+    }
+
+    /** 模型2：DeepSeek API 远程模型（故障转移 / 能力不足时求助） */
+    static OpenAiChatModel buildModel2(DesktopBrainProperties props) {
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(30000);
         factory.setReadTimeout(120000);
@@ -176,7 +211,7 @@ public class ModelRouter {
                 .completionsPath("/chat/completions")
                 .restClientBuilder(RestClient.builder().requestFactory(factory))
                 .build();
-        log.info("{}🔧 [ModelRouter] DeepSeek 主模型: {}/chat/completions | model={}{}", C1, props.deepseek().baseUrl(), props.deepseek().model(), R);
+        log.info("{}🔧 [ModelRouter] DeepSeek 备用: {}/chat/completions | model={}{}", C2, props.deepseek().baseUrl(), props.deepseek().model(), R);
         return OpenAiChatModel.builder()
                 .openAiApi(api)
                 .defaultOptions(OpenAiChatOptions.builder()
@@ -185,32 +220,11 @@ public class ModelRouter {
                 .build();
     }
 
-    /** 模型2：DeepSeek 云端备用（与模型1同API key，不同model） */
-    static OpenAiChatModel buildModel2(DesktopBrainProperties props) {
-        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(10000);
-        factory.setReadTimeout(120000);
-
-        OpenAiApi api = OpenAiApi.builder()
-                .baseUrl(props.exploration().baseUrl())
-                .apiKey(props.deepseek().apiKey())  // 共用同一个 API key
-                .completionsPath("/chat/completions")
-                .restClientBuilder(RestClient.builder().requestFactory(factory))
-                .build();
-        log.info("{}🔧 [ModelRouter] DeepSeek 备用模型: {}/chat/completions | model={}{}", C2, props.exploration().baseUrl(), props.exploration().model(), R);
-        return OpenAiChatModel.builder()
-                .openAiApi(api)
-                .defaultOptions(OpenAiChatOptions.builder()
-                        .model(props.exploration().model())
-                        .build())
-                .build();
-    }
-
     // ============================================================
     // 对外 API
     // ============================================================
 
-    /** 普通对话/探索统一入口：模型1 优先，失败降级模型2 */
+    /** 普通对话/探索统一入口：本地Ollama 优先，能力不足或故障时降级 DeepSeek */
     public ChatClient normal() {
         return failover;
     }

@@ -5,6 +5,7 @@ import com.example.desktopbrain.config.FallbackModelTool;
 import com.example.desktopbrain.config.ModelRouter;
 import com.example.desktopbrain.dialog.DialogStateMachine;
 import com.example.desktopbrain.dialog.SpeechAssembler;
+import com.example.desktopbrain.exploration.AutonomousExplorationService;
 import com.example.desktopbrain.exploration.ExplorationTool;
 import com.example.desktopbrain.service.AudioRecorder;
 import com.example.desktopbrain.service.BackgroundAudioService;
@@ -22,11 +23,13 @@ import com.example.desktopbrain.service.VoiceprintService;
 import com.example.desktopbrain.integration.HaToolService;
 import com.example.desktopbrain.util.NativeLoader;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.ComponentScan;
 
@@ -54,6 +57,7 @@ public class DesktopBrainApplication {
     // ========== 工具管理 ==========
     private volatile ToolCallback[] allTools;
     private volatile TurnProcessor turnProcessor;
+    private volatile AutonomousExplorationService explorationService;
 
     // ========== 模式（用于录音线程判断 VAD 策略） ==========
     private volatile SpeechEventLoop.Mode mode = SpeechEventLoop.Mode.IDLE;
@@ -84,18 +88,50 @@ public class DesktopBrainApplication {
                                  DesktopBrainProperties props,
                                  BackgroundAudioService backgroundAudio,
                                  SpeechEventLoop speechEventLoop,
+                                 ApplicationContext appCtx,
+                                 AutonomousExplorationService explorationService,
                                  @Qualifier("aiExecutor") ExecutorService aiExecutor) {
         return args -> {
             this.props = props;
             this.aiExecutor = aiExecutor;
             this.turnProcessor = turnProcessor;
+            this.explorationService = explorationService;
 
-            // 合并 MCP 工具 + 本地工具
+            // 合并 MCP 工具 + 所有本地 @Tool bean（含生成的）
             int mcpCount = mcpTools.getToolCallbacks().length;
-            ToolCallback[] localTools = MethodToolCallbackProvider.builder()
-                    .toolObjects(friendMatcher, capabilityService, haToolService, toolSearchService, failurePatternTool, explorationTool, fallbackModelTool)
-                    .build()
-                    .getToolCallbacks();
+            java.util.Set<String> seenBeans = new java.util.HashSet<>();
+            List<Object> allToolBeans = new ArrayList<>();
+            // 扫描所有带 @Tool 方法的 bean（自动发现，无需手动添加，避免重复）
+            for (String beanName : appCtx.getBeanDefinitionNames()) {
+                try {
+                    Object bean = appCtx.getBean(beanName);
+                    if (!seenBeans.add(bean.getClass().getName())) continue;
+                    for (java.lang.reflect.Method m : bean.getClass().getDeclaredMethods()) {
+                        if (m.isAnnotationPresent(org.springframework.ai.tool.annotation.Tool.class)) {
+                            allToolBeans.add(bean);
+                            break;
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // 跳过无法获取的 bean
+                }
+            }
+            // 每个 bean 独立创建 provider（避免不同 bean 间同名 @Tool 方法冲突），然后名称去重
+            java.util.LinkedHashMap<String, ToolCallback> localToolMap = new java.util.LinkedHashMap<>();
+            for (Object bean : allToolBeans) {
+                try {
+                    ToolCallback[] callbacks = MethodToolCallbackProvider.builder()
+                            .toolObjects(bean)
+                            .build()
+                            .getToolCallbacks();
+                    for (ToolCallback tc : callbacks) {
+                        localToolMap.putIfAbsent(tc.getToolDefinition().name(), tc);
+                    }
+                } catch (Exception e) {
+                    log.warn("⚠️ 无法注册工具 bean: {}", bean.getClass().getSimpleName(), e);
+                }
+            }
+            ToolCallback[] localTools = localToolMap.values().toArray(ToolCallback[]::new);
             int localCount = localTools.length;
             ToolCallback[] allToolCallbacks = Stream.concat(
                     Arrays.stream(mcpTools.getToolCallbacks()),
@@ -104,6 +140,9 @@ public class DesktopBrainApplication {
             this.allTools = allToolCallbacks;
             turnProcessor.initToolSearch(allToolCallbacks);
             turnProcessor.initDynamicClassLoader();
+
+            // 探索服务接收完整工具列表（含生成工具），避免"缺失浏览器工具"误判
+            explorationService.setAllTools(allToolCallbacks);
 
             log.info("🤖 桌面助手已启动（贾维斯模式）");
             log.info("💡 文字输入：直接对话，回复有语音播报");

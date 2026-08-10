@@ -1,5 +1,7 @@
 package com.example.desktopbrain.generated;
 
+import com.example.desktopbrain.generated.GeneratedTool;
+
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -12,6 +14,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 @Component
+@GeneratedTool
 public class DirectoryScannerTool {
 
     @Tool(description = "Scan a directory and return a list of files, optionally filtered by extension")

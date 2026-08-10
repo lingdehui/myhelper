@@ -170,17 +170,18 @@ public class FailureExperienceHandler {
     /**
      * 将 AI 生成的失败教训归一化为类型标签。
      *
-     * <p>保留核心语义，去除标点和冗余。如：
-     * "目标网页 URL 不存在" → "目标网页URL不存在"</p>
+     * <p>策略：按中文标点取第一段作为核心语义（AI生成的教训通常是"核心问题，细节补充"格式），
+     * 截断到20字符。避免"任务需明确步骤，避免盲目探索"和"任务需明确步骤，确保每步可跟踪"
+     * 被当成不同类型。</p>
      */
     private String normalizeType(String lesson) {
         if (lesson == null || lesson.isBlank()) return "未知失败";
-        String simplified = lesson.replaceAll("[，。！？；：、]", "")
-                .replaceAll("\\s+", "").trim();
-        if (simplified.length() > 30) {
-            simplified = simplified.substring(0, 30);
+        // 按中文标点取第一段
+        String firstSegment = lesson.split("[，。！？；：、\n]")[0].trim();
+        if (firstSegment.length() > 20) {
+            firstSegment = firstSegment.substring(0, 20);
         }
-        return simplified;
+        return firstSegment;
     }
 
     /** 根据失败类型生成缓解建议。 */

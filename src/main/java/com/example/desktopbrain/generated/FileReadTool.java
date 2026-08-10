@@ -1,5 +1,7 @@
 package com.example.desktopbrain.generated;
 
+import com.example.desktopbrain.generated.GeneratedTool;
+
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -9,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 
 @Component
+@GeneratedTool
 public class FileReadTool {
 
     @Tool(description = "读取指定路径的文件内容，返回文件全部文本")

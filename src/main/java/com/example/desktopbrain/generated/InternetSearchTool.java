@@ -1,5 +1,7 @@
 package com.example.desktopbrain.generated;
 
+import com.example.desktopbrain.generated.GeneratedTool;
+
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -16,6 +18,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Component
+@GeneratedTool
 public class InternetSearchTool {
 
     @Tool(description = "上网搜索工具，根据关键词搜索互联网，返回相关结果的标题和链接摘要")

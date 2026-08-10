@@ -1,5 +1,6 @@
 package com.example.desktopbrain.memory.vector;
 
+import com.example.desktopbrain.config.SystemEnvironmentService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -18,7 +19,7 @@ public class QdrantConfig {
     private int port;
 
     @Value("${qdrant.collection:desktop-memory}")
-    private String collectionName;
+    private String baseCollectionName;
 
     @Value("${qdrant.vector-size:768}")
     private int vectorSize;
@@ -31,8 +32,8 @@ public class QdrantConfig {
     }
 
     @Bean
-    public String qdrantCollectionName() {
-        return collectionName;
+    public String qdrantCollectionName(SystemEnvironmentService envService) {
+        return envService.collectionName(baseCollectionName);
     }
 
     @Bean

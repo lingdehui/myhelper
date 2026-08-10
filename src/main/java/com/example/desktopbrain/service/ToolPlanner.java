@@ -3,6 +3,7 @@ package com.example.desktopbrain.service;
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.PromptLoader;
 import com.example.desktopbrain.config.DesktopBrainProperties;
+import com.example.desktopbrain.config.SystemEnvironmentService;
 import com.example.desktopbrain.memory.graph.RuleNode;
 import com.example.desktopbrain.memory.vector.category.ToolCategoryService;
 import com.example.desktopbrain.memory.vector.episode.Episode;
@@ -63,6 +64,7 @@ public class ToolPlanner {
     private final RuleInductionService ruleInductionService;
     private final DesktopBrainProperties props;
     private final PromptLoader promptLoader;
+    private final SystemEnvironmentService envService;
 
     /** 脚本化阈值：与 EpisodeCacheService 保持一致，successCount≥此值 且 stability>0.9 时 canScript=true */
     @Value("${qdrant.episode.script-success-threshold:5}")
@@ -98,13 +100,15 @@ public class ToolPlanner {
                         ToolCategoryService categoryService,
                         RuleInductionService ruleInductionService,
                         DesktopBrainProperties props,
-                        PromptLoader promptLoader) {
+                        PromptLoader promptLoader,
+                        SystemEnvironmentService envService) {
         this.modelRouter = modelRouter;
         this.episodeCacheService = episodeCacheService;
         this.categoryService = categoryService;
         this.ruleInductionService = ruleInductionService;
         this.props = props;
         this.promptLoader = promptLoader;
+        this.envService = envService;
     }
 
     /**
@@ -364,9 +368,9 @@ public class ToolPlanner {
 
         String prompt;
         if (failureReason != null) {
-            prompt = promptLoader.getReplanning().formatted(toolList, userInput, failureReason);
+            prompt = promptLoader.getReplanning().formatted(envService.getOsInfo(), toolList, userInput, failureReason);
         } else {
-            prompt = promptLoader.getPlanning().formatted(toolList, userInput);
+            prompt = promptLoader.getPlanning().formatted(envService.getOsInfo(), toolList, userInput);
         }
 
         // 注入历史失败警告到 AI 规划 prompt
@@ -514,6 +518,75 @@ public class ToolPlanner {
         }
         // 如果只有1个字符，上面已通过单字符检查
         return keyword.length() == 1;
+    }
+
+    /**
+     * 宽松兜底匹配：当严格 findToolsByKeywords 返回空时调用。
+     * 按2/3-gram拆分描述，匹配具体关键词（过滤掉通用词如"工具""操作"）。
+     * 用于避免"浏览器控制工具"因"控""制"字不在描述中而导致误判为缺失。
+     */
+    public static List<String> findToolsByDescriptionFallback(String missingDesc, ToolCallback[] allTools) {
+        List<String> result = new ArrayList<>();
+        if (missingDesc == null || missingDesc.isBlank()) return result;
+
+        List<String> grams = extractMeaningfulGrams(missingDesc);
+        if (grams.isEmpty()) {
+            log.info("🔎 宽松兜底-全是通用词: '{}', 不匹配", missingDesc);
+            return result;
+        }
+
+        log.info("🔎 宽松兜底-关键词: {} → {}", missingDesc, grams);
+
+        for (ToolCallback tc : allTools) {
+            String name = tc.getToolDefinition().name();
+            String desc = tc.getToolDefinition().description();
+            String combined = (name + " " + (desc != null ? desc : "")).toLowerCase();
+
+            int matched = 0;
+            for (String gram : grams) {
+                if (combined.contains(gram)) {
+                    matched++;
+                }
+            }
+            if (matched >= Math.min(2, grams.size()) || (matched > 0 && matched * 2 >= grams.size())) {
+                log.info("    ✅ 命中工具: {} ({}个关键词匹配)", name, matched);
+                result.add(name);
+            }
+        }
+
+        if (result.isEmpty()) {
+            log.info("🔎 宽松兜底-未命中: '{}' (已查 {} 个工具)", missingDesc, allTools.length);
+        } else {
+            log.info("🔎 宽松兜底-命中 {} 个: {}", result.size(), result);
+        }
+        return result;
+    }
+
+    /** 通用词（2-gram）——在几乎所有工具描述里都会出现，没有区分度 */
+    private static final Set<String> GENERIC_GRAMS = Set.of(
+            "工具", "操作", "获取", "使用", "执行", "设置", "处理", "管理",
+            "功能", "信息", "内容", "文件", "数据", "配置", "控制", "支持",
+            "提供", "显示", "指定", "一个", "所有", "可以", "需要", "是否",
+            "系统", "当前", "服务", "返回", "用于", "包含", "实现", "检查",
+            "输入", "输出", "类型", "名称", "路径", "方法", "参数", "结果"
+    );
+
+    /** 提取2/3-gram并过滤通用词 */
+    private static List<String> extractMeaningfulGrams(String desc) {
+        List<String> grams = new ArrayList<>();
+        String lower = desc.toLowerCase();
+        // 2-gram
+        for (int i = 0; i + 2 <= lower.length(); i++) {
+            String g = lower.substring(i, i + 2);
+            if (!GENERIC_GRAMS.contains(g)) {
+                grams.add(g);
+            }
+        }
+        // 3-gram（更具体，直接加入不检查通用词）
+        for (int i = 0; i + 3 <= lower.length(); i++) {
+            grams.add(lower.substring(i, i + 3));
+        }
+        return grams;
     }
 
     private static Set<String> collectExisting(ToolCallback[] allTools) {

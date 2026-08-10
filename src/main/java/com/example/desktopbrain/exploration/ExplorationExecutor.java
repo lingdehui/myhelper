@@ -97,7 +97,7 @@ public class ExplorationExecutor {
     /** 创建探索 DRAFT Episode */
     private String createExplorationDraft(ExplorationDecision decision) {
         return episodeCache.createDraft(decision.learningGoal(),
-                List.of("exploration-" + decision.method()),
+                decision.toolCategories(),
                 List.of());
     }
 
@@ -122,7 +122,7 @@ public class ExplorationExecutor {
                 long stepStart = System.currentTimeMillis();
 
                 // 实际执行步骤（通过 AI + 工具调用）
-                String stepResult = executeStep(step, decision.method());
+                String stepResult = executeStep(step);
 
                 long elapsed = System.currentTimeMillis() - stepStart;
                 ToolCallLog entry = new ToolCallLog(
@@ -145,7 +145,7 @@ public class ExplorationExecutor {
                 // 走失败经验处理
                 failureHandler.handle(decision.learningGoal(),
                         "步骤失败: " + e.getMessage(), true, false,
-                        List.of("exploration-" + decision.method()));
+                        List.of("exploration-" + String.join(",", decision.toolCategories())));
 
                 allSuccess = false;
             }
@@ -155,9 +155,9 @@ public class ExplorationExecutor {
     }
 
     /** 执行单个步骤（通过 AI 调用工具） */
-    private String executeStep(String step, String method) {
-        String prompt = "请执行以下探索步骤：" + step + "\n方法：" + method
-                + "\n只使用工具执行，不要问问题。";
+    private String executeStep(String step) {
+        String prompt = "请执行以下探索步骤。你可以用任何可用的工具来完成。\n步骤：" + step
+                + "\n\n只使用工具执行，不要问问题。";
         try {
             return modelRouter.exploration().prompt()
                     .user(prompt)

@@ -9,7 +9,8 @@ public record ExplorationDecision(
         String decision,          // LEARN | SKIP
         String reason,
         String learningGoal,
-        String method,            // internal_tool_probing | web_research | download_and_learn | other
+        String learningMethod,    // internal_tool_probing | web_research | download_and_learn | other
+        List<String> toolCategories, // AI 从工具分类列表中选取的分类名
         List<String> steps,
         String expectedOutcome,
         String successCriteria,

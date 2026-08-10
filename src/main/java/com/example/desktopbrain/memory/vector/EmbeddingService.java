@@ -21,7 +21,7 @@ public class EmbeddingService {
     @Value("${embedding.model:nomic-embed-text}")
     private String model;
 
-    @Value("${ollama.base-url:http://localhost:11434}")
+    @Value("${ollama.base-url:http://localhost:11435}")
     private String ollamaBaseUrl;
 
     private WebClient ollamaClient;

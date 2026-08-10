@@ -1,5 +1,6 @@
 package com.example.desktopbrain.novel;
 
+import com.example.desktopbrain.config.SystemEnvironmentService;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -23,21 +24,26 @@ public class NovelVectorMemoryService {
     private final WebClient qdrant;
     private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper;
+    private final SystemEnvironmentService envService;
 
     @Value("${qdrant.novel-collection:novel-memory}")
+    private String baseCollectionName;
     private String collectionName;
 
     @Value("${qdrant.vector-size:768}")
     private int vectorSize;
 
-    public NovelVectorMemoryService(WebClient qdrantWebClient, EmbeddingService embeddingService) {
+    public NovelVectorMemoryService(WebClient qdrantWebClient, EmbeddingService embeddingService,
+                                      SystemEnvironmentService envService) {
         this.qdrant = qdrantWebClient;
         this.embeddingService = embeddingService;
+        this.envService = envService;
         this.objectMapper = new ObjectMapper();
     }
 
     @PostConstruct
     public void initCollection() {
+        this.collectionName = envService.collectionName(baseCollectionName);
         try {
             Boolean exists = qdrant.get()
                     .uri("/collections/" + collectionName)

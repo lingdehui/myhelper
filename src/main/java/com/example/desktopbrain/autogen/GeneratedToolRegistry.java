@@ -1,5 +1,6 @@
 package com.example.desktopbrain.autogen;
 
+import com.example.desktopbrain.config.SystemEnvironmentService;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,8 +49,12 @@ public class GeneratedToolRegistry {
     private final ToolGenerator toolGenerator;
     private final ToolCompiler toolCompiler;
     private final ApplicationContext applicationContext;
+    private final SystemEnvironmentService envService;
 
-    /** 已生成工具记录：descriptionHash → 注册信息（防止重复生成） */
+    /** 当前环境标识符（如 windows-amd64） */
+    private final String environmentKey;
+
+    /** 已生成工具记录：environmentKey::descriptionHash → 注册信息（防止跨环境重复生成） */
     private final Map<String, GeneratedToolInfo> generatedTools = new ConcurrentHashMap<>();
 
     /** 动态加载的工具列表（运行时即时生效） */
@@ -58,8 +63,14 @@ public class GeneratedToolRegistry {
     /** 用于动态加载的 ClassLoader（parent = 当前 ClassLoader） */
     private URLClassLoader dynamicClassLoader;
 
+    /** 生成工具连续失败计数：toolName → 连续失败次数（成功时清零，连续3次失败自动删除） */
+    private final Map<String, Integer> failureCounts = new ConcurrentHashMap<>();
+
+    /** 连续失败阈值：达到此次数自动删除 */
+    private static final int FAILURE_THRESHOLD = 3;
+
     /** 生成结果记录 */
-    public record GeneratedToolInfo(String className, String description, Path sourceFile, long timestamp) {}
+    public record GeneratedToolInfo(String className, String description, Path sourceFile, long timestamp, String environment) {}
 
     /**
      * 单次生成结果。
@@ -71,10 +82,13 @@ public class GeneratedToolRegistry {
     public record GenerationOutcome(boolean success, String message, String className) {}
 
     public GeneratedToolRegistry(ToolGenerator toolGenerator, ToolCompiler toolCompiler,
-                                   ApplicationContext applicationContext) {
+                                   ApplicationContext applicationContext,
+                                   SystemEnvironmentService envService) {
         this.toolGenerator = toolGenerator;
         this.toolCompiler = toolCompiler;
         this.applicationContext = applicationContext;
+        this.envService = envService;
+        this.environmentKey = envService.getEnvironmentKey();
     }
 
     /**
@@ -97,9 +111,9 @@ public class GeneratedToolRegistry {
                 String className = f.getFileName().toString().replace(".java", "");
                 String content = Files.readString(f);
                 String desc = extractFirstToolDescription(content);
-                String hash = hashDescription(desc != null ? desc : className);
+                String hash = hashKey(desc != null ? desc : className);
                 generatedTools.put(hash,
-                        new GeneratedToolInfo(className, desc != null ? desc : className, f, 0));
+                        new GeneratedToolInfo(className, desc != null ? desc : className, f, 0, environmentKey));
             }
             if (!files.isEmpty()) {
                 log.info("🔧 已加载 {} 个生成工具记录: {}", files.size(),
@@ -144,7 +158,7 @@ public class GeneratedToolRegistry {
      * @return 生成结果
      */
     public GenerationOutcome generateAndPersist(String description, int maxRetries) {
-        String hash = hashDescription(description);
+        String hash = hashKey(description);
         GeneratedToolInfo existing = generatedTools.get(hash);
         if (existing != null) {
             String msg = "工具已存在（" + existing.className() + "），跳过重复生成";
@@ -170,7 +184,7 @@ public class GeneratedToolRegistry {
             if (result.success()) {
                 generatedTools.put(hash, new GeneratedToolInfo(
                         generated.className(), description, result.sourceFile(),
-                        System.currentTimeMillis()));
+                        System.currentTimeMillis(), environmentKey));
 
                 // ===== 运行时动态加载（即时生效，无需重启）=====
                 boolean runtimeLoaded = loadAtRuntime(generated.sourceCode(), generated.className());
@@ -261,7 +275,7 @@ public class GeneratedToolRegistry {
         return new ArrayList<>(generatedTools.values());
     }
 
-    /** 删除已生成工具（删除源码文件 + 清除记录） */
+    /** 删除已生成工具（删除源码文件 + 动态工具列表移除 + 清除记录） */
     public boolean removeGeneratedTool(String className) {
         var entry = generatedTools.entrySet().stream()
                 .filter(e -> e.getValue().className().equals(className))
@@ -269,9 +283,25 @@ public class GeneratedToolRegistry {
         if (entry.isEmpty()) return false;
 
         try {
+            // 1. 删除 .java 源码文件
             Files.deleteIfExists(entry.get().getValue().sourceFile());
+            // 2. 从记录中移除
             generatedTools.remove(entry.get().getKey());
-            log.info("🗑️ 已删除生成工具: {}（重启后完全移除）", className);
+            // 3. 从动态工具列表中移除（即时生效，无需重启）
+            dynamicTools.removeIf(tc -> tc.getToolDefinition().name().equals(className)
+                    || tc.getToolDefinition().name().startsWith(className + "_"));
+            dynamicTools.removeIf(tc -> {
+                String[] parts = tc.getToolDefinition().name().split("_");
+                return parts.length > 1 && (parts[0] + parts[1]).equalsIgnoreCase(className);
+            });
+            // 4. 清除失败计数
+            failureCounts.remove(className);
+            // 5. 删除生成的 .class 文件
+            try {
+                Path classFile = Path.of(ToolCompiler.GENERATED_CLASSES_DIR, className + ".class");
+                Files.deleteIfExists(classFile);
+            } catch (Exception ignored) {}
+            log.info("🗑️ 已删除生成工具: {}（源码+运行时均已移除）", className);
             return true;
         } catch (Exception e) {
             log.error("❌ 删除生成工具失败", e);
@@ -279,12 +309,64 @@ public class GeneratedToolRegistry {
         }
     }
 
+    /** 判断指定工具名是否属于生成工具 */
+    public boolean isGeneratedTool(String toolName) {
+        if (toolName == null) return false;
+        return generatedTools.values().stream()
+                .anyMatch(info -> {
+                    String cn = info.className();
+                    return toolName.equals(cn)
+                            || toolName.startsWith(cn + "_")
+                            || toolName.replace("_", "").equalsIgnoreCase(cn);
+                });
+    }
+
+    /** 报告工具调用成功：重置失败计数 */
+    public void reportToolSuccess(String toolName) {
+        if (toolName != null && isGeneratedTool(toolName)) {
+            Integer prev = failureCounts.remove(toolName);
+            if (prev != null && prev > 0) {
+                log.info("🔄 生成工具 {} 调用成功，失败计数已重置（之前: {}）", toolName, prev);
+            }
+        }
+    }
+
+    /**
+     * 报告工具调用失败：递增失败计数，连续失败3次自动删除。
+     * @return true = 工具已被自动删除
+     */
+    public boolean reportToolFailure(String toolName) {
+        if (toolName == null || !isGeneratedTool(toolName)) return false;
+        int count = failureCounts.merge(toolName, 1, Integer::sum);
+        log.warn("⚠️ 生成工具 {} 调用失败（连续失败: {}/{})", toolName, count, FAILURE_THRESHOLD);
+        if (count >= FAILURE_THRESHOLD) {
+            // 找到 className 来删除
+            var info = generatedTools.values().stream()
+                    .filter(i -> toolName.equals(i.className())
+                            || toolName.startsWith(i.className() + "_"))
+                    .findFirst();
+            if (info.isPresent()) {
+                log.warn("🗑️ 生成工具 {} 连续失败 {} 次，自动删除！", info.get().className(), count);
+                removeGeneratedTool(info.get().className());
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ========== 内部工具方法 ==========
 
-    /** description 的简单 hash（避免重复生成相同描述的工具） */
+    /** description + 环境标识符 hash（相同描述不同环境会生成不同工具，避免跨环境误用） */
+    private String hashKey(String desc) {
+        if (desc == null) return environmentKey + "::null";
+        String normalized = desc.replaceAll("[\\s\\p{P}]", "").toLowerCase();
+        return environmentKey + "::" + Integer.toHexString(normalized.hashCode());
+    }
+
+    /** 仅按 description 做 hash（已废弃，改用 hashKey 包含环境） */
+    @Deprecated
     private static String hashDescription(String desc) {
         if (desc == null) return "null";
-        // 标准化：去标点空格小写后取 hash
         String normalized = desc.replaceAll("[\\s\\p{P}]", "").toLowerCase();
         return Integer.toHexString(normalized.hashCode());
     }

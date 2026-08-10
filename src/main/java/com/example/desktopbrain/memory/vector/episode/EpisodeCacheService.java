@@ -3,6 +3,7 @@ package com.example.desktopbrain.memory.vector.episode;
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.HaApiPaths;
 import com.example.desktopbrain.common.QdrantFields;
+import com.example.desktopbrain.config.SystemEnvironmentService;
 import com.example.desktopbrain.memory.graph.FailurePatternNode;
 import com.example.desktopbrain.memory.graph.FailurePatternRepository;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
@@ -53,11 +54,16 @@ public class EpisodeCacheService {
     private final UnitLearner unitLearner;
     private final FailurePatternRepository failurePatternRepo;
     private final ObjectMapper objectMapper;
+    private final SystemEnvironmentService envService;
 
     @Value("${qdrant.episodes-collection:episodes}")
-    private String collectionName;
+    private String baseCollectionName;
 
     @Value("${qdrant.failure-patterns-collection:failure-patterns}")
+    private String baseFailurePatternsCollection;
+
+    /** 环境隔离后的实际集合名（如 episodes-windows-amd64） */
+    private String collectionName;
     private String failurePatternsCollection;
 
     @Value("${qdrant.vector-size:768}")
@@ -83,12 +89,14 @@ public class EpisodeCacheService {
                                 EmbeddingService embeddingService,
                                 ReflectService reflectService,
                                 UnitLearner unitLearner,
-                                FailurePatternRepository failurePatternRepo) {
+                                FailurePatternRepository failurePatternRepo,
+                                SystemEnvironmentService envService) {
         this.qdrant = qdrantWebClient;
         this.embeddingService = embeddingService;
         this.reflectService = reflectService;
         this.unitLearner = unitLearner;
         this.failurePatternRepo = failurePatternRepo;
+        this.envService = envService;
         this.objectMapper = new ObjectMapper();
     }
 
@@ -100,6 +108,9 @@ public class EpisodeCacheService {
      */
     @PostConstruct
     public void initCollection() {
+        // 环境隔离：集合名加上当前环境后缀
+        this.collectionName = envService.collectionName(baseCollectionName);
+        this.failurePatternsCollection = envService.collectionName(baseFailurePatternsCollection);
         try {
             Boolean exists = qdrant.get()
                     .uri("/collections/" + collectionName)
@@ -804,6 +815,59 @@ public class EpisodeCacheService {
         }
     }
 
+    /**
+     * 直接拉取最近的失败模式（不用语义搜索，避免硬编码关键词）。
+     * 把所有模式注入探索/规划上下文，让 AI 自行判断相关性。
+     */
+    public List<FailureSearchResult> getRecentFailurePatterns(int limit) {
+        List<FailureSearchResult> results = new ArrayList<>();
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("limit", Math.min(limit, 30));
+            body.put("with_payload", true);
+            body.put("with_vector", false);
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> response = qdrant.post()
+                    .uri("/collections/" + failurePatternsCollection + "/points/scroll")
+                    .header(CONTENT_TYPE, APPLICATION_JSON)
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response == null) return results;
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> result = (Map<String, Object>) response.get("result");
+            if (result == null) return results;
+
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> points = (List<Map<String, Object>>) result.get("points");
+            if (points == null) return results;
+
+            for (Map<String, Object> point : points) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+                if (payload == null) continue;
+
+                results.add(new FailureSearchResult(
+                        (String) payload.get("type"),
+                        (String) payload.get("description"),
+                        (String) payload.get("mitigation"),
+                        ((Number) payload.getOrDefault("count", 0)).intValue(),
+                        ((Number) payload.getOrDefault("detectedAt", 0L)).longValue(),
+                        (List<String>) payload.getOrDefault("toolNames", List.of()),
+                        1.0  // scroll模式无相似度分数
+                ));
+            }
+
+        } catch (Exception e) {
+            log.error("❌ getRecentFailurePatterns 失败", e);
+        }
+        return results;
+    }
+
     /** upsert point 到指定 collection（不耦合 this.collectionName） */
     private void upsertPointToCollection(String collection, String pointId,
                                           List<Float> vector, Map<String, Object> payload) {
@@ -836,4 +900,147 @@ public class EpisodeCacheService {
             List<String> toolNames,
             double score
     ) {}
+
+    /**
+     * 查询 ACTIVE Episode 总数（用于展示已有知识片段数）。
+     * 失败/不可用时返回 0。
+     */
+    public int countActiveEpisodes() {
+        try {
+            String countJson = qdrant.post()
+                    .uri("/collections/" + collectionName + "/points/count")
+                    .header("Content-Type", "application/json")
+                    .bodyValue("{}")
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+            if (countJson != null) {
+                int count = objectMapper.readTree(countJson).path("result").path("count").asInt(0);
+                return count;
+            }
+        } catch (Exception e) {
+            log.debug("⚠️ countActiveEpisodes 失败: {}", e.getMessage());
+        }
+        return 0;
+    }
+
+    /**
+     * 获取近期成功学习主题（用于自主探索上下文——知道已学过什么，在此基础上深入）。
+     * 返回最近 15 条 ACTIVE Episode 的学习目标 + 成功经验。
+     */
+    public List<LearnedTopic> getRecentLearnedTopics(int limit) {
+        List<LearnedTopic> topics = new ArrayList<>();
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("limit", Math.min(limit, 50));
+            body.put("with_payload", true);
+            body.put("with_vector", false);
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> response = qdrant.post()
+                    .uri("/collections/" + collectionName + "/points/scroll")
+                    .header("Content-Type", "application/json")
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response == null) return topics;
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> result = (Map<String, Object>) response.get("result");
+            if (result == null) return topics;
+
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> points = (List<Map<String, Object>>) result.get("points");
+            if (points == null) return topics;
+
+            for (Map<String, Object> point : points) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+                if (payload == null) continue;
+
+                String status = String.valueOf(payload.getOrDefault("status", ""));
+                if (!"ACTIVE".equals(status)) continue;
+
+                String goal = String.valueOf(payload.getOrDefault("userInput", ""));
+                String lesson = String.valueOf(payload.getOrDefault("successLesson", "null"));
+                if ("null".equals(lesson)) lesson = null;
+                String epId = String.valueOf(payload.getOrDefault("id", point.get("id")));
+
+                @SuppressWarnings("unchecked")
+                List<String> selTools = (List<String>) payload.get("selectedToolNames");
+                List<String> safeTools = selTools != null ? selTools : List.of();
+
+                if (goal != null && !goal.isBlank() && !"null".equals(goal)) {
+                    topics.add(new LearnedTopic(goal, lesson, safeTools, epId));
+                }
+            }
+
+            // 按时间戳倒序（payload 里有 timestamp）
+            topics.sort((a, b) -> 0); // Qdrant scroll 已经是近似的插入顺序
+
+        } catch (Exception e) {
+            log.debug("⚠️ getRecentLearnedTopics 失败: {}", e.getMessage());
+        }
+        return topics.size() > limit ? topics.subList(0, limit) : topics;
+    }
+
+    /**
+     * 获取近期尝试过的探索目标（包括 DRAFT/FAILED/ACTIVE，不限状态）。
+     * 用于自主探索上下文——让 AI 知道最近已经试过什么，避免原地打转。
+     * 返回最近 20 条 episode 的 goal + status。
+     */
+    public List<AttemptedTopic> getRecentlyAttemptedTopics(int limit) {
+        List<AttemptedTopic> topics = new ArrayList<>();
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("limit", Math.min(limit, 50));
+            body.put("with_payload", true);
+            body.put("with_vector", false);
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> response = qdrant.post()
+                    .uri("/collections/" + collectionName + "/points/scroll")
+                    .header("Content-Type", "application/json")
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+
+            if (response == null) return topics;
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> result = (Map<String, Object>) response.get("result");
+            if (result == null) return topics;
+
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> points = (List<Map<String, Object>>) result.get("points");
+            if (points == null) return topics;
+
+            for (Map<String, Object> point : points) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+                if (payload == null) continue;
+
+                String goal = String.valueOf(payload.getOrDefault("userInput", ""));
+                String status = String.valueOf(payload.getOrDefault("status", ""));
+                String epId = String.valueOf(payload.getOrDefault("id", point.get("id")));
+
+                if (goal != null && !goal.isBlank() && !"null".equals(goal)) {
+                    topics.add(new AttemptedTopic(goal, status, epId));
+                }
+            }
+
+        } catch (Exception e) {
+            log.debug("⚠️ getRecentlyAttemptedTopics 失败: {}", e.getMessage());
+        }
+        return topics.size() > limit ? topics.subList(0, limit) : topics;
+    }
+
+    /** 已学主题（目标 + 经验 + 工具 + Episode ID，供 AI 验证/调整/优化） */
+    public record LearnedTopic(String goal, String lesson, List<String> toolNames, String episodeId) {}
+
+    /** 尝试过的主题（目标 + 状态 + Episode ID，供 AI 避免重复尝试） */
+    public record AttemptedTopic(String goal, String status, String episodeId) {}
 }

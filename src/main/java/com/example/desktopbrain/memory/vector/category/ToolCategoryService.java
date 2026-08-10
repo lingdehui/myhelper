@@ -2,6 +2,7 @@ package com.example.desktopbrain.memory.vector.category;
 
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.PromptLoader;
+import com.example.desktopbrain.config.SystemEnvironmentService;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -47,8 +48,10 @@ public class ToolCategoryService {
     private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper;
     private final PromptLoader promptLoader;
+    private final SystemEnvironmentService envService;
 
-    private static final String COLLECTION_NAME = "tool-categories";
+    private static final String BASE_collectionName = "tool-categories";
+    private String collectionName;
 
     @Value("${qdrant.vector-size:768}")
     private int vectorSize;
@@ -59,10 +62,12 @@ public class ToolCategoryService {
     public ToolCategoryService(WebClient qdrantWebClient,
                                 ModelRouter modelRouter,
                                 EmbeddingService embeddingService,
-                                PromptLoader promptLoader) {
+                                PromptLoader promptLoader,
+                                SystemEnvironmentService envService) {
         this.qdrant = qdrantWebClient;
         this.modelRouter = modelRouter;
         this.embeddingService = embeddingService;
+        this.envService = envService;
         this.objectMapper = new ObjectMapper();
         this.promptLoader = promptLoader;
     }
@@ -72,6 +77,8 @@ public class ToolCategoryService {
      */
     @PostConstruct
     public void initCollection() {
+        this.collectionName = envService.collectionName(BASE_collectionName);
+        log.info("📦 ToolCategory 集合: {}", collectionName);
         ensureCollection();
     }
 
@@ -79,7 +86,7 @@ public class ToolCategoryService {
     private void ensureCollection() {
         try {
             Boolean exists = qdrant.get()
-                    .uri("/collections/" + COLLECTION_NAME)
+                    .uri("/collections/" + collectionName)
                     .retrieve()
                     .toBodilessEntity()
                     .map(r -> true)
@@ -89,15 +96,15 @@ public class ToolCategoryService {
                 String body = String.format(
                         "{\"vectors\": {\"size\": %d, \"distance\": \"Cosine\"}}", vectorSize);
                 qdrant.put()
-                        .uri("/collections/" + COLLECTION_NAME)
+                        .uri("/collections/" + collectionName)
                         .header("Content-Type", "application/json")
                         .bodyValue(body)
                         .retrieve()
                         .toBodilessEntity()
                         .block();
-                log.info("📦 Qdrant 集合 '" + COLLECTION_NAME + "' 已创建（向量维度: " + vectorSize + "）");
+                log.info("📦 Qdrant 集合 '" + collectionName + "' 已创建（向量维度: " + vectorSize + "）");
             } else {
-                log.info("📦 Qdrant 集合 '" + COLLECTION_NAME + "' 已存在");
+                log.info("📦 Qdrant 集合 '" + collectionName + "' 已存在");
             }
         } catch (Exception e) {
             log.error("⚠️ tool-categories 初始化失败（工具分类将降级）: " + e.getMessage());
@@ -241,7 +248,7 @@ public class ToolCategoryService {
 
             @SuppressWarnings("unchecked")
             Map<String, Object> response = qdrant.post()
-                    .uri("/collections/" + COLLECTION_NAME + "/points/search")
+                    .uri("/collections/" + collectionName + "/points/search")
                     .header("Content-Type", "application/json")
                     .bodyValue(body)
                     .retrieve()
@@ -296,7 +303,7 @@ public class ToolCategoryService {
             Map<String, Object> deleteBody = new LinkedHashMap<>();
             deleteBody.put("filter", Map.of());
             qdrant.post()
-                    .uri("/collections/" + COLLECTION_NAME + "/points/delete?wait=true")
+                    .uri("/collections/" + collectionName + "/points/delete?wait=true")
                     .header("Content-Type", "application/json")
                     .bodyValue(deleteBody)
                     .retrieve()
@@ -340,7 +347,7 @@ public class ToolCategoryService {
     private boolean hasCategories() {
         try {
             String countJson = qdrant.post()
-                    .uri("/collections/" + COLLECTION_NAME + "/points/count")
+                    .uri("/collections/" + collectionName + "/points/count")
                     .header("Content-Type", "application/json")
                     .bodyValue("{}")
                     .retrieve()
@@ -359,7 +366,7 @@ public class ToolCategoryService {
     private void upsertBatch(Map<String, Object> body) {
         try {
             qdrant.put()
-                    .uri("/collections/" + COLLECTION_NAME + "/points?wait=true")
+                    .uri("/collections/" + collectionName + "/points?wait=true")
                     .header("Content-Type", "application/json")
                     .bodyValue(body)
                     .retrieve()

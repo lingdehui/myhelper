@@ -1,5 +1,7 @@
 package com.example.desktopbrain.generated;
 
+import com.example.desktopbrain.generated.GeneratedTool;
+
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -9,6 +11,7 @@ import java.util.List;
 import java.util.Random;
 
 @Component
+@GeneratedTool
 public class TextGenerationTool {
 
     private final Random random = new Random();

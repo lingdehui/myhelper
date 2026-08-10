@@ -187,6 +187,7 @@ public class PlanMatcher {
         }
 
         String json = AiResponseUtils.stripMarkdownCodeBlock(response);
+        json = fixJsonKeys(json);
 
         try {
             Map<String, Object> parsed = objectMapper.readValue(json, Map.class);
@@ -211,6 +212,22 @@ public class PlanMatcher {
             log.error("⚠️ PlanMatcher JSON 解析失败: {} | 原始: {}", e.getMessage(), json);
             return MatchResult.notApplicable("JSON 解析失败");
         }
+    }
+
+    /**
+     * 修复 AI 模型输出的坏 JSON（qwen2.5 有时输出 {key: val} 缺引号）。
+     * 给未加引号的 key 加上双引号，避免 Jackson 解析失败。
+     */
+    private static String fixJsonKeys(String json) {
+        if (json == null || json.isBlank()) return json;
+        // 把 :key: 这种格式修复为 :"key":
+        // 正则匹配：冒号后紧跟非引号、非空格的标识符
+        String fixed = json.replaceAll(":([a-zA-Z_][a-zA-Z0-9_]*)", ":\"$1\"");
+        // 把对象开头 {key: 修复为 {"key":
+        fixed = fixed.replaceAll("\\{([a-zA-Z_][a-zA-Z0-9_]*)", "{\"$1\"");
+        // 把逗号后 key: 修复为 ,"key":
+        fixed = fixed.replaceAll(",\\s*([a-zA-Z_][a-zA-Z0-9_]*)", ",\"$1\"");
+        return fixed;
     }
 
     /**

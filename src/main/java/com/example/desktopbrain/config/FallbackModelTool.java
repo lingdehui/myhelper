@@ -9,9 +9,9 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 /**
- * 备用模型工具 — 供模型1（deepseek-v4-pro）在遇到复杂/不确定问题时主动调用。
+ * 备用模型工具 — 供模型1（本地Ollama）在遇到复杂/不确定问题时主动调用。
  *
- * <p>模型1 在推理过程中可以自行判断是否需要调用此工具获取模型2（deepseek-chat）的参考意见，
+ * <p>模型1 在推理过程中可以自行判断是否需要调用此工具获取模型2（DeepSeek API）的参考意见，
  * 然后综合两方观点给出最终回复。</p>
  *
  * <p>与 {@link ModelRouter} 的被动降级不同，此工具是 AI 主动触发：</p>
@@ -31,7 +31,7 @@ public class FallbackModelTool {
     public FallbackModelTool(@Qualifier("model2") OpenAiChatModel model2,
                              DesktopBrainProperties props) {
         this.fallbackClient = ChatClient.builder(model2).build();
-        this.model2Name = props.exploration().model();
+        this.model2Name = props.deepseek() != null ? props.deepseek().model() : "未知";
     }
 
     @Tool(description = """

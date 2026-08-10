@@ -44,12 +44,12 @@ qdrant:
 
 # ===== 双模型配置 =====
 desktopbrain:
-  #  deepseek:                           # 模型 1: DeepSeek（远程）— 用户对话、工具执行
-  #    base-url: https://api.deepseek.com
-  #    api-key: sk-f2fcd2a4bdb44f02a410c3f030d6fb8b
-  #    model: deepseek-v4-pro
-  exploration:                        # 模型 2: 本地 Ollama qwen2.5:14b — 模型1 故障/能力不足时降级（见 desktopbrain-exploration.yml）
-    model: qwen2.5:14b
+  deepseek:                           # 模型 2: DeepSeek API（远程）— 本地Ollama搞不定时求助
+    base-url: https://api.deepseek.com
+    api-key: sk-f2fcd2a4bdb44f02a410c3f030d6fb8b
+    model: deepseek-v4-pro
+  exploration:                        # 模型 1: 本地 Ollama（AutoDL RTX3090 SSH隧道）— 主力模型
+    model: qwen3:30b
 
 # ===== Home Assistant 智能家居 =====
 homeassistant:

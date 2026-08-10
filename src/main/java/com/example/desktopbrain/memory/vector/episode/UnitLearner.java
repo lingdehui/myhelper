@@ -1,9 +1,11 @@
 package com.example.desktopbrain.memory.vector.episode;
 
 import com.example.desktopbrain.common.AiResponseUtils;
+import com.example.desktopbrain.config.SystemEnvironmentService;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
 import com.example.desktopbrain.memory.vector.QdrantDtos;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -49,8 +51,10 @@ public class UnitLearner {
     private final WebClient qdrant;
     private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper;
+    private final SystemEnvironmentService envService;
 
     @Value("${qdrant.episodes-collection:episodes}")
+    private String baseCollectionName;
     private String collectionName;
 
     /** 提取阈值：至少被 N 个不同 COMPOSITE 引用才标记为通用 */
@@ -60,10 +64,18 @@ public class UnitLearner {
     /** 最小子序列长度（少于2步不值得提取） */
     private static final int MIN_SUBSEQ_LEN = 2;
 
-    public UnitLearner(WebClient qdrantWebClient, EmbeddingService embeddingService) {
+    public UnitLearner(WebClient qdrantWebClient, EmbeddingService embeddingService,
+                        SystemEnvironmentService envService) {
         this.qdrant = qdrantWebClient;
         this.embeddingService = embeddingService;
+        this.envService = envService;
         this.objectMapper = new ObjectMapper();
+    }
+
+    @PostConstruct
+    public void init() {
+        this.collectionName = envService.collectionName(baseCollectionName);
+        log.info("📦 UnitLearner 集合: {}", collectionName);
     }
 
     /**

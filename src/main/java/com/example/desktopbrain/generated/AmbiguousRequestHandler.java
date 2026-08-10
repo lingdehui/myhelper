@@ -1,10 +1,13 @@
 package com.example.desktopbrain.generated;
 
+import com.example.desktopbrain.generated.GeneratedTool;
+
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
 @Component
+@GeneratedTool
 public class AmbiguousRequestHandler {
 
     @Tool(description = "无法理解用户请求“二十”的具体意图，返回友好的澄清提示")
