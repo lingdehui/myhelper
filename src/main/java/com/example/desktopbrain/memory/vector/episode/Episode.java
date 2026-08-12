@@ -52,6 +52,8 @@ import org.slf4j.LoggerFactory;
  * @param status              生命周期状态：DRAFT（执行中）/ACTIVE（成功可复用）/FAILED（失败但保留步骤）
  * @param canScript           是否可脚本化（successCount≥5 且 stability>0.9 时为 true，PlanExecutor 直接回放）
  * @param failedStepIndex     失败步位置（-1=未失败/成功；≥0=第 N 步失败，用于分段继续）
+ * @param exploreOptimizeCount 探索模式下被优化的次数（权重 1/(1+次数)）
+ * @param exploreDebugCount    探索模式下被调试的次数
  * @param explorationType      探索类型（null=非探索，AUTONOMOUS=自主探索，MANUAL=手动触发）
  * @param explorationSummary   探索摘要（探索任务完成后填入）
  */
@@ -76,6 +78,8 @@ public record Episode(
         EpisodeStatus status,
         boolean canScript,
         int failedStepIndex,
+        int exploreOptimizeCount,
+        int exploreDebugCount,
         ExplorationType explorationType,
         String explorationSummary
 ) {
@@ -148,6 +152,8 @@ public record Episode(
             payload.putIfAbsent("status", EpisodeStatus.ACTIVE.name());
             payload.putIfAbsent("canScript", false);
             payload.putIfAbsent("failedStepIndex", -1);
+            payload.putIfAbsent("exploreOptimizeCount", 0);
+            payload.putIfAbsent("exploreDebugCount", 0);
             payload.putIfAbsent("explorationType", null);
             payload.putIfAbsent("explorationSummary", null);
             return objectMapper.convertValue(payload, Episode.class);

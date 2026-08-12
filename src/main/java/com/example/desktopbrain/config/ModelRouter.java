@@ -21,15 +21,80 @@ import java.time.Duration;
 import java.util.stream.Collectors;
 
 /**
- * 模型路由器 — 所有 AI 调用的唯一入口。
+ * 模型路由器 — <b>项目中所有 AI 调用的唯一入口，不可绕过。</b>
  *
+ * <h2>核心职责</h2>
+ * <ul>
+ *   <li><b>统一入口</b>：所有需要 AI 模型的模块（规划、执行、反思、分类、工具生成…）
+ *       只需调用 {@link #chat()} 或 {@link #chat(Mode)}，不再关心模型来源。</li>
+ *   <li><b>配置驱动</b>：读取 {@code application.yml} 的 {@code normal-model} 和
+ *       {@code exploration-model} 开关，决定用模型1还是模型2。</li>
+ *   <li><b>故障转移</b>：模型1 不可用时（网络故障/能力不足）自动降级到模型2。</li>
+ *   <li><b>智能咨询</b>：模型1 回复不充分时，调用模型2 获取参考意见，交给模型1 综合后回复。</li>
+ *   <li><b>禁止绕过</b>：除了 {@code FallbackModelTool}（模型1 主动调工具咨询模型2 的架构设计），
+ *       项目中任何其他代码不得直接使用 {@code ChatClient} / {@code OpenAiChatModel}。</li>
+ * </ul>
+ *
+ * <h2>两种模式</h2>
+ * <table border="1">
+ *   <tr><th>模式</th><th>配置键</th><th>说明</th></tr>
+ *   <tr><td>{@link Mode#NORMAL NORMAL}</td><td>{@code normal-model}</td>
+ *       <td>普通对话/规划/反思/分类/工具生成。<br>
+ *           model2 → 直连 DeepSeek；model1 → 本地优先 failover 到 DeepSeek</td></tr>
+ *   <tr><td>{@link Mode#EXPLORATION EXPLORATION}</td><td>{@code exploration-model}</td>
+ *       <td>自主探索引擎专用。<br>
+ *           model2 → 全程 DeepSeek；model1 → 本地优先 failover</td></tr>
+ * </table>
+ *
+ * <h2>架构图</h2>
  * <pre>
- *   - 模型1（主）：本地 Ollama（AutoDL RTX3090，通过SSH隧道），处理所有对话和探索
- *   - 模型2（备）：DeepSeek API，以下场景自动介入：
- *       ① 模型1 网络故障 → 模型2 直接接管
- *       ② 模型1 回复不充分（无法解决/太复杂）→ 咨询模型2 → 模型1 综合后回复
- *   - 探索与普通对话共用同一路由，不再区分模型
+ *                  ┌────────────────────────────────────────────┐
+ *                  │              ModelRouter                    │
+ *                  │  chat() → NORMAL  │ chat(EXPLORATION)      │
+ *                  │       ↓                  ↓                  │
+ *                  │  normal-model      exploration-model       │
+ *                  │       ↓                  ↓                  │
+ *                  │  model1 ──failover──→ model2               │
+ *                  │  (本地 Ollama)      (DeepSeek API)          │
+ *                  └────────────────────────────────────────────┘
+ *                          ↑                    ↑
+ *          ┌───────────────┴────────────────────┴───────────────┐
+ *          │  ToolPlanner  ReflectService  TurnProcessor  ...   │
+ *          │  (只传 Mode，不读配置，不关心底层模型)                  │
+ *          └────────────────────────────────────────────────────┘
  * </pre>
+ *
+ * <h2>使用方式</h2>
+ * <pre>{@code
+ *   // 默认普通模式
+ *   modelRouter.chat().prompt().user("问题").call().content();
+ *
+ *   // 探索模式
+ *   modelRouter.chat(Mode.EXPLORATION).prompt().user("问题").call().content();
+ *
+ *   // 纯云端（分类同步等必须走 DeepSeek 的场景）
+ *   //   → 已内置在 chat() 中，model2 时自动返回 cloudOnly，外部无需区分
+ * }</pre>
+ *
+ * <h2>反模式（禁止）</h2>
+ * <pre>{@code
+ *   // 禁止：直接读配置判断模型
+ *   String model = props.normalModel();               // ✗
+ *   if ("model2".equals(model)) ...                   // ✗
+ *
+ *   // 禁止：直接创建/注入 ChatClient
+ *   ChatClient client = ChatClient.builder(model).build(); // ✗
+ *
+ *   // 禁止：直接注入 OpenAiChatModel
+ *   @Qualifier("model2") OpenAiChatModel model2;      // ✗ (除 ModelRouter 自身和 FallbackModelTool)
+ *
+ *   // 正确：只走 ModelRouter
+ *   modelRouter.chat() / modelRouter.chat(mode)       // ✓
+ * }</pre>
+ *
+ * @see Mode
+ * @see DesktopBrainProperties#normalModel()
+ * @see DesktopBrainProperties.Exploration#explorationModel()
  */
 @Component
 public class ModelRouter {
@@ -38,7 +103,11 @@ public class ModelRouter {
 
     private final ChatClient model1;      // 本地 Ollama qwen3:30b（主）
     private final ChatClient failover;    // 模型1 → 网络故障/能力不足 → 模型2 DeepSeek
+    private final ChatClient model2Direct;// 直接走模型2（分类等不需要本地的场景）
+    private final OpenAiChatModel model1Raw;
+    private final OpenAiChatModel model2Raw;
     private final boolean sameModel;      // 模型1和模型2是同一个对象（模型2未配置时）
+    private final DesktopBrainProperties props; // 配置引用
 
     private static final String C1 = "\u001b[32m"; // 绿色=模型1 本地Ollama
     private static final String C2 = "\u001b[34m"; // 蓝色=模型2 DeepSeek API（备）
@@ -52,11 +121,17 @@ public class ModelRouter {
         String model1Url = props.exploration().baseUrl();
         String model2Url = props.deepseek() != null ? props.deepseek().baseUrl() : "(未配置)";
 
-        log.info("{}🔧 [ModelRouter] 模型1 本地Ollama: {} | model={}{}", C1, model1Url, model1Name, R);
-        log.info("{}🔧 [ModelRouter] 模型2 DeepSeek: {} | model={}{}", C2, model2Url, model2Name, R);
+        log.info("{}🔧 [ModelRouter] 本地Ollama模型: {} | model={}{}", C1, model1Url, model1Name, R);
+        log.info("{}🔧 [ModelRouter] DeepSeek 备用: {} | model={}{}", C2, model2Url, model2Name, R);
 
         this.model1 = ChatClient.builder(model1Raw).build();
+        this.model1Raw = model1Raw;
+        this.model2Raw = model2Raw;
         this.sameModel = (model1Raw == model2Raw);
+        this.props = props;
+
+        // 模型2 直连（不经过 failover 逻辑，用于分类等纯云端场景）
+        this.model2Direct = sameModel ? null : ChatClient.builder(model2Raw).build();
 
         if (sameModel) {
             log.info("{}⚠️ [ModelRouter] 模型1与模型2为同一实例，跳过故障转移/咨询逻辑{}", C1, R);
@@ -74,7 +149,7 @@ public class ModelRouter {
                     long elapsed1 = System.currentTimeMillis() - start;
 
                     // ======== Phase 2: 检查回复质量 ========
-                    if (isInadequate(resp1)) {
+                    if (ModelRouter.this.isInadequate(resp1)) {
                         log.warn("{}🤔 [ModelRouter] 模型1 回复不充分（{}ms），咨询模型2 ({})...{}",
                                 C1, elapsed1, model2Name, R);
 
@@ -84,7 +159,7 @@ public class ModelRouter {
                         log.info("{}📋 [ModelRouter] 模型2 参考回复 ({}ms){}", C2, elapsed2, R);
 
                         // Phase 3: 模型2的回复交给模型1综合
-                        String refText = extractText(resp2);
+                        String refText = ModelRouter.this.extractText(resp2);
                         String originalText = prompt.getInstructions().stream()
                                 .map(Message::getText)
                                 .collect(Collectors.joining("\n"));
@@ -111,7 +186,7 @@ public class ModelRouter {
 
                 // ======== 网络故障：模型2 直接接管 ========
                 } catch (Exception e) {
-                    if (isNetworkError(e)) {
+                    if (ModelRouter.this.isNetworkError(e)) {
                         log.warn("{}⚠️ [ModelRouter] 模型1 网络异常，切换模型2 ({}){}", C2, model2Name, R);
                         log.warn("   异常: {} | 原因: {}", e.getClass().getSimpleName(),
                                 e.getMessage() != null ? e.getMessage().substring(0, Math.min(120, e.getMessage().length())) : "unknown");
@@ -125,49 +200,48 @@ public class ModelRouter {
                 }
             }
 
-            // ---- 判断模型1回复是否不充分 ----
-            private boolean isInadequate(ChatResponse resp) {
-                String text = extractText(resp);
-                if (text == null || text.isBlank()) return true;
-                String lower = text.toLowerCase();
-                // 中文：主动表达"做不到/不知道/太复杂"
-                if (lower.contains("我无法") || lower.contains("我做不到") || lower.contains("我不知道")
-                        || lower.contains("我不确定") || lower.contains("我不清楚") || lower.contains("我不明白")
-                        || (lower.contains("超出") && lower.contains("能力")) || lower.contains("太复杂")
-                        || lower.contains("无法处理") || lower.contains("无法完成") || lower.contains("无法回答")
-                        || (lower.contains("抱歉，我") && (lower.contains("无法") || lower.contains("不能"))))
-                    return true;
-                // 英文：主动表达无能为力
-                if (lower.contains("i cannot") || lower.contains("i'm unable") || lower.contains("i am unable")
-                        || lower.contains("i don't know how") || lower.contains("too complex")
-                        || lower.contains("beyond my") || lower.contains("i'm not able"))
-                    return true;
-                return false;
-            }
-
-            /** 从 ChatResponse 中提取文本内容 */
-            private String extractText(ChatResponse resp) {
-                try {
-                    if (resp == null || resp.getResults() == null || resp.getResults().isEmpty()) return null;
-                    var output = resp.getResults().get(0).getOutput();
-                    return output != null ? output.getText() : null;
-                } catch (Exception e) {
-                    return null;
-                }
-            }
-
-            // ---- 网络异常判断 ----
-            private boolean isNetworkError(Throwable e) {
-                if (e == null) return false;
-                String name = e.getClass().getName();
-                return name.contains("Timeout") || name.contains("Connect")
-                        || name.contains("IOException") || name.contains("Socket")
-                        || name.contains("ResourceAccess") || name.contains("HttpClient")
-                        || name.contains("NonTransientAiException")
-                        || (e.getCause() != null && isNetworkError(e.getCause()));
-            }
         }).build();
         }
+    }
+
+    // ---- 判断回复是否不充分 ----
+    private boolean isInadequate(ChatResponse resp) {
+        String text = extractText(resp);
+        if (text == null || text.isBlank()) return true;
+        String lower = text.toLowerCase();
+        if (lower.contains("我无法") || lower.contains("我做不到") || lower.contains("我不知道")
+                || lower.contains("我不确定") || lower.contains("我不清楚") || lower.contains("我不明白")
+                || (lower.contains("超出") && lower.contains("能力")) || lower.contains("太复杂")
+                || lower.contains("无法处理") || lower.contains("无法完成") || lower.contains("无法回答")
+                || (lower.contains("抱歉，我") && (lower.contains("无法") || lower.contains("不能"))))
+            return true;
+        if (lower.contains("i cannot") || lower.contains("i'm unable") || lower.contains("i am unable")
+                || lower.contains("i don't know how") || lower.contains("too complex")
+                || lower.contains("beyond my") || lower.contains("i'm not able"))
+            return true;
+        return false;
+    }
+
+    /** 从 ChatResponse 中提取文本内容 */
+    private String extractText(ChatResponse resp) {
+        try {
+            if (resp == null || resp.getResults() == null || resp.getResults().isEmpty()) return null;
+            var output = resp.getResults().get(0).getOutput();
+            return output != null ? output.getText() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // ---- 网络异常判断 ----
+    private boolean isNetworkError(Throwable e) {
+        if (e == null) return false;
+        String name = e.getClass().getName();
+        return name.contains("Timeout") || name.contains("Connect")
+                || name.contains("IOException") || name.contains("Socket")
+                || name.contains("ResourceAccess") || name.contains("HttpClient")
+                || name.contains("NonTransientAiException")
+                || (e.getCause() != null && isNetworkError(e.getCause()));
     }
 
     // ============================================================
@@ -221,16 +295,38 @@ public class ModelRouter {
     }
 
     // ============================================================
-    // 对外 API
+    // 对外 API — 统一入口，外部只需要传模式，不读配置
     // ============================================================
 
-    /** 普通对话/探索统一入口：本地Ollama 优先，能力不足或故障时降级 DeepSeek */
-    public ChatClient normal() {
+    public enum Mode { NORMAL, EXPLORATION }
+
+    /** 默认普通模式 */
+    public ChatClient chat() {
+        return chat(Mode.NORMAL);
+    }
+
+    /** 根据模式 + 配置开关返回对应模型 */
+    public ChatClient chat(Mode mode) {
+        String modelConfig = (mode == Mode.EXPLORATION)
+                ? props.exploration().explorationModel()
+                : props.normalModel();
+        if (modelConfig == null) modelConfig = "model1";
+        if ("model2".equalsIgnoreCase(modelConfig) && isCloudAvailable()) {
+            return cloudOnly();
+        }
         return failover;
     }
 
-    /** 探索模式（与普通对话共用同一路由） */
-    public ChatClient exploration() {
-        return failover;
+    /** 云端 AI 是否可用（DeepSeek 已配置） */
+    public boolean isCloudAvailable() {
+        return !sameModel;
+    }
+
+    /** 强制走云端 DeepSeek，用于分类等不需要本地模型的场景 */
+    public ChatClient cloudOnly() {
+        if (model2Direct == null) {
+            throw new IllegalStateException("云端 AI 未配置，不能直接调用 cloudOnly()");
+        }
+        return model2Direct;
     }
 }

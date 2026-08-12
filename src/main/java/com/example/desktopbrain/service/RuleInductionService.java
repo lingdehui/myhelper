@@ -99,7 +99,7 @@ public class RuleInductionService {
         // 6. 调用 LLM
         String response;
         try {
-            response = modelRouter.normal().prompt().user(prompt).call().content();
+            response = modelRouter.chat().prompt().user(prompt).call().content();
         } catch (Exception e) {
             log.error("⚠️ LLM 规则归纳调用失败: {}", e.getMessage());
             return 0;

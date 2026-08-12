@@ -27,7 +27,7 @@ spring:
     uri: bolt://localhost:7687
     authentication:
       username: neo4j
-      password: neo4j123
+      password: ll425972
 
 # ===== Qdrant 向量数据库 =====
 qdrant:
@@ -44,12 +44,13 @@ qdrant:
 
 # ===== 双模型配置 =====
 desktopbrain:
-  deepseek:                           # 模型 2: DeepSeek API（远程）— 本地Ollama搞不定时求助
+  normal-model: model2                # model1=本地Ollama优先(搞不定请教云端), model2=全程云端DeepSeek
+  deepseek:                           # 模型 2: DeepSeek API（远程）
     base-url: https://api.deepseek.com
     api-key: sk-f2fcd2a4bdb44f02a410c3f030d6fb8b
     model: deepseek-v4-pro
-  exploration:                        # 模型 1: 本地 Ollama（AutoDL RTX3090 SSH隧道）— 主力模型
-    model: qwen3:30b
+  exploration:
+    exploration-model: model2         # model1=本地, model2=云端
 
 # ===== Home Assistant 智能家居 =====
 homeassistant:

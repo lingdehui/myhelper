@@ -2,11 +2,11 @@ package com.example.desktopbrain.memory.vector.episode;
 
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.PromptLoader;
-import com.example.desktopbrain.config.DesktopBrainProperties;
 import com.example.desktopbrain.config.ModelRouter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -37,17 +37,18 @@ public class ReflectService {
     private static final Logger log = LoggerFactory.getLogger(ReflectService.class);
 
     private final ModelRouter modelRouter;
-    private final DesktopBrainProperties props;
     private final PromptLoader promptLoader;
     private final ObjectMapper objectMapper;
 
     public ReflectService(ModelRouter modelRouter,
-                           DesktopBrainProperties props,
                            PromptLoader promptLoader) {
         this.modelRouter = modelRouter;
         this.objectMapper = new ObjectMapper();
-        this.props = props;
         this.promptLoader = promptLoader;
+    }
+
+    private ChatClient client(ModelRouter.Mode mode) {
+        return modelRouter.chat(mode);
     }
 
     /**
@@ -81,13 +82,13 @@ public class ReflectService {
      * @param aiResponse AI 最终回复
      * @return 校验结果；AI 调用失败时默认返回 success=true（不阻塞流程）
      */
-    public VerificationResult verifyExecution(String userInput, List<ToolCallLog> toolCalls, String aiResponse) {
+    public VerificationResult verifyExecution(ModelRouter.Mode mode, String userInput, List<ToolCallLog> toolCalls, String aiResponse) {
         String stepsSummary = formatSteps(toolCalls);
         String prompt = promptLoader.getVerifyExecution()
                 .formatted(userInput, stepsSummary, AiResponseUtils.truncate(aiResponse, 300));
 
         try {
-            String response = modelRouter.normal().prompt().user(prompt).call().content();
+            String response = client(mode).prompt().user(prompt).call().content();
             return parseVerificationResult(response);
         } catch (Exception e) {
             log.error("⚠️ 执行校验失败: {}", e.getMessage());
@@ -151,7 +152,7 @@ public class ReflectService {
      * @return 提取结果（signature + 模板化后的 toolCalls）；AI 失败时 fallback 原样返回
      */
     @SuppressWarnings("unchecked")
-    public SignatureExtraction extractSignature(String userInput, List<ToolCallLog> toolCalls) {
+    public SignatureExtraction extractSignature(ModelRouter.Mode mode, String userInput, List<ToolCallLog> toolCalls) {
         if (toolCalls == null || toolCalls.isEmpty()) {
             return SignatureExtraction.fallback(toolCalls);
         }
@@ -167,7 +168,7 @@ public class ReflectService {
                 .formatted(userInput, stepsDesc);
 
         try {
-            String response = modelRouter.normal().prompt().user(prompt).call().content();
+            String response = client(mode).prompt().user(prompt).call().content();
             return parseSignatureExtraction(response, toolCalls);
         } catch (Exception e) {
             log.error("⚠️ 签名提取失败，原样保留 toolCalls: {}", e.getMessage());
@@ -232,13 +233,13 @@ public class ReflectService {
      * @param aiResponse AI 最终回复
      * @return 成功经验（30字内）；AI 调用失败时返回 null
      */
-    public String reflectSuccess(String userInput, List<ToolCallLog> toolCalls, String aiResponse) {
+    public String reflectSuccess(ModelRouter.Mode mode, String userInput, List<ToolCallLog> toolCalls, String aiResponse) {
         String stepsSummary = formatSteps(toolCalls);
         String prompt = promptLoader.getReflectSuccess()
                 .formatted(userInput, stepsSummary, AiResponseUtils.truncate(aiResponse, 200));
 
         try {
-            String result = modelRouter.normal().prompt().user(prompt).call().content();
+            String result = client(mode).prompt().user(prompt).call().content();
             return AiResponseUtils.truncate(result, 100);
         } catch (Exception e) {
             log.error("⚠️ 成功反思失败: {}", e.getMessage());
@@ -254,13 +255,18 @@ public class ReflectService {
      * @param errorMessage 失败错误信息
      * @return 失败分析（教训 + 是否计划问题）；AI 调用失败时返回默认值（环境问题，不惩罚计划）
      */
-    public FailureAnalysis reflectFailure(String userInput, List<ToolCallLog> toolCalls, String errorMessage) {
+    public FailureAnalysis reflectFailure(ModelRouter.Mode mode, String userInput, List<ToolCallLog> toolCalls, String errorMessage) {
+        return reflectFailure(client(mode), userInput, toolCalls, errorMessage);
+    }
+
+    /** 使用指定 ChatClient 的失败反思（探索模式可传入云端客户端） */
+    public FailureAnalysis reflectFailure(ChatClient client, String userInput, List<ToolCallLog> toolCalls, String errorMessage) {
         String stepsSummary = formatSteps(toolCalls);
         String prompt = promptLoader.getReflectFailure()
                 .formatted(userInput, stepsSummary, AiResponseUtils.truncate(errorMessage, 300));
 
         try {
-            String response = modelRouter.normal().prompt().user(prompt).call().content();
+            String response = client.prompt().user(prompt).call().content();
             return parseFailureAnalysis(response);
         } catch (Exception e) {
             log.error("⚠️ 失败反思失败: {}", e.getMessage());

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- 控制台输出 -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 文件输出到项目根目录 system.log -->
+    <appender name="SYSTEM_LOG" class="ch.qos.logback.core.FileAppender">
+        <file>system.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="SYSTEM_LOG" />
+    </root>
+
+    <!-- 减少噪音 -->
+    <logger name="org.springframework.ai.mcp" level="WARN"/>
+    <logger name="io.modelcontextprotocol" level="WARN"/>
+    <logger name="org.springframework.web" level="WARN"/>
+    <logger name="org.neo4j" level="WARN"/>
+</configuration>

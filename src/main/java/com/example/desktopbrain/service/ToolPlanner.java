@@ -9,7 +9,11 @@ import com.example.desktopbrain.memory.vector.category.ToolCategoryService;
 import com.example.desktopbrain.memory.vector.episode.Episode;
 import com.example.desktopbrain.memory.vector.episode.EpisodeCacheService;
 import com.example.desktopbrain.memory.vector.episode.ToolCallLog;
+import com.example.desktopbrain.registry.ToolModel;
+import com.example.desktopbrain.registry.ToolRegistry;
 import com.example.desktopbrain.config.ModelRouter;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
@@ -17,6 +21,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * 三阶段工具规划器（升级版：三层缓存 + Episode 经验学习）。
@@ -61,6 +66,7 @@ public class ToolPlanner {
     private final ModelRouter modelRouter;
     private final EpisodeCacheService episodeCacheService;
     private final ToolCategoryService categoryService;
+    private final ToolRegistry toolRegistry;
     private final RuleInductionService ruleInductionService;
     private final DesktopBrainProperties props;
     private final PromptLoader promptLoader;
@@ -87,6 +93,8 @@ public class ToolPlanner {
         }
     }
 
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
     private final Map<String, CacheEntry> cache = Collections.synchronizedMap(
             new LinkedHashMap<>(200, 0.75f, true) {  // access-order LRU
                 @Override
@@ -98,6 +106,7 @@ public class ToolPlanner {
     public ToolPlanner(ModelRouter modelRouter,
                         EpisodeCacheService episodeCacheService,
                         ToolCategoryService categoryService,
+                        ToolRegistry toolRegistry,
                         RuleInductionService ruleInductionService,
                         DesktopBrainProperties props,
                         PromptLoader promptLoader,
@@ -105,6 +114,7 @@ public class ToolPlanner {
         this.modelRouter = modelRouter;
         this.episodeCacheService = episodeCacheService;
         this.categoryService = categoryService;
+        this.toolRegistry = toolRegistry;
         this.ruleInductionService = ruleInductionService;
         this.props = props;
         this.promptLoader = promptLoader;
@@ -223,12 +233,15 @@ public class ToolPlanner {
             return true;
         }
         entry.failureCount++;
-        if (entry.failureCount >= props.toolPlanner().failureThreshold()) {
+        int threshold = entry.episode != null
+                ? effectiveFailureThreshold(entry.episode)
+                : props.toolPlanner().failureThreshold();
+        if (entry.failureCount >= threshold) {
             cache.remove(key);
-            log.info("🗑️ 缓存连续失败 {} 次（计划问题），已清除旧方案", props.toolPlanner().failureThreshold());
+            log.info("🗑️ 缓存连续失败 {} 次（阈值{}），已清除旧方案", entry.failureCount, threshold);
             return true;
         }
-        log.info("⚠️ 缓存方案失败（计划问题，第 {} 次/{}），保留缓存，本次重新规划", entry.failureCount, props.toolPlanner().failureThreshold());
+        log.info("⚠️ 缓存方案失败（计划问题，第 {} 次/{}），保留缓存，本次重新规划", entry.failureCount, threshold);
         return false;
     }
 
@@ -262,7 +275,9 @@ public class ToolPlanner {
                         old.toolCalls(), old.aiResponse(), old.successLesson(), old.failureLesson(),
                         old.signature(), old.unitType(), old.isGeneric(), old.parentIds(),
                         newSuccess, failure, old.archived(), old.timestamp(), newStability,
-                        old.status(), canScript, old.failedStepIndex(), old.explorationType(), old.explorationSummary());
+                        old.status(), canScript, old.failedStepIndex(),
+                        old.exploreOptimizeCount(), old.exploreDebugCount(),
+                        old.explorationType(), old.explorationSummary());
                 if (canScript && !wasScriptable) {
                     log.info("🚀 内存缓存 episode 升级为可脚本化（id={}...）", old.id().substring(0, 8));
                 }
@@ -271,7 +286,42 @@ public class ToolPlanner {
         episodeCacheService.incrementSuccess(plan.episodeId());
     }
 
-    /** 重新规划（带失败原因，不走缓存） */
+    // ========== 探索优化权重 ==========
+
+    /** 计算某计划的优化权重：被优化越多次越不值（权重 ∝ 1/(1+次数)） */
+    public double planOptimizeWeight(Episode episode) {
+        return 1.0 / (1.0 + episode.exploreOptimizeCount());
+    }
+
+    /** 优化阈值：数据库数据少 → 阈值高（倾向新建扩充），数据多 → 阈值低（倾向优化精炼） */
+    public double optimizeThreshold() {
+        int dataVolume = episodeCacheService.countActiveEpisodes();
+        if (dataVolume < 10) return 0.9;   // 库很小，几乎只新建
+        if (dataVolume < 50) return 0.7;
+        if (dataVolume < 100) return 0.5;
+        return 0.3;                         // 库够大，多优化
+    }
+
+    /** 判断是否值得优化：planWeight >= threshold → 优化，否则新建 */
+    public boolean isWorthOptimizing(Episode episode) {
+        double weight = planOptimizeWeight(episode);
+        double threshold = optimizeThreshold();
+        boolean worth = weight >= threshold;
+        log.info("⚖️ 优化权重判断: weight={} threshold={} optimizeCount={} dataVolume={} → {}",
+                String.format("%.2f", weight), String.format("%.2f", threshold),
+                episode.exploreOptimizeCount(),
+                episodeCacheService.countActiveEpisodes(),
+                worth ? "优化" : "新建");
+        return worth;
+    }
+
+    /** 获取优化后的失败删除门槛：基础3次 + 每优化1次多加0.5次（最少3次） */
+    public int effectiveFailureThreshold(Episode episode) {
+        return Math.max(props.toolPlanner().failureThreshold(),
+                props.toolPlanner().failureThreshold() + (int)(episode.exploreOptimizeCount() * 0.5));
+    }
+
+    // ========== 缓存失败/成功回调 ==========
     public PlanResult replan(String userInput, ToolCallback[] allTools, String failureReason) {
         List<EpisodeCacheService.FailureSearchResult> warnings = episodeCacheService.searchFailurePatterns(userInput, 3);
         return doPlan(userInput, allTools, failureReason, warnings);
@@ -330,7 +380,7 @@ public class ToolPlanner {
                 plan.missingDescriptions(), toolCallLogs, AiResponseUtils.truncate(aiResponse, 500),
                 successLesson, null, Map.of(), Episode.UnitType.COMPOSITE, false, List.of(),
                 1, 0, false, System.currentTimeMillis(), 1.0,
-                Episode.EpisodeStatus.ACTIVE, false, -1, null, null);
+                Episode.EpisodeStatus.ACTIVE, false, -1, 0, 0, null, null);
         cache.put(AiResponseUtils.normalizeKey(userInput), new CacheEntry(
                 plan.selectedToolNames(), plan.missingDescriptions(), episodeId, memEpisode));
         log.info("💾 已写入内存缓存（{} 个工具，episode={}...{}）", plan.selectedToolNames().size(),
@@ -351,128 +401,584 @@ public class ToolPlanner {
         return categoryService.syncCategories(allTools, force);
     }
 
-    /** 内部：调 AI 规划（让 AI 从完整工具列表中直接选工具名） */
+    /**
+     * 内部：AI 规划 — 多轮树形分类交互（严格按 docs/临时文件 设计）。
+     *
+     * <h3>多轮交互流程</h3>
+     * <ol>
+     *   <li><b>Round 1 — L1 大类选择</b>：展示 L1 大类（name+desc+toolCount），AI 选 1-3 个</li>
+     *   <li><b>Round 2 — L2 子类选择</b>（可选）：若选中 L1 有 L2 子类，展示子类列表，AI 选 1-2 个；
+     *       超过 maxCategoryRounds 则不再交互，降级为全量工具前 50 个</li>
+     *   <li><b>Round 3 — 工具选择 + 计划</b>：展示收集到的工具列表（name+desc），AI 挑工具 + 制定计划</li>
+     * </ol>
+     *
+     * <h3>防死循环约束（严格按 临时文件 §4）</h3>
+     * <ul>
+     *   <li>maxCategoryRounds（3）：超过后不再展示分类树，降级为全量工具（前 50 个）</li>
+     *   <li>max_selected_categories_per_round：每轮最多 3 个</li>
+     *   <li>max_tools_displayed（50）：超出截断并提示用 searchTool</li>
+     *   <li>路径记忆（§4.2）：AI 重选已展开的分类 → 拒绝 + 消耗轮次</li>
+     *   <li>禁止回退（§4.2）：只向前或 searchTool，不提供"返回上级"</li>
+     * </ul>
+     *
+     * <h3>异常处理（严格按 临时文件 §6）</h3>
+     * <ul>
+     *   <li>分类名不存在 → 模糊匹配 → 返回候选让 AI 重试（消耗轮次）</li>
+     *   <li>AI 始终不选分类 → 允许直接 searchTool/listAllTools 搜</li>
+     *   <li>轮次用尽 → 降级为全量工具前 50 个</li>
+     * </ul>
+     */
     private PlanResult doPlan(String userInput, ToolCallback[] allTools, String failureReason,
                                List<EpisodeCacheService.FailureSearchResult> warnings) {
-        // 构建完整工具列表（工具名 + 简短描述）
+        // ===== 验证分类数据 =====
+        List<ToolCategoryService.CategorySummary> allCategories = categoryService.listAllCategories();
+
+        if (allCategories.isEmpty()) {
+            log.info("📦 工具分类为空，触发异步同步...");
+            triggerAsyncClassification(allTools);
+            return fallbackPlan(List.of("分类数据未就绪"));
+        }
+
+        if (toolRegistry.checkAndClearDirty()) {
+            log.info("📦 检测到新工具，触发异步重新分类...");
+            triggerAsyncClassification(allTools);
+        }
+
+        // 分离 L1 大类
+        List<ToolCategoryService.CategorySummary> l1Categories = allCategories.stream()
+                .filter(c -> c.level() == 1).toList();
+
+        if (l1Categories.isEmpty()) {
+            return fallbackPlan(List.of("无L1分类数据"));
+        }
+
+        String contextPrefix = envService.getOsInfo();
+        Set<String> visitedIds = new HashSet<>();
+        List<String> missing = new ArrayList<>();
+        Set<String> allToolNames = new LinkedHashSet<>();
+        int maxRounds = props.toolPlanner().maxCategoryRounds();
+        int roundCount = 0;
+
+        // ===== Round 1: L1 大类选择 =====
+        List<String> selectedL1Names = List.of();
+        List<ToolCategoryService.CategorySummary> remainingL1 = new ArrayList<>(l1Categories);
+
+        while (roundCount < maxRounds) {
+            // 过滤已访问的分类
+            List<ToolCategoryService.CategorySummary> availableL1 = remainingL1.stream()
+                    .filter(c -> !visitedIds.contains(c.id()))
+                    .toList();
+
+            if (availableL1.isEmpty()) {
+                log.info("📦 L1 全部已访问，跳过 L1 选择");
+                break;
+            }
+
+            String l1Prompt = buildL1Prompt(contextPrefix, availableL1, userInput, failureReason,
+                    roundCount > 0 ? visitedIds : null);
+            l1Prompt = injectWarnings(l1Prompt, warnings);
+            l1Prompt = injectRules(l1Prompt, ruleInductionService.getActiveRules());
+
+            String l1Response = callAISafe(l1Prompt, "L1选择-" + (roundCount + 1));
+            selectedL1Names = parseCategoryNames(l1Response);
+            roundCount++;
+
+            log.info("📦 第{}轮 L1选择: {} 个L1大类 → AI选了 {} 个: {}",
+                    roundCount, availableL1.size(), selectedL1Names.size(), selectedL1Names);
+
+            if (selectedL1Names.isEmpty()) {
+                // AI 不选分类 → 允许直接 searchTool/listAllTools（§6）
+                log.info("📦 AI 未选择分类 → 降级为 searchTool/listAllTools 路径");
+                visitedIds.add("__ALL__"); // 标记为全部访问，防止重试
+                break;
+            }
+
+            // 解析 L1 名称为 CategorySummary（含路径记忆检查）
+            boolean allValid = true;
+            List<String> validatedNames = new ArrayList<>();
+            for (String name : selectedL1Names) {
+                var l1Opt = categoryService.findByName(name);
+                if (l1Opt.isPresent()) {
+                    String id = l1Opt.get().id();
+                    if (visitedIds.contains(id)) {
+                        // §4.2：路径记忆 → 拒绝重复选择
+                        log.warn("⛔ 路径记忆拒绝: L1「{}」已展开过，消耗本轮", name);
+                        allValid = false;
+                        continue;
+                    }
+                    visitedIds.add(id);
+                    validatedNames.add(name);
+                } else {
+                    // §6：分类名不存在 → 模糊匹配 → 候选重试
+                    List<String> candidates = fuzzyMatchCategoryNames(name, availableL1);
+                    if (!candidates.isEmpty()) {
+                        if (roundCount < maxRounds) {
+                            log.info("❓ L1「{}」不存在，候选: {} → 重新确认（消耗轮次）", name, candidates);
+                            String retryPrompt = buildRetryPrompt(contextPrefix,
+                                    "分类「" + name + "」不存在，以下是最接近的候选", candidates, userInput);
+                            String retryResponse = callAISafe(retryPrompt, "L1重试-" + name);
+                            List<String> retryNames = parseCategoryNames(retryResponse);
+                            roundCount++;
+                            for (String rn : retryNames) {
+                                var ro = categoryService.findByName(rn);
+                                if (ro.isPresent() && !visitedIds.contains(ro.get().id())) {
+                                    visitedIds.add(ro.get().id());
+                                    validatedNames.add(rn);
+                                }
+                            }
+                        } else {
+                            log.info("⚠️ 轮次已满，分类「{}」不存在 → 降级", name);
+                            missing.add("MISSING: 分类「" + name + "」不存在");
+                        }
+                    } else {
+                        missing.add("MISSING: 分类「" + name + "」不存在，无候选");
+                    }
+                    allValid = false;
+                }
+            }
+            selectedL1Names = validatedNames;
+
+            if (allValid || !selectedL1Names.isEmpty()) break;
+            // 全部无效且未消耗太多轮次则继续循环
+            if (roundCount >= maxRounds) break;
+            // 重建 availableL1（已过滤 visitedIds）
+            remainingL1 = availableL1;
+        }
+
+        if (roundCount >= maxRounds && selectedL1Names.isEmpty()) {
+            // §6：轮次用尽 → 降级为全量工具前 50 个
+            log.info("📦 轮次用尽 ({} 轮) → 降级为全量工具前 50 个", maxRounds);
+            Set<String> existingNames = collectExisting(allTools);
+            int count = 0;
+            for (ToolCallback tc : allTools) {
+                if (count >= 50) break;
+                allToolNames.add(tc.getToolDefinition().name());
+                count++;
+            }
+            return doFinalRound(contextPrefix, allTools, userInput, failureReason, warnings,
+                    new ArrayList<>(allToolNames), missing);
+        }
+
+        if (selectedL1Names.isEmpty()) {
+            // AI 始终不选分类 → searchTool/listAllTools 路径（§6）
+            // 限制工具列表最大长度 50，超长截断并提示
+            log.info("📦 AI 始终不选分类 → searchTool/listAllTools 路径，传前50个工具");
+            return doFinalRound(contextPrefix, allTools, userInput, failureReason, warnings,
+                    getFirstNToolNames(allTools, 50), missing);
+        }
+
+        // ===== Round 2: L2 子类选择 =====
+        for (String name : selectedL1Names) {
+            var l1Opt = categoryService.findByName(name);
+            if (l1Opt.isEmpty()) continue;
+            var l1 = l1Opt.get();
+
+            List<ToolCategoryService.CategorySummary> l2Children = categoryService.getChildren(l1.id());
+            // 过滤已访问的 L2
+            l2Children = l2Children.stream().filter(c -> !visitedIds.contains(c.id())).toList();
+
+            if (l2Children.isEmpty()) {
+                // 无 L2（或全部已访问）→ 直接收集工具
+                allToolNames.addAll(l1.toolNames());
+                log.info("📦 L1「{}」无子类（或已全展开）→ 直接收集 {} 个工具", l1.name(), l1.toolNames().size());
+            } else {
+                if (roundCount >= maxRounds) {
+                    // §6：轮次用尽 → 全量工具前 50 个
+                    log.info("📦 已达最大轮次 {} → 降级为全量工具前 50 个", maxRounds);
+                    Set<String> existingNames = collectExisting(allTools);
+                    int count = 0;
+                    allToolNames.clear();
+                    for (ToolCallback tc : allTools) {
+                        if (count >= 50) break;
+                        allToolNames.add(tc.getToolDefinition().name());
+                        count++;
+                    }
+                    break;
+                } else {
+                    // L2 选择轮
+                    String l2Prompt = buildL2Prompt(contextPrefix, l2Children, l1.name(), userInput);
+                    String l2Response = callAISafe(l2Prompt, "L2选择-" + l1.name());
+                    List<String> selectedL2Names = parseCategoryNames(l2Response);
+                    roundCount++;
+
+                    log.info("📦 第{}轮 L2选择: L1「{}」下 {} 个子类 → AI选了 {} 个",
+                            roundCount, l1.name(), l2Children.size(), selectedL2Names.size());
+
+                    if (selectedL2Names.isEmpty()) {
+                        // AI 没选 → §4.2 禁止抱怨，全量收集
+                        for (var l2 : l2Children) {
+                            allToolNames.addAll(l2.toolNames());
+                            visitedIds.add(l2.id());
+                        }
+                    } else {
+                        for (String l2Name : selectedL2Names) {
+                            var l2Opt = findCategory(l2Name, l2Children);
+                            if (l2Opt.isPresent()) {
+                                if (visitedIds.contains(l2Opt.get().id())) {
+                                    // §4.2：路径记忆拒绝
+                                    log.warn("⛔ 路径记忆拒绝: L2「{}」已展开过", l2Name);
+                                    continue;
+                                }
+                                allToolNames.addAll(l2Opt.get().toolNames());
+                                visitedIds.add(l2Opt.get().id());
+                            } else {
+                                // §6：分类名不存在 → 模糊匹配 → 候选重试
+                                List<String> candidates = fuzzyMatchCategoryNames(l2Name, l2Children);
+                                if (!candidates.isEmpty() && roundCount < maxRounds) {
+                                    log.info("❓ L2「{}」不存在，候选: {} → 重新确认（消耗轮次）", l2Name, candidates);
+                                    String retryPrompt = buildRetryPrompt(contextPrefix,
+                                            "子类「" + l2Name + "」不存在，以下是最接近的候选", candidates, userInput);
+                                    String retryResponse = callAISafe(retryPrompt, "L2重试-" + l2Name);
+                                    List<String> retryNames = parseCategoryNames(retryResponse);
+                                    roundCount++;
+                                    for (String rn : retryNames) {
+                                        var ro = findCategory(rn, l2Children);
+                                        if (ro.isPresent() && !visitedIds.contains(ro.get().id())) {
+                                            allToolNames.addAll(ro.get().toolNames());
+                                            visitedIds.add(ro.get().id());
+                                        }
+                                    }
+                                } else {
+                                    missing.add("MISSING: 子类「" + l2Name + "」不存在");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (allToolNames.isEmpty()) {
+            return fallbackPlan(missing);
+        }
+
+        return doFinalRound(contextPrefix, allTools, userInput, failureReason, warnings,
+                new ArrayList<>(allToolNames), missing);
+    }
+
+    /** 执行最终轮：工具选择 + 计划制定 */
+    private PlanResult doFinalRound(String contextPrefix, ToolCallback[] allTools,
+                                     String userInput, String failureReason,
+                                     List<EpisodeCacheService.FailureSearchResult> warnings,
+                                     List<String> toolNames, List<String> missing) {
+        // 构建工具列表文本
+        Set<String> existingNames = collectExisting(allTools);
         StringBuilder toolList = new StringBuilder();
-        for (ToolCallback tc : allTools) {
-            String name = tc.getToolDefinition().name();
-            String desc = tc.getToolDefinition().description();
-            toolList.append("- ").append(name);
+        int toolIdx = 0;
+        for (String name : toolNames) {
+            if (!existingNames.contains(name)) continue;
+            toolIdx++;
+            String desc = getToolDesc(name, allTools);
+            toolList.append(toolIdx).append(". ").append(name);
             if (desc != null && !desc.isBlank()) {
-                toolList.append(": ").append(AiResponseUtils.truncateNotNull(desc, 60));
+                toolList.append(" - ").append(desc);
             }
             toolList.append("\n");
         }
 
-        String prompt;
+        // §4.1：超出截断
+        int maxToolsDisplayed = 50;
+        String toolListStr = toolList.toString();
+        if (toolIdx > maxToolsDisplayed) {
+            String[] lines = toolListStr.split("\n");
+            StringBuilder truncated = new StringBuilder();
+            for (int i = 0; i < Math.min(lines.length, maxToolsDisplayed); i++) {
+                truncated.append(lines[i]).append("\n");
+            }
+            truncated.append("...（共 ").append(toolIdx).append(" 个工具，已截断，请用 searchTool 搜索更多）\n");
+            toolListStr = truncated.toString();
+        }
+
+        String finalPrompt;
         if (failureReason != null) {
-            prompt = promptLoader.getReplanning().formatted(envService.getOsInfo(), toolList, userInput, failureReason);
+            finalPrompt = promptLoader.getReplanning().formatted(contextPrefix, toolListStr, userInput, failureReason);
         } else {
-            prompt = promptLoader.getPlanning().formatted(envService.getOsInfo(), toolList, userInput);
+            finalPrompt = promptLoader.getPlanning().formatted(contextPrefix, toolListStr, userInput);
         }
+        finalPrompt = injectWarnings(finalPrompt, warnings);
+        finalPrompt = injectRules(finalPrompt, ruleInductionService.getActiveRules());
 
-        // 注入历史失败警告到 AI 规划 prompt
-        if (warnings != null && !warnings.isEmpty()) {
-            StringBuilder warnBlock = new StringBuilder("\n\n--- ⚠️ 历史失败警告（请避免以下做法） ---\n");
-            for (int i = 0; i < warnings.size(); i++) {
-                var w = warnings.get(i);
-                warnBlock.append((i + 1)).append(". ").append(w.type())
-                        .append("（失败 ").append(w.count()).append(" 次, 相似度 ").append(String.format("%.0f%%", w.score() * 100)).append("）\n")
-                        .append("   描述: ").append(w.description()).append("\n");
-                if (w.mitigation() != null && !w.mitigation().isBlank()) {
-                    warnBlock.append("   建议: ").append(w.mitigation()).append("\n");
-                }
-            }
-            prompt += warnBlock.toString();
-        }
-
-        // 注入归纳的通用规则到 AI 规划 prompt
-        List<RuleNode> activeRules = ruleInductionService.getActiveRules();
-        if (!activeRules.isEmpty()) {
-            StringBuilder ruleBlock = new StringBuilder("\n\n--- 📜 已知规则（请遵循） ---\n");
-            for (int i = 0; i < Math.min(activeRules.size(), 10); i++) {
-                var r = activeRules.get(i);
-                ruleBlock.append((i + 1)).append(". ").append(r.getSummary())
-                        .append("（置信度: ").append(String.format("%.0f%%", r.getConfidence() * 100)).append("）\n");
-            }
-            prompt += ruleBlock.toString();
-        }
-
-        String planResponse;
-        try {
-            planResponse = modelRouter.normal().prompt().user(prompt).call().content();
-        } catch (Exception e) {
-            log.info("⚠️ 规划失败，使用兜底工具: {}", e.getMessage());
-            return PlanResult.ofAIPlan(new ArrayList<>(props.toolPlanner().fallbackTools()), List.of());
-        }
-
-        return parseToolNames(planResponse, allTools);
+        String finalResponse = callAISafe(finalPrompt, "最终工具选择");
+        return parseFinalResponse(finalResponse, allTools, missing);
     }
 
-    /** 解析 AI 返回的工具名 → 精确匹配 → 模糊/关键词兜底 → MISSING */
-    private PlanResult parseToolNames(String response, ToolCallback[] allTools) {
-        if (response == null) {
-            return PlanResult.ofAIPlan(new ArrayList<>(props.toolPlanner().fallbackTools()), List.of());
+    // ========== 多轮交互辅助方法 ==========
+
+    /** 构建 L1 大类选择 prompt */
+    private String buildL1Prompt(String contextPrefix, List<ToolCategoryService.CategorySummary> l1Categories,
+                                  String userInput, String failureReason, Set<String> visitedIds) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("你是一个工具规划器。当前你处于「分类浏览模式」。\n");
+        sb.append(contextPrefix);
+        sb.append("\n\n根据用户请求，从以下L1大类中选择最相关的 1-3 个分类。\n");
+        if (visitedIds != null && !visitedIds.isEmpty()) {
+            sb.append("注意：以下分类已展开过，请勿重复选择: ").append(visitedIds.size()).append(" 个\n");
         }
+        sb.append("\n--- L1 大类 ---\n");
+        int idx = 1;
+        for (var c : l1Categories) {
+            sb.append(String.format("%d. 【%s】(%d个工具) - %s\n", idx++, c.name(), c.toolCount(), c.description()));
+        }
+        sb.append("\n用户请求: ").append(userInput);
+        if (failureReason != null) {
+            sb.append("\n上次失败原因: ").append(failureReason);
+        }
+        sb.append("\n\n规则:\n");
+        sb.append("- 如果展示的是子分类，请继续选择；如果是工具列表，请从中挑选必要的工具。\n");
+        sb.append("- 不要尝试「返回上一级」，只能向前或搜索。\n");
+        sb.append("- 如果对当前工具列表不满意，请使用 searchTool 搜索。\n");
+        sb.append("- 如果搜索无结果，请使用 listAllTools 查看全部工具名（仅名称），再用搜索定位。\n");
+        sb.append("\n返回严格JSON（只返回JSON，不要其他内容）:\n");
+        sb.append("{\"categories\": [\"大类名1\", \"大类名2\"], \"reason\": \"选择原因\"}");
+        return sb.toString();
+    }
 
-        Set<String> knownNames = collectExisting(allTools);
-        Set<String> neededTools = new LinkedHashSet<>();
-        List<String> missing = new ArrayList<>();
+    /** 构建 L2 子类选择 prompt */
+    private String buildL2Prompt(String contextPrefix, List<ToolCategoryService.CategorySummary> l2Children,
+                                  String l1Name, String userInput) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("你是一个工具规划器。当前你处于「分类浏览模式」。\n");
+        sb.append(contextPrefix);
+        sb.append("\n\n分类「").append(l1Name).append("」下有以下子类，请选择 1-2 个最相关的。\n\n");
+        sb.append("--- 子类 ---\n");
+        int idx = 1;
+        for (var c : l2Children) {
+            sb.append(String.format("%d. %s - %s (%d个工具)\n", idx++, c.name(), c.description(), c.toolCount()));
+        }
+        sb.append("\n用户请求: ").append(userInput);
+        sb.append("\n\n规则:\n");
+        sb.append("- 不要尝试「返回上一级」，只能向前或搜索。\n");
+        sb.append("- 如果对当前分类不满意，使用 searchTool 搜索跨分类工具。\n");
+        sb.append("- 如果搜索无结果，请使用 listAllTools 查看全部工具名（仅名称）。\n");
+        sb.append("\n返回严格JSON（只返回JSON，不要其他内容）:\n");
+        sb.append("{\"categories\": [\"子类名1\", \"子类名2\"], \"reason\": \"选择原因\"}");
+        return sb.toString();
+    }
 
-        for (String part : response.split("[,，\n]")) {
-            String trimmed = part.trim()
-                    .replaceAll("^[\\d]+[.\\)、]\\s*", "")  // 去掉编号
-                    .trim();
-            if (trimmed.isEmpty()) continue;
-            if (trimmed.toUpperCase().startsWith("MISSING:")) {
-                missing.add(trimmed.substring("MISSING:".length()).trim());
-                continue;
+    /** 构建分类名不存在时的重试 prompt */
+    private String buildRetryPrompt(String contextPrefix,
+                                     String hint, List<String> candidates, String userInput) {
+        StringBuilder sb = new StringBuilder(contextPrefix);
+        sb.append("\n\n").append(hint).append("：\n");
+        for (String c : candidates) {
+            sb.append("- ").append(c).append("\n");
+        }
+        sb.append("\n请从候选中重新选择（或选其他分类）。\n");
+        sb.append("用户请求: ").append(userInput);
+        sb.append("\n\n返回严格JSON:\n{\"categories\": [\"候选分类名\"], \"reason\": \"选择原因\"}");
+        return sb.toString();
+    }
+
+    /** 模糊匹配：从候选列表中找最接近的 1-2 个分类名 */
+    private List<String> fuzzyMatchCategoryNames(String input,
+            List<ToolCategoryService.CategorySummary> candidates) {
+        String key = input.toLowerCase().trim();
+        List<String> results = new ArrayList<>();
+        for (var c : candidates) {
+            String name = c.name().toLowerCase().trim();
+            // 包含匹配
+            if (name.contains(key) || key.contains(name)) {
+                results.add(c.name());
             }
-
-            // 精确匹配
-            if (knownNames.contains(trimmed)) {
-                neededTools.add(trimmed);
-                continue;
-            }
-            // 模糊匹配（AI 可能多打/少打字符）
-            String trimmedLower = trimmed.toLowerCase();
-            for (String known : knownNames) {
-                if (known.equalsIgnoreCase(trimmed)
-                        || known.toLowerCase().contains(trimmedLower)) {
-                    neededTools.add(known);
-                    break;
+            // 字符重叠度
+            else {
+                int overlap = 0;
+                for (int i = 0; i < key.length(); i++) {
+                    if (name.indexOf(key.charAt(i)) >= 0) overlap++;
+                }
+                if (overlap >= key.length() / 2 && overlap >= 2) {
+                    results.add(c.name());
                 }
             }
         }
+        return results.size() > 2 ? results.subList(0, 2) : results;
+    }
 
-        // === 关键词兜底：MISSING 或没选到工具时 ===
-        if (!missing.isEmpty()) {
-            List<String> keywordTools = findToolsByKeywords(missing, allTools);
-            if (!keywordTools.isEmpty()) {
-                neededTools.addAll(keywordTools);
-                log.info("🔎 关键词兜底匹配: {} 个工具", keywordTools.size());
-                missing.clear();
+    /** 从 allTools 中取前 N 个工具名 */
+    private List<String> getFirstNToolNames(ToolCallback[] allTools, int n) {
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < Math.min(allTools.length, n); i++) {
+            names.add(allTools[i].getToolDefinition().name());
+        }
+        return names;
+    }
+
+    /** 解析分类名 JSON：{"categories": [...]} */
+    @SuppressWarnings("unchecked")
+    private List<String> parseCategoryNames(String response) {
+        if (response == null || response.isBlank()) return List.of();
+        // §3.3：AI 可能输出工具调用指令而非 JSON → 无法解析则降级
+        String json = AiResponseUtils.stripMarkdownCodeBlock(response);
+        if (!json.trim().startsWith("{")) {
+            log.warn("⚠️ AI 返回非JSON响应（可能是工具调用指令），降级为空选择: {}", AiResponseUtils.truncate(response, 80));
+            return List.of();
+        }
+        try {
+            Map<String, Object> parsed = objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+            List<String> cats = (List<String>) parsed.getOrDefault("categories", List.of());
+            String reason = String.valueOf(parsed.getOrDefault("reason", ""));
+            if (!"null".equals(reason) && !reason.isBlank()) {
+                log.info("📝 AI选择原因: {}", AiResponseUtils.truncate(reason, 100));
+            }
+            // §4.1：硬截断，每轮最多3个
+            if (cats.size() > 3) {
+                log.warn("⚠️ AI选了 {} 个分类，超过上限3，截断", cats.size());
+                cats = cats.subList(0, 3);
+            }
+            return cats;
+        } catch (Exception e) {
+            log.warn("⚠️ 分类名解析失败: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** 按名称查找分类（模糊匹配） */
+    private Optional<ToolCategoryService.CategorySummary> findCategory(String name,
+            List<ToolCategoryService.CategorySummary> candidates) {
+        String key = name.toLowerCase().trim();
+        return candidates.stream()
+                .filter(c -> c.name().toLowerCase().trim().equals(key)
+                        || c.name().contains(name) || name.contains(c.name()))
+                .findFirst();
+    }
+
+    /** 安全调用 AI，异常时返回空字符串 */
+    private String callAISafe(String prompt, String stage) {
+        try {
+            return modelRouter.chat().prompt().user(prompt).call().content();
+        } catch (Exception e) {
+            log.warn("⚠️ AI调用失败 ({}): {}", stage, e.getMessage());
+            return "";
+        }
+    }
+
+    /** 获取工具简短描述 */
+    private String getToolDesc(String name, ToolCallback[] allTools) {
+        for (ToolCallback tc : allTools) {
+            if (tc.getToolDefinition().name().equals(name)) {
+                return AiResponseUtils.truncateNotNull(tc.getToolDefinition().description(), 80);
             }
         }
+        return "";
+    }
 
-        if (neededTools.isEmpty()) neededTools.addAll(props.toolPlanner().fallbackTools());
-        for (String tool : props.toolPlanner().alwaysAppendTools()) {
-            neededTools.add(tool);
+    /** 注入历史失败警告 */
+    private String injectWarnings(String prompt, List<EpisodeCacheService.FailureSearchResult> warnings) {
+        if (warnings == null || warnings.isEmpty()) return prompt;
+        StringBuilder warnBlock = new StringBuilder("\n\n--- ⚠️ 历史失败警告（请避免以下做法） ---\n");
+        for (int i = 0; i < warnings.size(); i++) {
+            var w = warnings.get(i);
+            warnBlock.append((i + 1)).append(". ").append(w.type())
+                    .append("（失败 ").append(w.count()).append(" 次, 相似度 ")
+                    .append(String.format("%.0f%%", w.score() * 100)).append("）\n")
+                    .append("   描述: ").append(w.description()).append("\n");
+            if (w.mitigation() != null && !w.mitigation().isBlank()) {
+                warnBlock.append("   建议: ").append(w.mitigation()).append("\n");
+            }
         }
-        log.info("📦 AI 选中 {} 个工具{}", neededTools.size(), (missing.isEmpty() ? "" : ", 缺失: " + missing));
-        return PlanResult.ofAIPlan(new ArrayList<>(neededTools), missing);
+        return prompt + warnBlock;
+    }
+
+    /** 注入归纳的通用规则 */
+    private String injectRules(String prompt, List<RuleNode> activeRules) {
+        if (activeRules == null || activeRules.isEmpty()) return prompt;
+        StringBuilder ruleBlock = new StringBuilder("\n\n--- 📜 已知规则（请遵循） ---\n");
+        for (int i = 0; i < Math.min(activeRules.size(), 10); i++) {
+            var r = activeRules.get(i);
+            ruleBlock.append((i + 1)).append(". ").append(r.getSummary())
+                    .append("（置信度: ").append(String.format("%.0f%%", r.getConfidence() * 100)).append("）\n");
+        }
+        return prompt + ruleBlock;
+    }
+
+    /** 降级兜底：fallbackTools + searchTool + listAllTools */
+    private PlanResult fallbackPlan(List<String> missing) {
+        List<String> fallback = new ArrayList<>(props.toolPlanner().fallbackTools());
+        if (!fallback.contains("searchTool")) fallback.add("searchTool");
+        if (!fallback.contains("listAllTools")) fallback.add("listAllTools");
+        return PlanResult.ofAIPlan(fallback, missing);
     }
 
     /**
-     * 关键词匹配：在所有工具中搜索名称/描述包含关键词的工具。
-     * 用于 Qdrant 分类漏掉工具时的兜底补充。
+     * 解析最终轮 AI 返回的工具+计划 JSON。
      *
-     * <p>对中文关键词做多级切分：先按分隔符切，再对每个片段用2-gram滑窗匹配，
-     * 确保 "设备扫描工具" 能匹配到描述中含 "扫描...设备" 的工具。</p>
+     * <p>JSON 格式：{@code {"tools": ["tool1"], "plan": "...", "missing": [...]}}</p>
      */
-    /** 按关键词匹配工具（公开静态，供外部复用） */
+    private PlanResult parseFinalResponse(String response, ToolCallback[] allTools, List<String> existingMissing) {
+        List<String> missing = new ArrayList<>(existingMissing);
+
+        if (response == null || response.isBlank()) {
+            return fallbackPlan(List.of("AI返回为空"));
+        }
+
+        // §3.3：AI 可能输出工具调用指令而非 JSON → 降级
+        String json = AiResponseUtils.stripMarkdownCodeBlock(response);
+        if (!json.trim().startsWith("{")) {
+            log.warn("⚠️ AI 返回非JSON响应（可能是工具调用指令），降级: {}", AiResponseUtils.truncate(response, 80));
+            return fallbackPlan(List.of("AI返回非JSON格式"));
+        }
+
+        try {
+            Map<String, Object> parsed = objectMapper.readValue(json,
+                    new TypeReference<Map<String, Object>>() {});
+
+            @SuppressWarnings("unchecked")
+            List<String> selectedTools = (List<String>) parsed.getOrDefault("tools", List.of());
+            String plan = String.valueOf(parsed.getOrDefault("plan", ""));
+            @SuppressWarnings("unchecked")
+            List<String> respMissing = (List<String>) parsed.getOrDefault("missing", List.of());
+            missing.addAll(respMissing);
+
+            Set<String> existingNames = collectExisting(allTools);
+            Set<String> resolvedTools = new LinkedHashSet<>();
+
+            // 验证 AI 选中的工具
+            List<String> validTools = new ArrayList<>();
+            List<String> hallucinatedTools = new ArrayList<>();
+            for (String t : selectedTools) {
+                if (existingNames.contains(t)) {
+                    validTools.add(t);
+                } else {
+                    hallucinatedTools.add(t);
+                }
+            }
+            resolvedTools.addAll(validTools);
+
+            if (!hallucinatedTools.isEmpty()) {
+                log.warn("⚠️ AI 脑补了不存在的工具: {}，已过滤", hallucinatedTools);
+                for (String ht : hallucinatedTools) {
+                    missing.add("MISSING: 工具「" + ht + "」不存在，请用 searchTool 搜索替代");
+                }
+            }
+
+            // 始终加入 searchTool + listAllTools
+            resolvedTools.add("searchTool");
+            resolvedTools.add("listAllTools");
+            resolvedTools.removeIf(t -> !existingNames.contains(t));
+
+            // 加入 alwaysAppendTools
+            for (String tool : props.toolPlanner().alwaysAppendTools()) {
+                if (existingNames.contains(tool)) resolvedTools.add(tool);
+            }
+
+            if (resolvedTools.isEmpty()) {
+                return fallbackPlan(missing);
+            }
+
+            List<String> finalTools = new ArrayList<>(resolvedTools);
+            if (!"null".equals(plan) && !plan.isBlank()) {
+                log.info("📋 AI 计划: {}", AiResponseUtils.truncate(plan, 200));
+            }
+            log.info("📦 最终选择 → {} 个工具 ({} 个缺失)", finalTools.size(), missing.size());
+            return PlanResult.ofAIPlan(finalTools, missing);
+
+        } catch (Exception e) {
+            log.warn("⚠️ AI 返回的 JSON 解析失败: {}，使用兜底工具", e.getMessage());
+            return fallbackPlan(List.of("JSON解析失败: " + e.getMessage()));
+        }
+    }
+
+    /** 按关键词匹配工具（公开静态，供外部复用，保留原逻辑） */
     public static List<String> findToolsByKeywords(List<String> missingDescriptions,
                                                     ToolCallback[] allTools) {
         List<String> result = new ArrayList<>();
@@ -598,5 +1104,17 @@ public class ToolPlanner {
     public void clearCache() {
         cache.clear();
         log.info("🗑️ 工具规划缓存已清除");
+    }
+
+    /** 异步触发分类同步（不阻塞规划） */
+    private void triggerAsyncClassification(ToolCallback[] allTools) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                int n = categoryService.syncCategories(allTools, true);
+                log.info("📁 异步分类完成: {} 类", n);
+            } catch (Exception e) {
+                log.warn("⚠️ 异步分类失败: {}", e.getMessage());
+            }
+        });
     }
 }

@@ -3,6 +3,8 @@ desktopbrain:
   tool-planner:
     max-cache-size: 500
     failure-threshold: 3
+    force-category-sync: true
+    max-category-rounds: 3
     fallback-tools:
       - sleep
       - listWindows

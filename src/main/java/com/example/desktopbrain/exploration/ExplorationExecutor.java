@@ -3,9 +3,11 @@ package com.example.desktopbrain.exploration;
 import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.memory.vector.episode.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.example.desktopbrain.config.DesktopBrainProperties;
 import com.example.desktopbrain.config.ModelRouter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.stereotype.Service;
@@ -33,6 +35,7 @@ public class ExplorationExecutor {
     private final EpisodeCacheService episodeCache;
     private final FailureExperienceHandler failureHandler;
     private final ModelRouter modelRouter;
+    private final DesktopBrainProperties props;
     private final ToolCallback[] tools;
     private final ObjectMapper objectMapper;
 
@@ -42,12 +45,14 @@ public class ExplorationExecutor {
     public ExplorationExecutor(EpisodeCacheService episodeCache,
                                 FailureExperienceHandler failureHandler,
                                 ModelRouter modelRouter,
+                                DesktopBrainProperties props,
                                 ToolCallbackProvider mcpTools) {
         this.episodeCache = episodeCache;
         this.failureHandler = failureHandler;
         this.objectMapper = new ObjectMapper();
         this.tools = mcpTools.getToolCallbacks();
         this.modelRouter = modelRouter;
+        this.props = props;
     }
 
     /**
@@ -154,12 +159,17 @@ public class ExplorationExecutor {
         return allSuccess;
     }
 
+    /** 获取探索用 ChatClient — 统一走 ModelRouter */
+    private ChatClient explorationClient() {
+        return modelRouter.chat(ModelRouter.Mode.EXPLORATION);
+    }
+
     /** 执行单个步骤（通过 AI 调用工具） */
     private String executeStep(String step) {
         String prompt = "请执行以下探索步骤。你可以用任何可用的工具来完成。\n步骤：" + step
                 + "\n\n只使用工具执行，不要问问题。";
         try {
-            return modelRouter.exploration().prompt()
+            return explorationClient().prompt()
                     .user(prompt)
                     .toolCallbacks(tools)
                     .call()
@@ -206,7 +216,7 @@ public class ExplorationExecutor {
                     decision.learningGoal(), decision.expectedOutcome(),
                     decision.successCriteria(), allSuccess, stepsLog);
 
-            String response = modelRouter.exploration().prompt()
+            String response = explorationClient().prompt()
                     .user(prompt)
                     .call()
                     .content();

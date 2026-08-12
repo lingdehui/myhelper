@@ -7,6 +7,7 @@ import com.example.desktopbrain.dialog.DialogStateMachine;
 import com.example.desktopbrain.dialog.SpeechAssembler;
 import com.example.desktopbrain.exploration.AutonomousExplorationService;
 import com.example.desktopbrain.exploration.ExplorationTool;
+import com.example.desktopbrain.registry.ToolSyncService;
 import com.example.desktopbrain.service.AudioRecorder;
 import com.example.desktopbrain.service.BackgroundAudioService;
 import com.example.desktopbrain.service.CapabilityService;
@@ -90,6 +91,7 @@ public class DesktopBrainApplication {
                                  SpeechEventLoop speechEventLoop,
                                  ApplicationContext appCtx,
                                  AutonomousExplorationService explorationService,
+                                 ToolSyncService toolSyncService,
                                  @Qualifier("aiExecutor") ExecutorService aiExecutor) {
         return args -> {
             this.props = props;
@@ -144,6 +146,9 @@ public class DesktopBrainApplication {
             // 探索服务接收完整工具列表（含生成工具），避免"缺失浏览器工具"误判
             explorationService.setAllTools(allToolCallbacks);
 
+            // === 启动工具注册表同步（Neo4j + Qdrant）===
+            toolSyncService.syncOnStartup(allToolCallbacks, mcpCount);
+
             log.info("🤖 桌面助手已启动（贾维斯模式）");
             log.info("💡 文字输入：直接对话，回复有语音播报");
             log.info("💡 语音唤醒：说 '{}' 进入语音对话", props.voice().wakeWord());
@@ -161,10 +166,11 @@ public class DesktopBrainApplication {
                 log.info("✅ sherpa-onnx 资源已释放");
             }, "sherpa-shutdown"));
 
-            // 异步同步工具分类（启动时非强制，已有缓存则跳过）
+            // 异步同步工具分类（可通过配置 force-category-sync 强制刷新）
             aiExecutor.submit(() -> {
-                int catCount = turnProcessor.syncCategories(getMergedTools(), false);
-                if (catCount > 0) log.info("📁 工具分类已同步: {} 类", catCount);
+                boolean forceCategory = props.toolPlanner().forceCategorySync();
+                int catCount = turnProcessor.syncCategories(getMergedTools(), forceCategory);
+                if (catCount > 0) log.info("📁 工具分类已同步: {} 类 (force={})", catCount, forceCategory);
             });
 
             // 启动语音子组件

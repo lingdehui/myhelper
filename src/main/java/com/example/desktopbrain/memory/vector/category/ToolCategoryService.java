@@ -15,28 +15,26 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
- * 工具分类服务：AI 动态分类 + Qdrant 向量存储。
+ * 工具分类服务：树形分类 + Qdrant 向量存储。
  *
- * <h3>代替旧版写死 10 类 Category</h3>
- * <p>旧版：{@code ToolPlanner.CATEGORIES} 是 {@code static final} 硬编码列表，
- * 10 个分类、54 个工具全手写映射，新增工具（HA、生成的 tool）永远不在分类里。</p>
+ * <h3>3层树形结构</h3>
+ * <pre>
+ * L1 大类 (8-15个) ─ 功能领域，简短描述
+ *   ├─ L2 子类 (可选) ─ 细分功能，当L1下工具>15个时拆分
+ *   │   └─ L3 工具 (叶子) ─ 实际工具名列表
+ *   └─ L2可省略，直接挂工具（L1下工具≤15个时）
+ * </pre>
  *
- * <p>新版：启动时 AI 自动扫描所有 ToolCallback 分组归类，存入 Qdrant，
- * 分类数量随工具数量动态增长。AI 规划时 embed 用户输入 → 向量搜索最相关的分类。</p>
- *
- * <h3>initCollection → syncCategories → search</h3>
- * <ol>
- *   <li>启动时初始化 {@code tool-categories} collection</li>
- *   <li>AI 扫描所有工具生成分类（每次工具变化时重新同步）</li>
- *   <li>规划阶段：embed(userInput) → 向量搜索 → 返回匹配分类及工具列表</li>
- * </ol>
+ * <h3>存储方式</h3>
+ * 树结构展平为独立 Qdrant points，每个 point 含 parent_id + level + tools。
+ * 查询时通过 getChildren() 导航，buildCategoryTree() 组装展示树。
  *
  * <h3>交叉分类</h3>
- * AI 可将同一工具归入多个分类（如 "ocrScreen" 属于"屏幕OCR"也属于"文字识别"）。
- * 搜索时工具列表自动去重。
+ * 同一工具可出现在多个分类中（如 ocrScreen 属于"屏幕截取"也属于"文字识别"）。
  */
 @Service
 public class ToolCategoryService {
@@ -56,7 +54,6 @@ public class ToolCategoryService {
     @Value("${qdrant.vector-size:768}")
     private int vectorSize;
 
-    /** 分类同步版本号（时间戳），每次同步更新 */
     private volatile long lastSyncVersion = 0;
 
     public ToolCategoryService(WebClient qdrantWebClient,
@@ -72,9 +69,6 @@ public class ToolCategoryService {
         this.promptLoader = promptLoader;
     }
 
-    /**
-     * 启动时初始化 tool-categories collection（@PostConstruct 入口）。
-     */
     @PostConstruct
     public void initCollection() {
         this.collectionName = envService.collectionName(BASE_collectionName);
@@ -82,7 +76,6 @@ public class ToolCategoryService {
         ensureCollection();
     }
 
-    /** 确保 tool-categories 集合存在，不存在则创建。幂等，可重复调用。 */
     private void ensureCollection() {
         try {
             Boolean exists = qdrant.get()
@@ -102,39 +95,30 @@ public class ToolCategoryService {
                         .retrieve()
                         .toBodilessEntity()
                         .block();
-                log.info("📦 Qdrant 集合 '" + collectionName + "' 已创建（向量维度: " + vectorSize + "）");
-            } else {
-                log.info("📦 Qdrant 集合 '" + collectionName + "' 已存在");
+                log.info("📦 Qdrant 集合 '" + collectionName + "' 已创建");
             }
         } catch (Exception e) {
-            log.error("⚠️ tool-categories 初始化失败（工具分类将降级）: " + e.getMessage());
+            log.error("⚠️ tool-categories 初始化失败");
         }
     }
 
     /**
-     * 同步工具分类到 Qdrant（启动时 / 工具变化时调用）。
+     * 同步工具分类到 Qdrant — AI 生成 3 层树形分类。
      *
-     * <p>收集所有 ToolCallback 的 name + description → AI 分组归类 → 逐条写入 Qdrant。
-     * 每个分类作为独立 point，向量 = 分类描述的 embedding。支持交叉分类（同一工具可出现在多个分类中）。</p>
-     *
-     * @param allTools 所有可用工具（MCP + 本地 + 生成的）
-     * @param force true=强制刷新（新工具生成时），false=有缓存则跳过（启动时）
-     * @return 分类数量（失败返回 0，跳过返回 -1）
+     * @param allTools 所有可用工具
+     * @param force    true=强制刷新
+     * @return 分类节点数
      */
     public int syncCategories(ToolCallback[] allTools, boolean force) {
         if (allTools == null || allTools.length == 0) return 0;
-
-        // 兜底确保集合已创建（@PostConstruct 可能因 Qdrant 未就绪而静默失败）
         ensureCollection();
 
-        // 非强制模式：已有分类缓存则跳过
         if (!force && hasCategories()) {
             log.info("📦 工具分类已缓存，跳过 AI 同步");
             return -1;
         }
 
         try {
-            // 构建工具列表字符串供 AI 分类
             StringBuilder toolList = new StringBuilder();
             for (ToolCallback tc : allTools) {
                 toolList.append("- ").append(tc.getToolDefinition().name());
@@ -147,94 +131,337 @@ public class ToolCategoryService {
 
             String prompt = promptLoader.getToolCategorySync().formatted(toolList);
 
-            log.info("{}🔄 工具分类同步: {} 个工具 → AI 分组...{}", "\u001b[36m", allTools.length, "\u001b[0m");
-            String response = modelRouter.normal().prompt().user(prompt).call().content();
+            if (!modelRouter.isCloudAvailable()) {
+                log.warn("☁️ 云端 AI 未配置，跳过工具分类同步");
+                return 0;
+            }
+
+            log.info("☁️ 工具分类同步: {} 个工具 → DeepSeek 生成树形分类...", allTools.length);
+            String response = modelRouter.cloudOnly().prompt().user(prompt).call().content();
             if (response == null || response.isBlank()) return 0;
 
             String json = AiResponseUtils.stripMarkdownCodeBlock(response);
+            List<Map<String, Object>> tree = objectMapper.readValue(json,
+                    new TypeReference<List<Map<String, Object>>>() {});
 
-            List<Map<String, Object>> categories =
-                    objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
-
-            // 分类过多则精简合并
-            if (categories.size() > 20) {
-                log.info("📦 分类数量 {} > 20，触发精简合并...", categories.size());
-                categories = consolidateCategories(categories, toolList.toString());
+            // 精简合并
+            if (tree.size() > 15) {
+                log.info("📦 L1 分类数量 {} > 15，触发精简合并...", tree.size());
+                tree = consolidateCategories(tree, toolList.toString());
             }
 
             long version = System.currentTimeMillis();
-
-            // 先构建所有新 points，一次性写入，成功后再删旧版本
-            // （防止先删后写时中途失败导致分类为空）
-            Map<String, Object> upsertBody = new LinkedHashMap<>();
+            Set<String> existingTools = collectExistingToolNames(allTools);
             List<Map<String, Object>> points = new ArrayList<>();
-            int count = 0;
-
-            for (Map<String, Object> cat : categories) {
-                String name = String.valueOf(cat.get("name"));
-                String desc = String.valueOf(cat.getOrDefault("desc", name));
-
-                @SuppressWarnings("unchecked")
-                List<String> tools = (List<String>) cat.getOrDefault("tools", List.of());
-
-                // 过滤：只保留实际存在的工具名
-                Set<String> existingTools = collectExistingToolNames(allTools);
-                List<String> validTools = new ArrayList<>();
-                for (String t : tools) {
-                    if (existingTools.contains(t)) validTools.add(t);
-                }
-                if (validTools.isEmpty()) continue;
-
-                // 生成 embedding
-                String categoryText = name + ": " + desc;
-                List<Float> vector = embeddingService.embed(categoryText);
-
-                String categoryId = UUID.randomUUID().toString();
-                Map<String, Object> payload = new LinkedHashMap<>();
-                payload.put("id", categoryId);
-                payload.put("name", name);
-                payload.put("description", desc);
-                payload.put("tools", validTools);
-                payload.put("toolCount", validTools.size());
-                payload.put("version", version);
-
-                Map<String, Object> point = new LinkedHashMap<>();
-                point.put("id", categoryId);
-                point.put("vector", vector);
-                point.put("payload", payload);
-                points.add(point);
-                count++;
-            }
+            int nodeCount = flattenTree(tree, "root", 1, existingTools, points, version);
 
             if (points.isEmpty()) return 0;
 
-            // 批量 upsert 所有新分类
-            upsertBody.put("points", points);
+            Map<String, Object> upsertBody = Map.of("points", points);
             upsertBatch(upsertBody);
 
-            // 新分类全部写成功后，再删除旧版本
-            deleteAllCategoryPoints();
-
             this.lastSyncVersion = version;
-            log.info("✅ 工具分类同步完成: " + count + " 类, "
-                    + allTools.length + " 个工具");
-            return count;
+            log.info("✅ 工具分类同步完成: {} 个树节点, {} 个工具", nodeCount, allTools.length);
+            return nodeCount;
 
         } catch (Exception e) {
-            log.error("❌ 工具分类同步失败: " + e.getMessage());
+            log.error("❌ 工具分类同步失败: {}", e.getMessage());
             return 0;
         }
     }
 
     /**
-     * 向量搜索最匹配的分类（AI 规划阶段调用）。
+     * 将 AI 返回的树形 JSON 展平为 Qdrant points。
      *
-     * <p>embed(userInput) → 搜索 tool-categories → 返回 top-K 分类及工具列表（去重）。</p>
-     *
-     * @param userInput 用户自然语言输入
-     * @param topK      返回几个分类
-     * @param minScore  最小相似度阈值（0-1）
-     * @return 匹配结果列表；Qdrant 故障时返回空列表（调用方降级到硬编码兜底）
+     * @param nodes        当前层级节点列表
+     * @param parentId     父节点 id
+     * @param level         当前层级 (1=L1, 2=L2, 3=L3工具层)
+     * @param existingTools 所有工具名集合（验证用）
+     * @param points        收集的 point 列表
+     * @param version       同步版本号
+     * @return 本层及子层的节点数
+     */
+    @SuppressWarnings("unchecked")
+    private int flattenTree(List<Map<String, Object>> nodes, String parentId, int level,
+                              Set<String> existingTools, List<Map<String, Object>> points, long version) {
+        int count = 0;
+        for (Map<String, Object> node : nodes) {
+            String id = String.valueOf(node.getOrDefault("id", UUID.randomUUID().toString()));
+            String name = String.valueOf(node.get("name"));
+            String desc = String.valueOf(node.getOrDefault("desc", name));
+            List<String> tools = new ArrayList<>();
+
+            // 本层是否有直接工具列表
+            List<String> directTools = (List<String>) node.get("tools");
+            if (directTools != null) {
+                for (String t : directTools) {
+                    if (existingTools.contains(t)) tools.add(t);
+                }
+            }
+
+            // 处理子节点
+            List<Map<String, Object>> children = (List<Map<String, Object>>) node.get("children");
+            List<String> childIds = new ArrayList<>();
+            int childTools = 0;
+            if (children != null && !children.isEmpty()) {
+                int childCount = flattenTree(children, id, level + 1, existingTools, points, version);
+                // 收集子节点 id 和工具
+                for (Map<String, Object> c : children) {
+                    childIds.add(String.valueOf(c.getOrDefault("id", "")));
+                    List<String> ct = (List<String>) c.get("tools");
+                    if (ct != null) {
+                        for (String t : ct) {
+                            if (existingTools.contains(t) && !tools.contains(t)) tools.add(t);
+                        }
+                    }
+                    // 如果子节点还有子节点，也需要收集
+                    childTools += collectAllTools(c, existingTools, tools);
+                }
+            }
+
+            // 构建 point
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("id", id);
+            payload.put("name", name);
+            payload.put("description", desc);
+            payload.put("parentId", parentId);
+            payload.put("level", level);
+            payload.put("tools", tools);
+            payload.put("toolCount", tools.size());
+            payload.put("childIds", childIds);
+            payload.put("version", version);
+
+            String categoryText = name + ": " + desc;
+            List<Float> vector = embeddingService.embed(categoryText);
+
+            Map<String, Object> point = new LinkedHashMap<>();
+            point.put("id", UUID.nameUUIDFromBytes((parentId + "/" + id).getBytes(StandardCharsets.UTF_8)));
+            point.put("vector", vector);
+            point.put("payload", payload);
+            points.add(point);
+            count++;
+
+            // 更新原节点 id 字段，供父节点收集
+            node.put("_resolvedId", id);
+            node.put("_allTools", tools);
+        }
+        return count;
+    }
+
+    /** 递归收集子树中所有工具 */
+    @SuppressWarnings("unchecked")
+    private int collectAllTools(Map<String, Object> node, Set<String> existingTools, List<String> collector) {
+        int added = 0;
+        List<String> tools = (List<String>) node.get("tools");
+        if (tools != null) {
+            for (String t : tools) {
+                if (existingTools.contains(t) && !collector.contains(t)) {
+                    collector.add(t);
+                    added++;
+                }
+            }
+        }
+        List<Map<String, Object>> children = (List<Map<String, Object>>) node.get("children");
+        if (children != null) {
+            for (Map<String, Object> child : children) {
+                added += collectAllTools(child, existingTools, collector);
+            }
+        }
+        return added;
+    }
+
+    /**
+     * 精简合并分类树（L1 > 15 时触发）。
+     */
+    private List<Map<String, Object>> consolidateCategories(
+            List<Map<String, Object>> tree, String toolList) {
+        try {
+            StringBuilder catList = new StringBuilder();
+            for (Map<String, Object> node : tree) {
+                catList.append("- ").append(node.get("name"))
+                        .append(": ").append(node.getOrDefault("desc", ""))
+                        .append(" (L1)\n");
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> children = (List<Map<String, Object>>) node.get("children");
+                if (children != null) {
+                    for (Map<String, Object> child : children) {
+                        catList.append("    - ").append(child.get("name"))
+                                .append(": ").append(child.getOrDefault("desc", ""))
+                                .append(" → tools=").append(child.getOrDefault("tools", "[]"))
+                                .append("\n");
+                    }
+                } else {
+                    catList.append("    → tools=").append(node.getOrDefault("tools", "[]")).append("\n");
+                }
+            }
+            String prompt = promptLoader.getCategoryConsolidation().formatted(catList, toolList);
+            if (!modelRouter.isCloudAvailable()) return tree;
+            String response = modelRouter.cloudOnly().prompt().user(prompt).call().content();
+            if (response == null || response.isBlank()) return tree;
+
+            String json = AiResponseUtils.stripMarkdownCodeBlock(response);
+            List<Map<String, Object>> merged = objectMapper.readValue(json,
+                    new TypeReference<List<Map<String, Object>>>() {});
+            if (merged == null || merged.isEmpty()) return tree;
+
+            log.info("📦 精简后: {} → {} L1类", tree.size(), merged.size());
+            return merged;
+        } catch (Exception e) {
+            log.warn("⚠️ 分类精简失败: {}", e.getMessage());
+            return tree;
+        }
+    }
+
+    /**
+     * 构建分类树文本（供 AI prompt 展示）。
+     */
+    public String buildCategoryTreeText() {
+        List<CategorySummary> all = listAllCategories();
+        if (all.isEmpty()) return "（分类数据未就绪）";
+
+        // 先建索引：id → summary
+        Map<String, CategorySummary> index = new LinkedHashMap<>();
+        for (CategorySummary s : all) index.put(s.id(), s);
+
+        StringBuilder sb = new StringBuilder();
+        int l1Idx = 0;
+
+        // 先输出 L1
+        for (CategorySummary s : all) {
+            if (s.level() != 1) continue;
+            l1Idx++;
+            sb.append(String.format("%d. 【%s】(%d个工具) - %s\n",
+                    l1Idx, s.name(), s.toolCount(), s.description()));
+
+            // L2 子类
+            int l2Idx = 0;
+            for (CategorySummary s2 : all) {
+                if (s2.level() != 2 || !s.id().equals(s2.parentId())) continue;
+                l2Idx++;
+                List<String> tools = s2.toolNames();
+                if (tools == null || tools.isEmpty()) continue;
+                sb.append(String.format("  %d.%d %s - %s [%d个工具] ",
+                        l1Idx, l2Idx, s2.name(), s2.description(), tools.size()));
+                // 工具名简写（最多显示15个）
+                int show = Math.min(tools.size(), 15);
+                for (int i = 0; i < show; i++) {
+                    sb.append(tools.get(i));
+                    if (i < show - 1) sb.append(" ");
+                }
+                if (tools.size() > 15) sb.append(" ...");
+                sb.append("\n");
+            }
+
+            // L1 下无 L2 → 直接在 L1 下列出工具
+            if (l2Idx == 0) {
+                List<String> tools = s.toolNames();
+                if (tools != null && !tools.isEmpty()) {
+                    sb.append("  → ");
+                    int show = Math.min(tools.size(), 20);
+                    for (int i = 0; i < show; i++) {
+                        sb.append(tools.get(i));
+                        if (i < show - 1) sb.append(" ");
+                    }
+                    if (tools.size() > 20) sb.append(" ...");
+                    sb.append("\n");
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 从 Qdrant 拉取全量分类（展平列表，含 parentId + level）。
+     */
+    public List<CategorySummary> listAllCategories() {
+        try {
+            List<Map<String, Object>> allPoints = new ArrayList<>();
+            String nextOffset = null;
+
+            do {
+                Map<String, Object> scrollBody = new LinkedHashMap<>();
+                scrollBody.put("limit", 100);
+                scrollBody.put("with_payload", true);
+                if (nextOffset != null) scrollBody.put("offset", nextOffset);
+
+                @SuppressWarnings("unchecked")
+                Map<String, Object> response = qdrant.post()
+                        .uri("/collections/" + collectionName + "/points/scroll")
+                        .header("Content-Type", "application/json")
+                        .bodyValue(scrollBody)
+                        .retrieve()
+                        .bodyToMono(Map.class)
+                        .block();
+
+                if (response == null) break;
+
+                @SuppressWarnings("unchecked")
+                Map<String, Object> result = (Map<String, Object>) response.get("result");
+                if (result == null) break;
+
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> pts = (List<Map<String, Object>>) result.getOrDefault("points", List.of());
+                allPoints.addAll(pts);
+
+                Object offsetObj = result.get("next_page_offset");
+                nextOffset = (offsetObj != null && !offsetObj.toString().isEmpty()) ? offsetObj.toString() : null;
+            } while (nextOffset != null);
+
+            if (allPoints.isEmpty()) return List.of();
+
+            List<CategorySummary> summaries = new ArrayList<>();
+            for (Map<String, Object> point : allPoints) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+                if (payload == null) continue;
+
+                String id = String.valueOf(payload.get("id"));
+                String name = String.valueOf(payload.get("name"));
+                String desc = String.valueOf(payload.getOrDefault("description", name));
+                String parentId = String.valueOf(payload.getOrDefault("parentId", "root"));
+                int level = ((Number) payload.getOrDefault("level", 1)).intValue();
+                int toolCount = ((Number) payload.getOrDefault("toolCount", 0)).intValue();
+                @SuppressWarnings("unchecked")
+                List<String> tools = (List<String>) payload.getOrDefault("tools", List.of());
+                @SuppressWarnings("unchecked")
+                List<String> childIds = (List<String>) payload.getOrDefault("childIds", List.of());
+
+                summaries.add(new CategorySummary(id, name, desc, parentId, level, toolCount, tools, childIds));
+            }
+
+            summaries.sort(Comparator.comparingInt(CategorySummary::level)
+                    .thenComparing(CategorySummary::name));
+            return summaries;
+
+        } catch (Exception e) {
+            log.error("❌ 全量分类拉取失败: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * 查直接子节点（供树形导航）。
+     */
+    public List<CategorySummary> getChildren(String parentId) {
+        return listAllCategories().stream()
+                .filter(s -> parentId.equals(s.parentId()))
+                .toList();
+    }
+
+    /**
+     * 根据分类名查找分类详情（模糊匹配，忽略大小写和空格）。
+     */
+    public Optional<CategorySummary> findByName(String name) {
+        String key = name.toLowerCase().trim();
+        return listAllCategories().stream()
+                .filter(s -> s.name().toLowerCase().trim().equals(key)
+                        || s.name().contains(name)
+                        || name.contains(s.name()))
+                .findFirst();
+    }
+
+    /**
+     * 向量搜索最匹配的分类。
      */
     public List<CategoryMatch> searchCategories(String userInput, int topK, double minScore) {
         try {
@@ -263,8 +490,6 @@ public class ToolCategoryService {
             if (points.isEmpty()) return List.of();
 
             List<CategoryMatch> results = new ArrayList<>();
-            Set<String> dedupTools = new LinkedHashSet<>();
-
             for (Map<String, Object> point : points) {
                 @SuppressWarnings("unchecked")
                 Map<String, Object> payload = (Map<String, Object>) point.get("payload");
@@ -272,77 +497,25 @@ public class ToolCategoryService {
 
                 String name = String.valueOf(payload.get("name"));
                 String desc = String.valueOf(payload.getOrDefault("description", name));
+                String parentId = String.valueOf(payload.getOrDefault("parentId", "root"));
+                int level = ((Number) payload.getOrDefault("level", 1)).intValue();
                 @SuppressWarnings("unchecked")
                 List<String> tools = (List<String>) payload.getOrDefault("tools", List.of());
                 double score = ((Number) point.getOrDefault("score", 0.0)).doubleValue();
 
-                results.add(new CategoryMatch(name, desc, tools, score));
-                dedupTools.addAll(tools);
+                results.add(new CategoryMatch(name, desc, parentId, level, tools, score));
             }
 
             results.sort((a, b) -> Double.compare(b.score(), a.score()));
-            int totalUnique = dedupTools.size();
-            log.info("🔍 向量分类匹配: " + results.size() + " 类 → "
-                    + totalUnique + " 个工具");
             return results;
 
         } catch (Exception e) {
-            log.error("❌ 工具分类搜索失败: " + e.getMessage());
+            log.error("❌ 工具分类搜索失败: {}", e.getMessage());
             return List.of();
         }
     }
 
-    // ========== 内部工具方法 ==========
-
-    /**
-     * 删除所有分类 points（同步前清理旧数据）。
-     * 使用 Qdrant delete 按 filter 删除所有匹配 points。
-     */
-    private void deleteAllCategoryPoints() {
-        try {
-            Map<String, Object> deleteBody = new LinkedHashMap<>();
-            deleteBody.put("filter", Map.of());
-            qdrant.post()
-                    .uri("/collections/" + collectionName + "/points/delete?wait=true")
-                    .header("Content-Type", "application/json")
-                    .bodyValue(deleteBody)
-                    .retrieve()
-                    .toBodilessEntity()
-                    .block();
-        } catch (Exception e) {
-            log.error("⚠️ 清理旧分类失败: " + e.getMessage());
-        }
-    }
-
-    /**
-     * 分类过多时用 AI 精简合并为不超过 15 个粗粒度分类。
-     */
-    private List<Map<String, Object>> consolidateCategories(
-            List<Map<String, Object>> categories, String toolList) {
-        try {
-            StringBuilder catList = new StringBuilder();
-            for (Map<String, Object> cat : categories) {
-                catList.append("- ").append(cat.get("name"))
-                        .append(": ").append(cat.getOrDefault("desc", ""))
-                        .append(" → 工具: ").append(cat.getOrDefault("tools", "[]"))
-                        .append("\n");
-            }
-            String prompt = promptLoader.getCategoryConsolidation().formatted(catList, toolList);
-            String response = modelRouter.normal().prompt().user(prompt).call().content();
-            if (response == null || response.isBlank()) return categories;
-
-            String json = AiResponseUtils.stripMarkdownCodeBlock(response);
-            List<Map<String, Object>> merged =
-                    objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
-            if (merged == null || merged.isEmpty()) return categories;
-
-            log.info("📦 精简后: {} → {} 类", categories.size(), merged.size());
-            return merged;
-        } catch (Exception e) {
-            log.warn("⚠️ 分类精简失败，使用原始分类: {}", e.getMessage());
-            return categories;
-        }
-    }
+    // ========== 内部工具 ==========
 
     private boolean hasCategories() {
         try {
@@ -373,7 +546,7 @@ public class ToolCategoryService {
                     .toBodilessEntity()
                     .block();
         } catch (Exception e) {
-            log.error("❌ tool-categories 批量 upsert 失败: " + e.getMessage());
+            log.error("❌ tool-categories 批量 upsert 失败: {}", e.getMessage());
         }
     }
 
@@ -387,18 +560,35 @@ public class ToolCategoryService {
 
     // ========== 内部类型 ==========
 
-    /**
-     * 分类匹配结果。
-     *
-     * @param name        分类名称
-     * @param description 分类描述
-     * @param tools       该分类下的工具名列表
-     * @param score       向量相似度分数
-     */
     public record CategoryMatch(
             String name,
             String description,
+            String parentId,
+            int level,
             List<String> tools,
             double score
+    ) {}
+
+    /**
+     * 分类摘要（树节点）。
+     *
+     * @param id          唯一标识
+     * @param name        分类名称（中文 2-6字）
+     * @param description 简短描述（一句话说明能做什么）
+     * @param parentId    父节点 id，L1 为 "root"
+     * @param level       层级 (1=L1大类, 2=L2子类)
+     * @param toolCount   该类下工具数（含所有子孙）
+     * @param toolNames   直接挂在该类下的工具名（叶子节点）
+     * @param childIds    子分类 id 列表（非叶子节点）
+     */
+    public record CategorySummary(
+            String id,
+            String name,
+            String description,
+            String parentId,
+            int level,
+            int toolCount,
+            List<String> toolNames,
+            List<String> childIds
     ) {}
 }

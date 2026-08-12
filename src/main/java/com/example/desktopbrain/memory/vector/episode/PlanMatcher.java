@@ -6,6 +6,7 @@ import com.example.desktopbrain.config.ModelRouter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
 import java.util.Collections;
@@ -71,6 +72,16 @@ public class PlanMatcher {
      * @return 匹配结果；AI 调用失败时返回 notApplicable（降级到新规划）
      */
     public MatchResult match(String userInput, Episode episode) {
+        return match(userInput, episode, modelRouter.chat());
+    }
+
+    /** 使用指定 ChatClient 判断（探索模式走云端时传入 cloudOnly 客户端） */
+    public MatchResult match(String userInput, Episode episode, ChatClient client) {
+        if (client == null) return match(userInput, episode);
+        return doMatch(userInput, episode, client);
+    }
+
+    private MatchResult doMatch(String userInput, Episode episode, ChatClient client) {
         if (episode.toolCalls() == null || episode.toolCalls().isEmpty()) {
             return MatchResult.notApplicable("计划没有可执行步骤");
         }
@@ -105,7 +116,7 @@ public class PlanMatcher {
                 .formatted(stripPii(userInput), episode.userInput(), stepsDesc, varList);
 
         try {
-            String response = modelRouter.normal().prompt().user(prompt).call().content();
+            String response = client.prompt().user(prompt).call().content();
             return parseMatchResult(response);
         } catch (Exception e) {
             log.error("⚠️ PlanMatcher AI 判断失败: {}", e.getMessage());

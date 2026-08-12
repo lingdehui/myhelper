@@ -4,6 +4,7 @@ import com.example.desktopbrain.common.AiResponseUtils;
 import com.example.desktopbrain.common.HaApiPaths;
 import com.example.desktopbrain.common.QdrantFields;
 import com.example.desktopbrain.config.SystemEnvironmentService;
+import com.example.desktopbrain.config.ModelRouter;
 import com.example.desktopbrain.memory.graph.FailurePatternNode;
 import com.example.desktopbrain.memory.graph.FailurePatternRepository;
 import com.example.desktopbrain.memory.vector.EmbeddingService;
@@ -353,7 +354,7 @@ public class EpisodeCacheService {
                 // AI 提取变量签名 + 模板化 toolCalls（用户设计：args 具体值→$varName）
                 // 失败时 fallback 原样保留，不影响主流程
                 ReflectService.SignatureExtraction extraction =
-                        reflectService.extractSignature(ep.userInput(), toolCalls);
+                        reflectService.extractSignature(ModelRouter.Mode.NORMAL, ep.userInput(), toolCalls);
                 List<ToolCallLog> templatedToolCalls = extraction.templatedToolCalls();
                 Map<String, String> signature = extraction.signature();
 
@@ -518,6 +519,38 @@ public class EpisodeCacheService {
                         canScript ? ", 🚀可脚本化" : "");
             } catch (Exception e) {
                 log.error("❌ Episode 成功计数更新失败", e);
+            }
+        });
+    }
+
+    /** 探索优化计数+1（异步更新 Qdrant） */
+    public void incrementOptimizeCount(String episodeId) {
+        if (episodeId == null) return;
+        CompletableFuture.runAsync(() -> {
+            try {
+                Optional<Episode> current = fetchEpisode(episodeId);
+                if (current.isEmpty()) return;
+                int newCount = current.get().exploreOptimizeCount() + 1;
+                setPayload(episodeId, Map.of("exploreOptimizeCount", newCount));
+                log.info("📝 Episode 优化+1（id={}..., count={}）", episodeId.substring(0, 8), newCount);
+            } catch (Exception e) {
+                log.error("❌ Episode 优化计数更新失败", e);
+            }
+        });
+    }
+
+    /** 探索调试计数+1（异步更新 Qdrant） */
+    public void incrementDebugCount(String episodeId) {
+        if (episodeId == null) return;
+        CompletableFuture.runAsync(() -> {
+            try {
+                Optional<Episode> current = fetchEpisode(episodeId);
+                if (current.isEmpty()) return;
+                int newCount = current.get().exploreDebugCount() + 1;
+                setPayload(episodeId, Map.of("exploreDebugCount", newCount));
+                log.info("🔧 Episode 调试+1（id={}..., count={}）", episodeId.substring(0, 8), newCount);
+            } catch (Exception e) {
+                log.error("❌ Episode 调试计数更新失败", e);
             }
         });
     }

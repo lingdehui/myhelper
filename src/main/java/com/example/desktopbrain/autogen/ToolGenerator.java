@@ -65,7 +65,7 @@ public class ToolGenerator {
                 .formatted(envService.getOsInfo(), toolDescription);
 
         try {
-            String source = modelRouter.normal().prompt().user(prompt).call().content();
+            String source = modelRouter.chat().prompt().user(prompt).call().content();
             if (source == null || source.isBlank()) return null;
 
             // 去掉可能的 markdown 代码块标记

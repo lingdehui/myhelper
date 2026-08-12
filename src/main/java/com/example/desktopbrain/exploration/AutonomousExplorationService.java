@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.example.desktopbrain.config.ModelRouter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -48,7 +49,11 @@ public class AutonomousExplorationService {
 
     /** 重复目标黑名单：目标（标准化）→ 连续失败次数，≥2次不再作为候选 */
     private final Map<String, Integer> failedGoalCounts = new java.util.LinkedHashMap<>();
+    /** 黑名单条目记录时间（epoch ms），用于 30 分钟过期 */
+    private final Map<String, Long> goalFailedAt = new java.util.LinkedHashMap<>();
     private static final int BLACKLIST_THRESHOLD = 2;
+    /** 黑名单过期时间：30 分钟 */
+    private static final long BLACKLIST_TTL_MS = 30 * 60 * 1000;
 
     public AutonomousExplorationService(IdleDetectionService idleDetection,
                                          EpisodeCacheService episodeCache,
@@ -119,8 +124,8 @@ public class AutonomousExplorationService {
                 List<EpisodeCacheService.AttemptedTopic> attemptedTopics =
                         episodeCache.getRecentlyAttemptedTopics(20);
 
-                // 0.5 P0-1: 构建失败目标黑名单（同一目标 FAILED ≥2次 → 跳过）
-                Map<String, Integer> blacklisted = buildBlacklist(attemptedTopics);
+                // 0.5 P0-1: 构建失败目标黑名单（同一目标 FAILED ≥2次 → 跳过，但已有 ACTIVE 的不拉黑）
+                Map<String, Integer> blacklisted = buildBlacklist(attemptedTopics, learnedTopics);
 
                 // 1. 收集上下文（传入黑名单用于过滤候选）
                 String context = buildContext(learnedTopics, attemptedTopics, blacklisted);
@@ -164,10 +169,12 @@ public class AutonomousExplorationService {
                 // 3.6 P0-1: 记录本次目标（用于后续黑名单判断）
                 String normalizedGoal = normalizeGoal(decision.learningGoal());
                 failedGoalCounts.merge(normalizedGoal, 1, Integer::sum);
+                goalFailedAt.put(normalizedGoal, System.currentTimeMillis());  // 每次失败刷新过期时间
                 // 清理旧条目（只保留最近 50 个）
                 if (failedGoalCounts.size() > 50) {
                     String first = failedGoalCounts.keySet().iterator().next();
                     failedGoalCounts.remove(first);
+                    goalFailedAt.remove(first);
                 }
 
                 // 4. 将学习目标送入主流程管线（TurnProcessor），复用 Plan→Execute→Reflect→Store
@@ -548,22 +555,46 @@ public class AutonomousExplorationService {
 
     // ========== P0-1: 黑名单机制 ==========
 
-    /** 从最近尝试主题构建黑名单：同一目标 FAILED ≥2次 → 列入 */
-    private Map<String, Integer> buildBlacklist(List<EpisodeCacheService.AttemptedTopic> attemptedTopics) {
+    /** 从最近尝试主题构建黑名单：同一目标 FAILED ≥2次 → 列入。已有 ACTIVE 经验的目标不拉黑。超过 30 分钟自动过期。 */
+    private Map<String, Integer> buildBlacklist(List<EpisodeCacheService.AttemptedTopic> attemptedTopics,
+                                                 List<EpisodeCacheService.LearnedTopic> learnedTopics) {
         Map<String, Integer> blacklisted = new LinkedHashMap<>();
+        long now = System.currentTimeMillis();
         if (attemptedTopics == null || attemptedTopics.isEmpty()) return blacklisted;
+
+        // 先收集已掌握的目标（ACTIVE），这些不拉黑
+        Set<String> masteredGoals = new LinkedHashSet<>();
+        if (learnedTopics != null) {
+            for (EpisodeCacheService.LearnedTopic lt : learnedTopics) {
+                String normalized = normalizeGoal(lt.goal());
+                if (!normalized.isBlank()) masteredGoals.add(normalized);
+            }
+        }
 
         for (EpisodeCacheService.AttemptedTopic t : attemptedTopics) {
             if (!"FAILED".equalsIgnoreCase(t.status())) continue;
             String key = normalizeGoal(t.goal());
+            if (key.isBlank()) continue;
+
+            // 已有 ACTIVE 成功经验 → 不拉黑
+            if (masteredGoals.contains(key)) {
+                log.debug("🛡️ 不拉黑 '{}'（已有 ACTIVE 成功经验）", t.goal());
+                continue;
+            }
+
             int count = blacklisted.merge(key, 1, Integer::sum);
             if (count >= BLACKLIST_THRESHOLD) {
                 log.debug("⛔ 黑名单: {}（FAILED {}次）", t.goal(), count);
             }
         }
-        // 合并内存中的 failedGoalCounts
+        // 合并内存中的 failedGoalCounts（30 分钟过期）
         for (var entry : failedGoalCounts.entrySet()) {
-            blacklisted.merge(entry.getKey(), entry.getValue(), Integer::sum);
+            String key = entry.getKey();
+            Long recordedAt = goalFailedAt.get(key);
+            if (recordedAt != null && (now - recordedAt) > BLACKLIST_TTL_MS) {
+                continue; // 已过期，跳过
+            }
+            blacklisted.merge(key, entry.getValue(), Integer::sum);
         }
         return blacklisted;
     }
@@ -637,10 +668,15 @@ public class AutonomousExplorationService {
         return sb.toString();
     }
 
-    /** 调用小模型做探索决策 */
+    /** 获取探索用 ChatClient — 统一走 ModelRouter */
+    private ChatClient explorationClient() {
+        return modelRouter.chat(ModelRouter.Mode.EXPLORATION);
+    }
+
+    /** 调用模型做探索决策 */
     private ExplorationDecision decide(String context) {
         try {
-            String response = modelRouter.exploration().prompt()
+            String response = explorationClient().prompt()
                     .user(context)
                     .call()
                     .content();

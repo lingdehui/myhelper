@@ -23,7 +23,8 @@ public record DesktopBrainProperties(
         Voiceprint voiceprint,
         Vad vad,
         Execution execution,
-        MemoryMaintenance memoryMaintenance
+        MemoryMaintenance memoryMaintenance,
+        String normalModel
 ) {
 
     /** 语音交互参数 */
@@ -72,7 +73,9 @@ public record DesktopBrainProperties(
             int maxCacheSize,
             int failureThreshold,
             List<String> fallbackTools,
-            List<String> alwaysAppendTools
+            List<String> alwaysAppendTools,
+            boolean forceCategorySync,
+            int maxCategoryRounds
     ) {}
 
     /** 执行校验参数 */
@@ -97,6 +100,7 @@ public record DesktopBrainProperties(
     /** 自主探索引擎参数（模型 2: DeepSeek 云端备用） */
     public record Exploration(
             boolean enabled,
+            String explorationModel,
             int idleThresholdMinutes,
             int maxDurationMinutes,
             List<Integer> blackoutHours,

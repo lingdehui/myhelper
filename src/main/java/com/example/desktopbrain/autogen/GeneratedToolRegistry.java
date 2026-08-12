@@ -1,6 +1,8 @@
 package com.example.desktopbrain.autogen;
 
 import com.example.desktopbrain.config.SystemEnvironmentService;
+import com.example.desktopbrain.registry.ToolModel;
+import com.example.desktopbrain.registry.ToolRegistry;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,6 +52,7 @@ public class GeneratedToolRegistry {
     private final ToolCompiler toolCompiler;
     private final ApplicationContext applicationContext;
     private final SystemEnvironmentService envService;
+    private final ToolRegistry toolRegistry;
 
     /** 当前环境标识符（如 windows-amd64） */
     private final String environmentKey;
@@ -83,11 +86,13 @@ public class GeneratedToolRegistry {
 
     public GeneratedToolRegistry(ToolGenerator toolGenerator, ToolCompiler toolCompiler,
                                    ApplicationContext applicationContext,
-                                   SystemEnvironmentService envService) {
+                                   SystemEnvironmentService envService,
+                                   ToolRegistry toolRegistry) {
         this.toolGenerator = toolGenerator;
         this.toolCompiler = toolCompiler;
         this.applicationContext = applicationContext;
         this.envService = envService;
+        this.toolRegistry = toolRegistry;
         this.environmentKey = envService.getEnvironmentKey();
     }
 
@@ -188,6 +193,11 @@ public class GeneratedToolRegistry {
 
                 // ===== 运行时动态加载（即时生效，无需重启）=====
                 boolean runtimeLoaded = loadAtRuntime(generated.sourceCode(), generated.className());
+
+                // ===== 同步写入统一注册表（Neo4j + Qdrant）=====
+                if (runtimeLoaded) {
+                    syncToRegistry(dynamicTools, generated.className(), description);
+                }
 
                 String msg = "已生成新工具 " + generated.className()
                         + (runtimeLoaded ? "（已即时生效）" : "（重启后生效）");
@@ -301,7 +311,9 @@ public class GeneratedToolRegistry {
                 Path classFile = Path.of(ToolCompiler.GENERATED_CLASSES_DIR, className + ".class");
                 Files.deleteIfExists(classFile);
             } catch (Exception ignored) {}
-            log.info("🗑️ 已删除生成工具: {}（源码+运行时均已移除）", className);
+            // 6. 同步废弃统一注册表记录
+            deprecateFromRegistry(className);
+            log.info("🗑️ 已删除生成工具: {}（源码+运行时+注册表均已移除）", className);
             return true;
         } catch (Exception e) {
             log.error("❌ 删除生成工具失败", e);
@@ -377,5 +389,81 @@ public class GeneratedToolRegistry {
                 "@Tool\\s*\\(\\s*description\\s*=\\s*\"([^\"]+)\"");
         java.util.regex.Matcher m = p.matcher(source);
         return m.find() ? m.group(1) : null;
+    }
+
+    // ==================== 与统一注册表同步 ====================
+
+    /**
+     * 新生成的工具同步写入 ToolRegistry（Neo4j + Qdrant）。
+     * 从动态加载的 ToolCallback 提取元数据构建 ToolModel。
+     */
+    private void syncToRegistry(List<ToolCallback> dynamicTools, String className, String description) {
+        try {
+            for (ToolCallback tc : dynamicTools) {
+                // 只处理本次生成的工具
+                String toolName = tc.getToolDefinition().name();
+                if (!toolName.equals(className) && !toolName.startsWith(className + "_")) continue;
+
+                List<ToolModel.ParamInfo> params = extractParams(tc);
+                String id = "GENERATED:" + className + ":" + toolName;
+                ToolModel model = ToolModel.of(id, toolName,
+                        tc.getToolDefinition().description() != null ? tc.getToolDefinition().description() : description,
+                        "GENERATED", className, params, "String", List.of("GENERATED"), null);
+                toolRegistry.upsertTool(model);
+                log.info("  📦 新工具已注册: {} (GENERATED)", toolName);
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ 新工具同步注册表失败: {}", e.getMessage());
+        }
+    }
+
+    /** 删除工具时同步废弃注册表记录 */
+    private void deprecateFromRegistry(String className) {
+        try {
+            // 查找所有以 className 开头的工具 ID 并废弃
+            String prefix = "GENERATED:" + className + ":";
+            for (ToolModel m : toolRegistry.findAllActive()) {
+                if (m.id().startsWith(prefix)) {
+                    toolRegistry.deprecateTool(m.id());
+                    log.info("  🗑️ 注册表已废弃: {}", m.name());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ 废弃注册表记录失败: {}", e.getMessage());
+        }
+    }
+
+    /** 从 ToolCallback 提取参数列表（与 ToolSyncService 一致） */
+    private List<ToolModel.ParamInfo> extractParams(ToolCallback tc) {
+        List<ToolModel.ParamInfo> params = new ArrayList<>();
+        try {
+            java.lang.reflect.Method getDef = tc.getClass().getMethod("getToolDefinition");
+            Object def = getDef.invoke(tc);
+            try {
+                java.lang.reflect.Method schemaMethod = def.getClass().getMethod("inputSchema");
+                Object schema = schemaMethod.invoke(def);
+                if (schema instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> schemaMap = (Map<String, Object>) schema;
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> properties = (Map<String, Object>) schemaMap.get("properties");
+                    @SuppressWarnings("unchecked")
+                    List<String> required = (List<String>) schemaMap.get("required");
+                    if (properties != null) {
+                        java.util.Set<String> requiredSet = required != null ? new java.util.HashSet<>(required) : java.util.Set.of();
+                        for (Map.Entry<String, Object> entry : properties.entrySet()) {
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> propDef = (Map<String, Object>) entry.getValue();
+                            String propType = String.valueOf(propDef.getOrDefault("type", "string"));
+                            String propDesc = String.valueOf(propDef.getOrDefault("description", ""));
+                            params.add(new ToolModel.ParamInfo(
+                                    entry.getKey(), propType,
+                                    requiredSet.contains(entry.getKey()), propDesc));
+                        }
+                    }
+                }
+            } catch (NoSuchMethodException ignored) {}
+        } catch (Exception ignored) {}
+        return params;
     }
 }
