@@ -11,9 +11,9 @@
     </parent>
 
     <groupId>com.example</groupId>
-    <artifactId>desktop-brain</artifactId>
+    <artifactId>myhelper</artifactId>
     <version>1.0.0</version>
-    <name>desktop-brain</name>
+    <name>myhelper</name>
     <description>AI Desktop Assistant - Brain</description>
 
     <properties>

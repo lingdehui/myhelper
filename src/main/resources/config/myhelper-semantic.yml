@@ -1,0 +1,5 @@
+# ===== 语义匹配 =====
+myhelper:
+  semantic:
+    related-ratio-threshold: 0.3
+    voice-tone-filter-regex: "[嗯啊哦呢吧吗的了一]"

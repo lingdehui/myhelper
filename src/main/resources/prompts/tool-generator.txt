@@ -6,7 +6,7 @@
 功能描述: %s
 
 严格要求:
-1. 包名必须是: com.example.desktopbrain.generated
+1. 包名必须是: com.example.myhelper.generated
 2. 类名用大驼峰，见名知意，加 @Component 注解
 3. 工具方法加 @Tool(description="...") 注解，方法返回 String
 4. 参数加 @ToolParam(description="...") 注解

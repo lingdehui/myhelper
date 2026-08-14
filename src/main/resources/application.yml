@@ -6,11 +6,11 @@ spring:
       fail-on-unknown-properties: false
   config:
     import:
-      - classpath:config/desktopbrain-voice.yml
-      - classpath:config/desktopbrain-dialog.yml
-      - classpath:config/desktopbrain-tool.yml
-      - classpath:config/desktopbrain-semantic.yml
-      - classpath:config/desktopbrain-exploration.yml
+      - classpath:config/myhelper-voice.yml
+      - classpath:config/myhelper-dialog.yml
+      - classpath:config/myhelper-tool.yml
+      - classpath:config/myhelper-semantic.yml
+      - classpath:config/myhelper-exploration.yml
   ai:
     mcp:
       client:
@@ -43,7 +43,7 @@ qdrant:
     top-k: 3                          # 向量检索返回数量
 
 # ===== 双模型配置 =====
-desktopbrain:
+myhelper:
   normal-model: model2                # model1=本地Ollama优先(搞不定请教云端), model2=全程云端DeepSeek
   deepseek:                           # 模型 2: DeepSeek API（远程）
     base-url: https://api.deepseek.com

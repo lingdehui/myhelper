@@ -90,7 +90,7 @@
 ## 快速开始
 
 > **不想下载 18GB 本地模型？**  
-> 在 `application.yml` 中设置 `desktopbrain.exploration.enabled: false`，所有 AI 调用走 DeepSeek API，日常使用约 ¥1-2/天。
+> 在 `application.yml` 中设置 `myhelper.exploration.enabled: false`，所有 AI 调用走 DeepSeek API，日常使用约 ¥1-2/天。
 
 ```bash
 # 1. 启动基础设施 (Neo4j + Qdrant + Home Assistant)
