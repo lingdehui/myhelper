@@ -35,9 +35,9 @@ qdrant:
   port: 6333
   collection: desktop-memory
   episodes-collection: episodes      # Episode 经验学习集合（ExpeL/MUSE）
-  vector-size: 768
+  vector-size: 1024
   episode:                            # Episode 检索/淘汰参数
-    similarity-threshold: 0.65        # 向量相似度阈值（nomic-embed-text 中文短句推荐 0.65）
+    similarity-threshold: 0.65        # 向量相似度阈值（bge-m3 中文检索）
     stability-threshold: 0.6          # 稳定度阈值（success/(success+fail) >= 0.6 才复用）
     failure-threshold: 3              # 连续失败达此阈值自动归档
     top-k: 3                          # 向量检索返回数量
@@ -60,7 +60,7 @@ homeassistant:
 
 # ===== Ollama 嵌入模型 =====
 embedding:
-  model: nomic-embed-text
+  model: bge-m3
 
 logging:
   level:

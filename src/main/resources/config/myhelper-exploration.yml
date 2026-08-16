@@ -3,7 +3,7 @@ myhelper:
   exploration:
     enabled: true
     exploration-model: model2       # model1=本地qwen3:30b(搞不定请教云端), model2=全程云端DeepSeek, 不配置=默认本地
-    idle-threshold-minutes: 30       # TODO: 回头启用（当前跳过空闲检查，每分钟3并发）
+    idle-threshold-minutes: 30       # 空闲阈值：用户半小时没动电脑才开启探索
     max-duration-minutes: 15         # 单次探索最长耗时
     blackout-hours: []               # 留空=全天可探索
     base-url: http://localhost:11435/v1      # 模型1: 本地 Ollama（AutoDL RTX3090 SSH隧道）

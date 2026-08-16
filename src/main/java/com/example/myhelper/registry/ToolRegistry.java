@@ -6,6 +6,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
@@ -38,6 +39,9 @@ public class ToolRegistry {
 
     private final String collectionName;
 
+    @Value("${qdrant.vector-size:768}")
+    private int vectorSize;
+
     /** L1 内存缓存：toolId → ToolModel */
     private final Map<String, ToolModel> memoryCache = new ConcurrentHashMap<>();
 
@@ -69,7 +73,7 @@ public class ToolRegistry {
                     .retrieve().toBodilessEntity().map(r -> true).onErrorReturn(false).block();
             if (Boolean.FALSE.equals(exists)) {
                 String body = String.format(
-                        "{\"vectors\": {\"size\": 768, \"distance\": \"Cosine\"}}");
+                        "{\"vectors\": {\"size\": %d, \"distance\": \"Cosine\"}}", vectorSize);
                 qdrant.put().uri("/collections/" + collectionName)
                         .header("Content-Type", "application/json")
                         .bodyValue(body).retrieve().toBodilessEntity().block();
@@ -393,8 +397,15 @@ public class ToolRegistry {
     }
 
     private Map<String, Object> buildQdrantPoint(ToolModel m) {
-        String embedText = m.name() + "用于" + (m.description() != null ? m.description() : m.name());
-        List<Float> vector = embeddingService.embed(embedText);
+        // 中英文混合 embedding 文本：工具名 + 分类 + 描述（MCP 工具描述含中文检索关键词）
+        StringBuilder embed = new StringBuilder(m.name());
+        if (m.categories() != null && !m.categories().isEmpty()) {
+            embed.append(" 分类:").append(String.join(" ", m.categories()));
+        }
+        if (m.description() != null && !m.description().isBlank()) {
+            embed.append(" ").append(m.description());
+        }
+        List<Float> vector = embeddingService.embed(embed.toString());
 
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("toolId", m.id());

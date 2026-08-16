@@ -49,7 +49,7 @@ public class DeviceDiscoveryService {
     private volatile boolean scanning;
 
     private static final String COLLECTION = "discovered-devices";
-    private static final int VECTOR_SIZE = 768;
+    private static final int VECTOR_SIZE = 1024;
     private String subnet; // 启动时自动探测，如 "192.168.31"
 
     public DeviceDiscoveryService(@Qualifier("qdrantWebClient") WebClient qdrant,

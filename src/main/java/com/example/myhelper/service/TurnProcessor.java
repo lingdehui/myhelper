@@ -886,6 +886,7 @@ public class TurnProcessor {
         fullPrompt.append("- 如果要调用的工具不在列表中，请调用 searchTool(中文描述, 英文关键词) 搜索。\n");
         fullPrompt.append("- searchTool 支持按中文名、英文名、功能描述进行语义搜索，会返回匹配的工具及完整参数信息。\n");
         fullPrompt.append("- 如果 searchTool 也搜不到，可以调用 listAllTools 查看所有可用工具。\n");
+        fullPrompt.append("- 当 searchTool 反复搜不到目标工具时，不要继续换关键词重搜；直接用系统命令完成：打开网页 cmd /c start <url>、打开文件 explorer <path>、运行命令 cmd /c <command>。\n");
         fullPrompt.append("- 调用工具时确保参数类型和名称与工具定义一致。\n\n");
 
         // 从注册表注入选中参数信息（qwen3:30b function calling 弱，直接放文本里）

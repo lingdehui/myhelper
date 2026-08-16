@@ -195,10 +195,10 @@ public class ToolSyncService {
     }
 
     /**
-     * 为 MCP 工具批量生成中文描述并拼接到 description（B1 次因修复）。
-     * MCP 工具的 description 是英文，导致中文关键词兜底（contains）失效；
-     * 让大模型为每个 MCP 工具生成一句中文描述，拼接到 description 末尾，
-     * 使向量检索和关键词兜底都能命中中文。
+     * 为 MCP 工具批量生成中文检索关键词并拼接到 description。
+     * MCP 工具的 description 是英文，nomic-embed-text 对中文向量化弱，
+     * 导致中文关键词检索失效；让大模型为每个工具生成一组中文检索关键词
+     * （同义词/近义词），拼接到 description 末尾，提高中文命中率。
      */
     private void enrichMcpChineseDescriptions(Map<String, ToolModel> currentModels) {
         List<ToolModel> mcpModels = currentModels.values().stream()
@@ -220,10 +220,14 @@ public class ToolSyncService {
             }
 
             String prompt = """
-                    你是工具描述翻译助手。为下面每个工具生成一句简洁的中文功能描述（5-15字），
-                    用于中文关键词检索。严格只输出一个 JSON 对象，不要输出任何其他文字或解释。
-                    格式：{"工具名": "中文描述", ...}
-                    要求：工具名保持原样作为 key，中文描述要准确概括工具功能，可包含关键词同义词。
+                    你是工具检索别名生成助手。为下面每个工具生成一组中文检索关键词（3-6个同义词/近义词，用空格分隔），
+                    用于中文语义检索。关键词要覆盖用户可能用到的不同说法，准确代表工具功能。
+                    严格只输出一个 JSON 对象，不要输出任何其他文字或解释。
+                    格式：{"工具名": "关键词1 关键词2 关键词3", ...}
+                    示例：
+                    - leftClick: "鼠标左键 单击 点击 左键单击"
+                    - openUrl: "打开网页 浏览器 访问网址 打开链接"
+                    - listWindows: "窗口 列出窗口 枚举窗口 窗口列表"
 
                     工具列表：
                     %s
@@ -243,13 +247,13 @@ public class ToolSyncService {
                 String zh = zhMap.get(m.name());
                 if (zh == null || zh.isBlank()) continue;
                 ToolModel enrichedModel = ToolModel.of(m.id(), m.name(),
-                        m.description() + "\n中文描述: " + zh,
+                        m.description() + "\n检索关键词: " + zh,
                         m.type(), m.source(), m.parameters(), m.returnType(),
                         m.categories(), m.inputSchema());
                 currentModels.put(m.id(), enrichedModel);
                 enriched++;
             }
-            log.info("✅ 已为 {} 个 MCP 工具补充中文描述", enriched);
+            log.info("✅ 已为 {} 个 MCP 工具补充中文检索关键词", enriched);
         } catch (Exception e) {
             log.warn("⚠️ MCP 工具中文描述生成失败: {}", e.getMessage());
         }

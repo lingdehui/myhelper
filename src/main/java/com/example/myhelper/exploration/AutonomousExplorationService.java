@@ -51,10 +51,25 @@ public class AutonomousExplorationService {
 
     /** 动态基础能力映射：工具名+描述 → 能力分组（setAllTools 时自动构建，随工具变化而更新） */
     private record CapabilityDef(String name, List<String> toolNames, String taskHint) {}
+
+    /** 探索摘要：每轮学习压缩成单行，避免注入完整学习记录（上下文膨胀治理核心） */
+    private record ExplorationSummary(String goal, String tools, String result, String lesson) {
+        String toText() {
+            return String.format("[%s] | 工具:%s | 结果:%s | 教训:%s", goal, tools, result, lesson);
+        }
+    }
+
     private volatile Map<String, CapabilityDef> dynamicCapabilities = Map.of();
+
+    /** 探索摘要环形缓冲：压缩每轮学习结果，最多保留 5 条 */
+    private final Deque<ExplorationSummary> summaries = new ArrayDeque<>();
+    private static final int SUMMARY_BUFFER_MAX = 5;
 
     /** 黑名单阈值：同一目标 FAILED 次数 ≥ 此值才拉黑 */
     private static final int BLACKLIST_THRESHOLD = 2;
+
+    /** Token 守卫：探索决策上下文估算值超过此上限则放弃本轮（止血，防止撞 1M 上限） */
+    private static final int MAX_CONTEXT_TOKENS = 800_000;
 
     public AutonomousExplorationService(IdleDetectionService idleDetection,
                                          UnitStore unitStore,
@@ -99,8 +114,8 @@ public class AutonomousExplorationService {
      * 异步执行，不阻塞调用方。
      */
     public void tryExplore() {
-        // TODO: 回头启用空闲检查
-        // if (!idleDetection.shouldExplore()) return;
+        // 空闲检查：用户半小时没动电脑才开启探索
+        if (!idleDetection.shouldExplore()) return;
         doExplore();
     }
 
@@ -137,6 +152,12 @@ public class AutonomousExplorationService {
 
                 // 1. 收集上下文（传入黑名单用于过滤候选）
                 String context = buildContext(learnedTopics, attemptedTopics, blacklisted);
+
+                // 1.5 Token 守卫：上下文超限立刻终止，防止再撞 1M 上限
+                if (estimateTokens(context) > MAX_CONTEXT_TOKENS) {
+                    log.warn("🛑 探索上下文超限（约 {} tokens > {}），放弃本轮", estimateTokens(context), MAX_CONTEXT_TOKENS);
+                    return;
+                }
 
                 // 2. LLM 决策
                 ExplorationDecision decision = decide(context);
@@ -201,12 +222,47 @@ public class AutonomousExplorationService {
         });
     }
 
-    /** 构建上下文 prompt */
+    /** 估算文本 token 数（粗略：字符数 / 3，用于上下文止血守卫） */
+    private int estimateTokens(String text) {
+        return text == null || text.isBlank() ? 0 : text.length() / 3;
+    }
+
+    /** 加入一条探索摘要（新摘要放最前，超出上限移除最旧） */
+    private void addSummary(ExplorationSummary summary) {
+        summaries.addFirst(summary);
+        while (summaries.size() > SUMMARY_BUFFER_MAX) summaries.removeLast();
+    }
+
+    /** 取最近 n 条探索摘要（最新在前） */
+    private List<ExplorationSummary> getRecentSummaries(int n) {
+        return summaries.stream().limit(n).toList();
+    }
+
+    /** 从持久化近期已学单元重建摘要缓冲（重启后仍保留记忆，learnedTopics 已按时间倒序） */
+    private void syncSummaries(List<UnitStore.LearnedUnit> learnedTopics) {
+        summaries.clear();
+        if (learnedTopics == null) return;
+        List<ExplorationSummary> built = new ArrayList<>();
+        for (UnitStore.LearnedUnit t : learnedTopics) {
+            built.add(new ExplorationSummary(
+                    t.goal(),
+                    t.toolNames() != null ? String.join(",", t.toolNames()) : "",
+                    "成功",
+                    t.lesson() != null ? t.lesson() : ""));
+            if (built.size() >= SUMMARY_BUFFER_MAX) break;
+        }
+        // built 是 newest-first，addSummary 用 addFirst，倒序加入保证最新在前
+        for (int i = built.size() - 1; i >= 0; i--) {
+            addSummary(built.get(i));
+        }
+    }
+
+    /** 构建上下文 prompt（瘦身版：只注入精简摘要、Top2 失败、缺失能力，不注入全量工具清单） */
     private String buildContext(List<UnitStore.LearnedUnit> learnedTopics,
                                  List<UnitStore.AttemptedUnit> attemptedTopics,
                                  Map<String, Integer> blacklisted) {
-        // 直接拉取最近失败原因（指向 FailureCause 图，让 AI 自行判断相关性）
-        List<FailureCause> failures = unitFailureService.getRecentFailureCauses(10);
+        // 失败模式：只注入最近 Top 2（相关性由 AI 自行判断）
+        List<FailureCause> failures = unitFailureService.getRecentFailureCauses(2);
         StringBuilder failureText = new StringBuilder("无");
         if (failures != null && !failures.isEmpty()) {
             failureText.setLength(0);
@@ -214,20 +270,13 @@ public class AutonomousExplorationService {
                     .append(f.reason()).append("\n"));
         }
 
-        // 近期已学主题（成功经验 = AI 真正学到的东西，可验证/调整/优化）
+        // 近期已学：先同步摘要缓冲，再只注入最近 3 条单行摘要（压缩器输出）
+        syncSummaries(learnedTopics);
         StringBuilder learnedText = new StringBuilder("暂无");
-        if (learnedTopics != null && !learnedTopics.isEmpty()) {
+        List<ExplorationSummary> recentSummaries = getRecentSummaries(3);
+        if (!recentSummaries.isEmpty()) {
             learnedText.setLength(0);
-            for (UnitStore.LearnedUnit t : learnedTopics) {
-                learnedText.append("- ").append(t.goal());
-                if (t.lesson() != null && !t.lesson().isBlank()) {
-                    learnedText.append("（经验: ").append(t.lesson()).append("）");
-                }
-                if (t.toolNames() != null && !t.toolNames().isEmpty()) {
-                    learnedText.append(" [工具: ").append(String.join(", ", t.toolNames())).append("]");
-                }
-                learnedText.append("\n");
-            }
+            recentSummaries.forEach(s -> learnedText.append("- ").append(s.toText()).append("\n"));
         }
 
         // 近期尝试过的主题（包括失败的，让AI避免原地打转）
@@ -241,14 +290,11 @@ public class AutonomousExplorationService {
             }
         }
 
-        // 知识库数量（从 Qdrant 实时查询 ACTIVE Episode 总数）
-        int knowledgeCount = unitStore.countActiveUnits();
-
-        // 构建分类化工具概览（按前缀分组，避免单个工具列表过长）
-        String toolOverview = buildToolOverview();
-
-        // 能力清单：按难度分级展示已掌握能力 + 缺失的基础能力（黑名单已过滤）
+        // 缺失基础能力（只注入缺失项，替代完整难度分级清单）
         String capabilityInventory = buildCapabilityInventory(learnedTopics, blacklisted);
+
+        // 知识库数量（从 Qdrant 实时查询 ACTIVE 总数）
+        int knowledgeCount = unitStore.countActiveUnits();
 
         String template = promptLoader.getAutonomousExploration();
         return template
@@ -258,7 +304,7 @@ public class AutonomousExplorationService {
                 .replace("{capability_inventory}", capabilityInventory)
                 .replace("{recently_attempted}", attemptedText.toString())
                 .replace("{unsolved_questions}", "暂无记录")
-                .replace("{tool_list_with_usage}", toolOverview)
+                .replace("{tool_list_with_usage}", "（未预注入，需要时用 searchTool / listAllTools 查询）")
                 .replace("{knowledge_count}", String.valueOf(knowledgeCount));
     }
 
@@ -312,107 +358,23 @@ public class AutonomousExplorationService {
         return Collections.unmodifiableMap(result);
     }
 
-    /** 根据目标文本和工具名判断难度等级（1-4） */
-    private int classifyDifficulty(String goal, List<String> toolNames) {
-        if (goal == null) goal = "";
-        if (toolNames == null) toolNames = List.of();
-        String goalLower = goal.toLowerCase();
-        String toolsStr = String.join(" ", toolNames).toLowerCase();
-
-        // 系统级关键词 → ⭐⭐⭐⭐
-        if (goalLower.matches(".*(安装|docker|数据库|mysql|postgres|neo4j|redis|k8s|kubernetes|配置.*环境|部署|system.*config).*")
-                || toolsStr.matches(".*(install|docker|database|config.*env|setup).*")) {
-            return 4;
-        }
-
-        // 有依赖流程关键词 → ⭐⭐⭐
-        if (goalLower.matches(".*(下载.*保存|下载.*写入|download.*save|download.*write|编译|compile|构建|build|打包|package).*")
-                || toolsStr.matches(".*(download|compile|build).*")) {
-            return 3;
-        }
-        // 多工具(3+)组合 → ⭐⭐⭐
-        Set<String> toolCategories = new HashSet<>();
-        for (String tn : toolNames) {
-            toolCategories.add(toolCategoryFor(tn));
-        }
-        if (toolCategories.size() >= 3) return 3;
-
-        // 组合操作关键词 → ⭐⭐
-        if (goalLower.matches(".*(打开.*截图|搜索.*点击|search.*click|open.*capture|browse.*extract|网页.*识别).*")
-                || toolCategories.size() == 2) {
-            return 2;
-        }
-
-        // 默认 → ⭐
-        return 1;
-    }
-
-    /** 简单归类工具名到功能类别 */
-    private String toolCategoryFor(String toolName) {
-        if (toolName == null) return "unknown";
-        String n = toolName.toLowerCase();
-        if (n.matches(".*(screenshot|capture|截图|screen).*")) return "screenshot";
-        if (n.matches(".*(scroll|page|翻页|滚动).*")) return "scroll";
-        if (n.matches(".*(ocr|findText|readText|文字识别).*")) return "ocr";
-        if (n.matches(".*(read.*file|读文件|^read_|^cat_|^type_).*")) return "file_read";
-        if (n.matches(".*(write.*file|写文件|^write_|^save_|^echo_).*")) return "file_write";
-        if (n.matches(".*(click|点击|mouse.*click).*")) return "click";
-        if (n.matches(".*(type|键盘|keyboard|按键|press.*key).*")) return "keyboard";
-        if (n.matches(".*(browser|navigate|打开.*网页|open.*browser|chromium).*")) return "browser";
-        if (n.matches(".*(mouse.*move|移动.*鼠标|光标).*")) return "mouse_move";
-        return "other";
-    }
-
-    /** 构建能力清单：按难度分级展示已掌握+缺失，缺失项附带具体学习任务（黑名单已过滤） */
+    /** 构建能力清单（瘦身版）：只注入缺失的基础能力候选 + 黑名单，不注入完整难度分级清单 */
     private String buildCapabilityInventory(List<UnitStore.LearnedUnit> learnedTopics,
                                              Map<String, Integer> blacklisted) {
-        // 按难度分组
-        Map<Integer, List<UnitStore.LearnedUnit>> byLevel = new LinkedHashMap<>();
-        byLevel.put(1, new ArrayList<>());
-        byLevel.put(2, new ArrayList<>());
-        byLevel.put(3, new ArrayList<>());
-        byLevel.put(4, new ArrayList<>());
-
-        if (learnedTopics != null) {
-            for (UnitStore.LearnedUnit t : learnedTopics) {
-                int level = classifyDifficulty(t.goal(), t.toolNames());
-                byLevel.get(level).add(t);
-            }
-        }
-
-        // 缺失的基础能力（基于动态能力映射 + 黑名单过滤）
         List<String> missingBasics = computeMissingBasics(learnedTopics, blacklisted);
 
         StringBuilder sb = new StringBuilder();
 
-        // 总览
-        int total = byLevel.values().stream().mapToInt(List::size).sum();
-        sb.append("📊 能力总览：共 ").append(total).append(" 个成功案例\n");
-        String[] stars = {"", "⭐", "⭐⭐", "⭐⭐⭐", "⭐⭐⭐⭐"};
-        for (int lv = 1; lv <= 4; lv++) {
-            int count = byLevel.get(lv).size();
-            sb.append("  难度").append(stars[lv]).append("：").append(count).append(" 个");
-            if (!byLevel.get(lv).isEmpty()) {
-                List<String> examples = byLevel.get(lv).stream()
-                        .limit(3)
-                        .map(t -> t.goal().length() > 30 ? t.goal().substring(0, 30) + "..." : t.goal())
-                        .toList();
-                sb.append("（如：").append(String.join("、", examples)).append("）");
-            }
-            sb.append("\n");
-        }
-
         // P0-1: 被黑名单拦截的能力单独提示
         if (!blacklisted.isEmpty()) {
-            sb.append("\n⛔ 以下能力已被暂时冻结（多次失败，跳过）：\n");
-            for (var entry : blacklisted.entrySet()) {
-                sb.append("  - ").append(entry.getKey()).append("（失败").append(entry.getValue()).append("次）\n");
-            }
+            sb.append("⛔ 已冻结能力（多次失败，跳过）：");
+            sb.append(String.join("、", blacklisted.keySet()));
+            sb.append("\n");
         }
 
         // 缺失的基础能力（附具体学习任务，AI必须从中选，黑名单已过滤）
         if (!missingBasics.isEmpty()) {
-            sb.append("\n⚠️ 你必须从以下候选任务中选择一个学习（禁止SKIP！）：\n");
+            sb.append("⚠️ 你必须从以下候选任务中选择一个学习（禁止SKIP！）：\n");
             int idx = 1;
             for (String b : missingBasics) {
                 CapabilityDef def = dynamicCapabilities.get(b);
@@ -422,9 +384,9 @@ public class AutonomousExplorationService {
             }
             sb.append("  用 internal_tool_probing 方法，工具分类选「鼠标键盘」或「文件与窗口」或「浏览器与Web」。\n");
         } else if (!blacklisted.isEmpty()) {
-            sb.append("\n⚠️ 所有基础能力已被尝试但部分被冻结。请在非冻结的已有能力基础上向难度⭐⭐扩展。\n");
+            sb.append("⚠️ 所有基础能力已被尝试但部分被冻结。请在非冻结的已有能力基础上向难度⭐⭐扩展。\n");
         } else {
-            sb.append("\n✅ 基础能力已覆盖，可以在已有基础上向难度⭐⭐扩展。\n");
+            sb.append("✅ 基础能力已覆盖，可以在已有基础上向难度⭐⭐扩展。\n");
         }
 
         return sb.toString();
@@ -465,49 +427,6 @@ public class AutonomousExplorationService {
             missing.add(capName);
         }
         return missing;
-    }
-
-    /** 构建分类化工具概览（按 MCP 前缀/功能分组，精简版） */
-    private String buildToolOverview() {
-        List<String> toolNames = new ArrayList<>();
-        for (ToolCallback tc : tools) {
-            toolNames.add(tc.getToolDefinition().name());
-        }
-        Collections.sort(toolNames);
-
-        // 按前缀分组
-        Map<String, List<String>> groups = new LinkedHashMap<>();
-        for (String name : toolNames) {
-            int idx = name.indexOf('_');
-            String prefix = idx > 0 ? name.substring(0, idx) : name;
-            // 合并短前缀
-            if (prefix.length() <= 3 || prefix.equals("browser") || prefix.equals("chromium")) {
-                prefix = "浏览器与Web";
-            } else if (prefix.equals("click") || prefix.equals("type") || prefix.equals("scroll") || prefix.equals("press") || prefix.equals("key") || prefix.equals("mouse")) {
-                prefix = "鼠标键盘";
-            } else if (prefix.equals("find") || prefix.equals("read") || prefix.equals("write") || prefix.equals("glob") || prefix.equals("edit") || prefix.equals("delete") || prefix.equals("open")) {
-                prefix = "文件与窗口";
-            } else if (prefix.equals("search") || prefix.equals("list")) {
-                prefix = "工具查询";
-            } else if (prefix.equals("get") || prefix.equals("set")) {
-                prefix = "系统信息";
-            } else if (prefix.equals("generate") || prefix.equals("fix") || prefix.equals("searchCodebase")) {
-                prefix = "代码工具";
-            } else if (prefix.equals("query") || prefix.equals("store")) {
-                prefix = "知识库";
-            } else if (prefix.equals("consult") || prefix.equals("fallback")) {
-                prefix = "AI辅助";
-            }
-            groups.computeIfAbsent(prefix, k -> new ArrayList<>()).add(name);
-        }
-
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, List<String>> e : groups.entrySet()) {
-            sb.append("【").append(e.getKey()).append("】");
-            sb.append(String.join(", ", e.getValue()));
-            sb.append("\n");
-        }
-        return sb.toString();
     }
 
     /** 从 AI 返回的文本中提取 JSON 对象 */

@@ -8,7 +8,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -31,8 +33,35 @@ public class LocalASR {
         initOffline();
     }
 
+    /** 清理上次非正常退出（JVM 崩溃/被杀）遗留的 sherpa-model 临时目录，防止累积占满磁盘。 */
+    private void cleanupStaleModelDirs() {
+        Path tmp = Path.of(System.getProperty("java.io.tmpdir"));
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(tmp, "sherpa-model*")) {
+            for (Path p : ds) {
+                deleteRecursively(p);
+            }
+        } catch (IOException e) {
+            log.debug("清理旧 sherpa-model 临时目录失败: {}", e.getMessage());
+        }
+    }
+
+    private void deleteRecursively(Path dir) {
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
+            for (Path p : ds) {
+                if (Files.isDirectory(p)) {
+                    deleteRecursively(p);
+                } else {
+                    Files.deleteIfExists(p);
+                }
+            }
+            Files.deleteIfExists(dir);
+        } catch (IOException ignored) {
+        }
+    }
+
     // ========== OnlineRecognizer（唤醒词检测）==========
     private void initOnline() throws Exception {
+        cleanupStaleModelDirs();
         Path modelDir = Files.createTempDirectory("sherpa-model");
         modelDir.toFile().deleteOnExit();
 
