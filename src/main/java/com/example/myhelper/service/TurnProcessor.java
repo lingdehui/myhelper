@@ -146,6 +146,11 @@ public class TurnProcessor {
         return toolPlanner.syncCategories(tools, force);
     }
 
+    /** 触发工具分类增量同步（只有初始化才全量，之后只为新增工具归类） */
+    public int syncCategoriesIncremental(ToolCallback[] tools) {
+        return toolPlanner.syncCategoriesIncremental(tools);
+    }
+
     /** 合并静态工具 + 动态生成工具（供外部获取完整工具列表） */
     public ToolCallback[] mergeTools(ToolCallback[] baseTools) {
         return mergeDynamicTools(baseTools);
@@ -310,10 +315,10 @@ public class TurnProcessor {
         int currentExtraCount = currentDynamicCount + lastUnitToolCount;
         if (currentExtraCount > lastDynamicToolCount) {
             lastDynamicToolCount = currentExtraCount;
-            log.info("🔄 检测到新工具（动态{} + 计划步骤{}），重同步分类（强制刷新）...",
+            log.info("🔄 检测到新工具（动态{} + 计划步骤{}），增量归类...",
                     currentDynamicCount, lastUnitToolCount);
-            int catCount = toolPlanner.syncCategories(currentTools, true);
-            if (catCount > 0) log.info("📁 工具分类已重同步: {} 类", catCount);
+            int catCount = toolPlanner.syncCategoriesIncremental(currentTools);
+            if (catCount >= 0) log.info("📁 工具分类已增量更新: 归类 {} 个", catCount);
         }
     }
 
@@ -323,10 +328,10 @@ public class TurnProcessor {
         if (base == null) return;
         try {
             ToolCallback[] latest = mergeDynamicTools(base);
-            int catCount = toolPlanner.syncCategories(latest, true);
-            if (catCount > 0) log.info("📁 沉淀后分类已重同步: {} 类", catCount);
+            int catCount = toolPlanner.syncCategoriesIncremental(latest);
+            if (catCount >= 0) log.info("📁 沉淀后分类已增量更新: 归类 {} 个", catCount);
         } catch (Exception e) {
-            log.warn("⚠️ 沉淀后分类重同步失败: {}", e.getMessage());
+            log.warn("⚠️ 沉淀后分类增量更新失败: {}", e.getMessage());
         }
     }
 
@@ -887,7 +892,8 @@ public class TurnProcessor {
         fullPrompt.append("- searchTool 支持按中文名、英文名、功能描述进行语义搜索，会返回匹配的工具及完整参数信息。\n");
         fullPrompt.append("- 如果 searchTool 也搜不到，可以调用 listAllTools 查看所有可用工具。\n");
         fullPrompt.append("- 当 searchTool 反复搜不到目标工具时，不要继续换关键词重搜；直接用系统命令完成：打开网页 cmd /c start <url>、打开文件 explorer <path>、运行命令 cmd /c <command>。\n");
-        fullPrompt.append("- 调用工具时确保参数类型和名称与工具定义一致。\n\n");
+        fullPrompt.append("- 调用工具时确保参数类型和名称与工具定义一致。\n");
+        fullPrompt.append("- 每个关键操作执行后都必须立即验证结果是否达标，禁止在错误结果上继续后续操作：打开网页后核对窗口标题/内容是否为目标网站（不符就重开）、创建/下载文件后确认文件是否存在、安装软件后确认是否成功、发送消息后确认是否发出。\n\n");
 
         // 从注册表注入选中参数信息（qwen3:30b function calling 弱，直接放文本里）
         fullPrompt.append("[选中工具参数要求]\n");

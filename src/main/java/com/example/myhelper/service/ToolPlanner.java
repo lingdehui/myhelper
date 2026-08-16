@@ -361,6 +361,13 @@ public class ToolPlanner {
     }
 
     /**
+     * 增量分类：只有初始化（分类为空）才全量，之后只为新增工具归类（硬阈值 + 容量上限，放不进强制新建）。
+     */
+    public int syncCategoriesIncremental(ToolCallback[] allTools) {
+        return categoryService.syncCategoriesIncremental(allTools);
+    }
+
+    /**
      * 内部：AI 规划 — 多轮树形分类交互（严格按 docs/临时文件 设计）。
      *
      * <h3>多轮交互流程（3 阶段）</h3>
@@ -1164,14 +1171,14 @@ public class ToolPlanner {
         log.info("🗑️ 工具规划缓存已清除");
     }
 
-    /** 异步触发分类同步（不阻塞规划） */
+    /** 异步触发增量分类（不阻塞规划） */
     private void triggerAsyncClassification(ToolCallback[] allTools) {
         CompletableFuture.runAsync(() -> {
             try {
-                int n = categoryService.syncCategories(allTools, true);
-                log.info("📁 异步分类完成: {} 类", n);
+                int n = categoryService.syncCategoriesIncremental(allTools);
+                log.info("📁 异步增量分类完成: 归类 {} 个", n);
             } catch (Exception e) {
-                log.warn("⚠️ 异步分类失败: {}", e.getMessage());
+                log.warn("⚠️ 异步增量分类失败: {}", e.getMessage());
             }
         });
     }

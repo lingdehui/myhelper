@@ -188,6 +188,145 @@ public class ToolCategoryService {
     }
 
     /**
+     * 增量分类：只有【初始化】（分类系统为空）才做全量建树；之后只为新增工具归类。
+     *
+     * 归入现有分类必须同时满足：向量匹配分 ≥ MIN_MATCH_SCORE 且目标分类工具数 &lt; MAX_CATEGORY_TOOLS。
+     * 不满足则强制新建分类（不给 LLM "塞进老分类"的自由，避免单分类膨胀到几百个工具）。
+     *
+     * @return 本次增量归类的工具数；-1 表示无新增工具
+     */
+    public int syncCategoriesIncremental(ToolCallback[] allTools) {
+        if (allTools == null || allTools.length == 0) return 0;
+
+        final double MIN_MATCH_SCORE = 0.55;   // 向量匹配最低分，低于此分视为"放不进现有分类"
+        final int MAX_CATEGORY_TOOLS = 60;      // 单分类工具数上限，超过则不再塞入
+
+        // 只有【初始化】（分类系统为空）才做全量建树
+        if (!hasCategories()) {
+            log.info("🏗️ 分类系统为空（初始化），执行首次全量建树");
+            return syncCategories(allTools, true);
+        }
+
+        // 1. 已归属工具名集合（从现有分类的 toolNames 收集）
+        List<CategorySummary> allCats = listAllCategories();
+        Set<String> categorized = new HashSet<>();
+        for (CategorySummary s : allCats) {
+            if (s.toolNames() != null) categorized.addAll(s.toolNames());
+        }
+
+        // 2. 识别新增工具
+        List<ToolCallback> newTools = new ArrayList<>();
+        for (ToolCallback tc : allTools) {
+            if (!categorized.contains(tc.getToolDefinition().name())) {
+                newTools.add(tc);
+            }
+        }
+        if (newTools.isEmpty()) {
+            log.info("📦 无新增工具，跳过增量分类");
+            return -1;
+        }
+
+        // 3. 向量匹配 + 硬阈值归入现有分类；放不进的强制新建
+        List<ToolCallback> toNewCategory = new ArrayList<>();
+        int linked = 0;
+        for (ToolCallback tc : newTools) {
+            String name = tc.getToolDefinition().name();
+            String desc = tc.getToolDefinition().description();
+            String query = name + " " + (desc != null ? desc : "");
+            boolean assigned = false;
+            for (CategoryMatch m : searchCategories(query, 3, MIN_MATCH_SCORE)) {
+                // searchCategories 返回的 name 是 displayName，反查 @Id 用于 linkCategoryByName
+                Optional<CategorySummary> target = allCats.stream()
+                        .filter(c -> c.name().equals(m.name()) || c.id().equals(m.name()))
+                        .findFirst();
+                if (target.isPresent() && target.get().toolNames().size() < MAX_CATEGORY_TOOLS) {
+                    toolRegistry.linkCategoryByName(name, target.get().id());
+                    log.info("📦 增量归类: {} → {}（{} 个工具）", name, target.get().name(), target.get().toolNames().size() + 1);
+                    linked++;
+                    assigned = true;
+                    break;
+                }
+            }
+            if (!assigned) toNewCategory.add(tc);
+        }
+
+        // 4. 放不进的 → 强制新建分类
+        if (!toNewCategory.isEmpty()) {
+            createNewCategories(toNewCategory, allCats, allTools);
+        }
+
+        return linked;
+    }
+
+    /**
+     * 强制新建分类：AI 只针对待归类的新工具 + 现有 L1 概览生成新分类树。
+     * prompt 明确禁止把工具归入现有分类（否则 LLM 偷懒导致分类膨胀）。
+     */
+    private void createNewCategories(List<ToolCallback> newTools, List<CategorySummary> allCats, ToolCallback[] allTools) {
+        if (!modelRouter.isCloudAvailable()) {
+            log.warn("☁️ 云端 AI 未配置，跳过新建分类，{} 个新工具暂未归类", newTools.size());
+            return;
+        }
+
+        StringBuilder l1 = new StringBuilder();
+        for (CategorySummary c : allCats) {
+            if (c.level() == 1) {
+                l1.append("- id=").append(c.id())
+                  .append(", name=").append(c.name())
+                  .append(", desc=").append(c.description() != null ? c.description() : "")
+                  .append("\n");
+            }
+        }
+
+        StringBuilder toolList = new StringBuilder();
+        for (ToolCallback tc : newTools) {
+            toolList.append("- ").append(tc.getToolDefinition().name());
+            String d = tc.getToolDefinition().description();
+            if (d != null && !d.isBlank()) {
+                toolList.append(": ").append(AiResponseUtils.truncateNotNull(d, 80));
+            }
+            toolList.append("\n");
+        }
+
+        String prompt = """
+                现有 L1 大类（仅作参考，禁止把下面的新工具归入这些分类）：
+                %s
+
+                以下新工具无法归入任何现有分类，必须新建 L1 大类收纳它们：
+                %s
+
+                请为这些新工具新建 L1 大类，输出 JSON 数组（每个节点字段：id/name/desc/tools/children）：
+                - id 用小写英文点分命名（如 video.edit）
+                - name 用中文 2-6 字
+                - desc 一句话说明该分类能做什么
+                - tools 只能填上面列出的新工具名，不得填其他工具
+                - 可在 children 里再分子类（L2）
+                直接输出 JSON 数组，不要任何解释。
+                """.formatted(l1, toolList);
+
+        try {
+            log.info("☁️ 增量新建分类：{} 个新工具 → DeepSeek 生成新分类树...", newTools.size());
+            String response = modelRouter.cloudOnly().prompt().user(prompt).call().content();
+            if (response == null || response.isBlank()) return;
+
+            String json = AiResponseUtils.stripMarkdownCodeBlock(response);
+            List<Map<String, Object>> tree = objectMapper.readValue(json,
+                    new TypeReference<List<Map<String, Object>>>() {});
+
+            long version = System.currentTimeMillis();
+            Set<String> existingTools = collectExistingToolNames(allTools);
+            List<Map<String, Object>> points = new ArrayList<>();
+            int nodeCount = flattenTree(tree, "root", 1, existingTools, points, version);
+
+            if (points.isEmpty()) return;
+            upsertBatch(Map.of("points", points));
+            log.info("✅ 增量新建分类完成: {} 个新节点", nodeCount);
+        } catch (Exception e) {
+            log.error("❌ 增量新建分类失败: {}", e.getMessage());
+        }
+    }
+
+    /**
      * 将 AI 返回的树形 JSON 展平为 Qdrant points。
      *
      * @param nodes        当前层级节点列表

@@ -69,7 +69,6 @@ public class ToolSyncService {
 
         // 2. 从 ToolCallback 提取 ToolModel（含完整参数）
         Map<String, ToolModel> currentModels = new LinkedHashMap<>();
-        int mcpIdx = 0;
         for (int i = 0; i < allTools.length; i++) {
             ToolCallback tc = allTools[i];
             ToolModel model = extractFromToolCallback(tc, i < mcpCount);
@@ -78,10 +77,7 @@ public class ToolSyncService {
             }
         }
 
-        // 2.5 为 MCP 工具批量生成中文描述（B1 次因修复：MCP 描述是英文，中文关键词搜不到）
-        enrichMcpChineseDescriptions(currentModels);
-
-        // 3. 对比 Neo4j 已有记录
+        // 3. 对比 Neo4j 已有记录（先读库，用于判断增量）
         Set<String> dbIds;
         try {
             dbIds = toolRegistry.findAllActive().stream()
@@ -91,6 +87,12 @@ public class ToolSyncService {
             dbIds = Set.of();
         }
 
+        // 3.5 只为【新增】的 MCP 工具补中文描述（已有数据的跳过，避免每次启动全量调 DeepSeek）
+        Set<String> newToolIds = currentModels.keySet().stream()
+                .filter(id -> !dbIds.contains(id))
+                .collect(Collectors.toSet());
+        enrichMcpChineseDescriptions(currentModels, newToolIds);
+
         // 4. 新增 & 更新（Neo4j 不可用时跳过写库））
         int added = 0, updated = 0;
         boolean neo4jAvailable = true;
@@ -99,6 +101,8 @@ public class ToolSyncService {
                 if (!dbIds.contains(model.id())) {
                     toolRegistry.upsertTool(model);
                     added++;
+                } else if ("MCP".equals(model.type())) {
+                    // 已有 MCP 工具：中文关键词已在库中，跳过 update（避免用原始英文描述覆盖）
                 } else {
                     Optional<ToolModel> existing = toolRegistry.findById(model.id());
                     if (existing.isPresent() && needsUpdate(existing.get(), model)) {
@@ -200,11 +204,15 @@ public class ToolSyncService {
      * 导致中文关键词检索失效；让大模型为每个工具生成一组中文检索关键词
      * （同义词/近义词），拼接到 description 末尾，提高中文命中率。
      */
-    private void enrichMcpChineseDescriptions(Map<String, ToolModel> currentModels) {
+    private void enrichMcpChineseDescriptions(Map<String, ToolModel> currentModels, Set<String> newToolIds) {
         List<ToolModel> mcpModels = currentModels.values().stream()
                 .filter(m -> "MCP".equals(m.type()))
+                .filter(m -> newToolIds.contains(m.id()))  // 只处理新增工具，已有数据跳过
                 .toList();
-        if (mcpModels.isEmpty()) return;
+        if (mcpModels.isEmpty()) {
+            log.info("📦 无新增 MCP 工具，跳过中文描述生成");
+            return;
+        }
 
         try {
             if (!modelRouter.isCloudAvailable()) {

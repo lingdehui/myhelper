@@ -15,7 +15,8 @@ public class AutomationStepOptimizer {
             } else {
                 throw new UnsupportedOperationException("Opening browser is currently supported only on Windows.");
             }
-            return "Successfully opened URL in the default browser.";
+            Thread.sleep(2000); // 等待浏览器加载，便于后续核对窗口标题
+            return "已打开网页: " + url + "（请立即用 getActiveWindowTitle 或截图 OCR 核对当前页面是否为正确网站，若不符请用正确 URL 重新打开，不要在错误页面上继续操作）";
         } catch (Exception e) {
             return "Failed to open URL. Reason: " + e.getMessage();
         }

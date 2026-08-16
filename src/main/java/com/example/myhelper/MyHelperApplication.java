@@ -173,10 +173,15 @@ public class MyHelperApplication {
                 log.info("✅ sherpa-onnx 资源已释放");
             }, "sherpa-shutdown"));
 
-            // 异步同步工具分类（可通过配置 force-category-sync 强制刷新）
+            // 异步同步工具分类（默认增量：只有初始化才全量；force-category-sync=true 时显式全量刷新）
             aiExecutor.submit(() -> {
                 boolean forceCategory = props.toolPlanner().forceCategorySync();
-                int catCount = turnProcessor.syncCategories(getMergedTools(), forceCategory);
+                int catCount;
+                if (forceCategory) {
+                    catCount = turnProcessor.syncCategories(getMergedTools(), true);
+                } else {
+                    catCount = turnProcessor.syncCategoriesIncremental(getMergedTools());
+                }
                 if (catCount > 0) log.info("📁 工具分类已同步: {} 类 (force={})", catCount, forceCategory);
             });
 
@@ -190,14 +195,15 @@ public class MyHelperApplication {
             try (Scanner scanner = new Scanner(System.in)) {
                 int roundNum = 0;
                 while (true) {
-                    log.info("> ");
-                    String userInput = scanner.nextLine();
+                    log.info("> （多行输入，空行回车发送）");
+                    String firstLine = scanner.nextLine();
                     dialogStateMachine.touch();
-                    if ("exit".equalsIgnoreCase(userInput.trim())) {
+
+                    // 单行命令立即生效
+                    if ("exit".equalsIgnoreCase(firstLine.trim())) {
                         break;
                     }
-
-                    if ("voice".equalsIgnoreCase(userInput.trim())) {
+                    if ("voice".equalsIgnoreCase(firstLine.trim())) {
                         log.info("🎤 开始录音（5秒），请说话...");
                         try {
                             AudioRecorder.AudioData audio = AudioRecorder.record(5);
@@ -216,6 +222,17 @@ public class MyHelperApplication {
                         }
                         continue;
                     }
+
+                    // 多行输入：空行结束发送
+                    StringBuilder sb = new StringBuilder(firstLine);
+                    String line;
+                    while (true) {
+                        line = scanner.nextLine();
+                        if (line.trim().isEmpty()) break;
+                        sb.append("\n").append(line);
+                    }
+                    String userInput = sb.toString().trim();
+                    if (userInput.isEmpty()) continue;
 
                     roundNum++;
                     log.info("=== 第{}轮 === userInput='{}'", roundNum, userInput);

@@ -6,6 +6,7 @@ import com.example.myhelper.config.SystemEnvironmentService;
 import com.example.myhelper.memory.unit.FailureCause;
 import com.example.myhelper.memory.unit.UnitFailureService;
 import com.example.myhelper.memory.unit.UnitStore;
+import com.example.myhelper.memory.vector.category.ToolCategoryService;
 import com.example.myhelper.service.TurnProcessor;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -39,6 +40,7 @@ public class AutonomousExplorationService {
     private final ObjectMapper objectMapper;
 
     private final ModelRouter modelRouter;
+    private final ToolCategoryService categoryService;
     private volatile ToolCallback[] tools;  // volatile: 启动后由 MyHelperApplication 设置完整列表
     private final SystemEnvironmentService envService;
 
@@ -78,6 +80,7 @@ public class AutonomousExplorationService {
                                          PromptLoader promptLoader,
                                          MyHelperProperties props,
                                          ModelRouter modelRouter,
+                                         ToolCategoryService categoryService,
                                          SystemEnvironmentService envService) {
         this.idleDetection = idleDetection;
         this.unitStore = unitStore;
@@ -87,6 +90,7 @@ public class AutonomousExplorationService {
         this.props = props;
         this.objectMapper = new ObjectMapper();
         this.modelRouter = modelRouter;
+        this.categoryService = categoryService;
         this.tools = new ToolCallback[0];  // 占位，启动后 setAllTools() 会填充
         this.envService = envService;
     }
@@ -536,46 +540,43 @@ public class AutonomousExplorationService {
 
     // ========== P0-2: 强制工具发现 ==========
 
-    /** 构建与决策目标相关的工具摘要（前30个工具名+描述，硬注入不让AI想象） */
+    /** 构建与决策目标相关的工具摘要（按选中分类查工具，不发全量） */
     private String buildRelevantToolsSummary(ExplorationDecision decision) {
-        if (tools == null || tools.length == 0) return "（工具列表暂不可用）";
-
-        // 根据决策的工具分类筛选相关工具
         List<String> relevantCategories = decision.toolCategories();
-        List<String> categoryLower = relevantCategories != null
-                ? relevantCategories.stream().map(String::toLowerCase).toList()
-                : List.of();
+        if (relevantCategories == null || relevantCategories.isEmpty()) {
+            return "（未指定分类，需要时用 searchTool / listAllTools 查询工具）";
+        }
 
-        StringBuilder sb = new StringBuilder("📋 可用工具清单（必须使用已有工具，禁止调用不存在的工具名）：\n");
-        List<ToolCallback> sorted = new ArrayList<>(List.of(tools));
-        // 优先展示与分类相关的工具
-        sorted.sort((a, b) -> {
-            String descA = a.getToolDefinition().description();
-            String descB = b.getToolDefinition().description();
-            String nameA = a.getToolDefinition().name();
-            String nameB = b.getToolDefinition().name();
-            String combinedA = (nameA + " " + (descA != null ? descA : "")).toLowerCase();
-            String combinedB = (nameB + " " + (descB != null ? descB : "")).toLowerCase();
-
-            int scoreA = 0, scoreB = 0;
-            for (String cat : categoryLower) {
-                if (combinedA.contains(cat.toLowerCase())) scoreA++;
-                if (combinedB.contains(cat.toLowerCase())) scoreB++;
+        // 工具名 → 描述 映射（只在需要时取描述，避免全量注入）
+        Map<String, String> descMap = new LinkedHashMap<>();
+        if (tools != null) {
+            for (ToolCallback tc : tools) {
+                String d = tc.getToolDefinition().description();
+                descMap.put(tc.getToolDefinition().name(), d != null ? d : "");
             }
-            return Integer.compare(scoreB, scoreA); // 高分在前
-        });
+        }
 
-        int limit = Math.min(30, sorted.size());
-        for (int i = 0; i < limit; i++) {
-            ToolCallback tc = sorted.get(i);
-            String name = tc.getToolDefinition().name();
-            String desc = tc.getToolDefinition().description();
-            String shortDesc = (desc != null && desc.length() > 80)
-                    ? desc.substring(0, 80) + "..."
-                    : (desc != null ? desc : "");
-            sb.append("  ").append(name);
-            if (!shortDesc.isBlank()) sb.append(" — ").append(shortDesc);
-            sb.append("\n");
+        StringBuilder sb = new StringBuilder("📋 相关分类工具清单（必须使用已有工具，禁止调用不存在的工具名）：\n");
+        int total = 0;
+        for (String catName : relevantCategories) {
+            Optional<ToolCategoryService.CategorySummary> cat = categoryService.findByName(catName);
+            if (cat.isEmpty()) continue;
+            List<String> catTools = cat.get().toolNames();
+            if (catTools == null || catTools.isEmpty()) continue;
+
+            sb.append("  【").append(cat.get().name()).append("】\n");
+            for (String t : catTools) {
+                String desc = descMap.getOrDefault(t, "");
+                String shortDesc = desc.length() > 80 ? desc.substring(0, 80) + "..." : desc;
+                sb.append("    - ").append(t);
+                if (!shortDesc.isBlank()) sb.append(" — ").append(shortDesc);
+                sb.append("\n");
+                total++;
+            }
+        }
+
+        if (total == 0) {
+            return "（所选分类下未找到工具，需要时用 searchTool / listAllTools 查询）";
         }
         return sb.toString();
     }
