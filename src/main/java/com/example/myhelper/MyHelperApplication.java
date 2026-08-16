@@ -22,6 +22,7 @@ import com.example.myhelper.service.TurnProcessor;
 import com.example.myhelper.service.VadService;
 import com.example.myhelper.service.VoiceprintService;
 import com.example.myhelper.integration.HaToolService;
+import com.example.myhelper.memory.unit.UniversalUnitExecutor;
 import com.example.myhelper.util.NativeLoader;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.annotation.Tool;
@@ -94,6 +95,7 @@ public class MyHelperApplication {
                                  ApplicationContext appCtx,
                                  AutonomousExplorationService explorationService,
                                  ToolSyncService toolSyncService,
+                                 UniversalUnitExecutor universalUnitExecutor,
                                  @Qualifier("aiExecutor") ExecutorService aiExecutor) {
         return args -> {
             this.props = props;
@@ -147,6 +149,9 @@ public class MyHelperApplication {
 
             // 探索服务接收完整工具列表（含生成工具），避免"缺失浏览器工具"误判
             explorationService.setAllTools(allToolCallbacks);
+
+            // 万能执行器接收完整工具列表（脚本化/递归展开执行时按名查找工具）
+            universalUnitExecutor.setAllTools(allToolCallbacks);
 
             // === 启动工具注册表同步（Neo4j + Qdrant）===
             toolSyncService.syncOnStartup(allToolCallbacks, mcpCount);

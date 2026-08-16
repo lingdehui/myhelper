@@ -48,7 +48,7 @@ myhelper:
   deepseek:                           # 模型 2: DeepSeek API（远程）
     base-url: https://api.deepseek.com
     api-key: sk-f2fcd2a4bdb44f02a410c3f030d6fb8b
-    model: deepseek-v4-pro
+    model: deepseek-v4-flash
   exploration:
     exploration-model: model2         # model1=本地, model2=云端
 

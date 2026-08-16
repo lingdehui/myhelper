@@ -12,11 +12,22 @@ import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.client.BufferingClientHttpRequestFactory;
+import org.springframework.http.client.ClientHttpRequestExecution;
+import org.springframework.http.client.ClientHttpRequestInterceptor;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.http.client.ReactorClientHttpRequestFactory;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StreamUtils;
 import org.springframework.web.client.RestClient;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.stream.Collectors;
 
@@ -244,6 +255,45 @@ public class ModelRouter {
                 || (e.getCause() != null && isNetworkError(e.getCause()));
     }
 
+    // ---- HTTP 抓包：日志化请求/响应体，定位工具名截断是 LLM 还是 Spring AI 造成的 ----
+    private static ClientHttpRequestInterceptor httpBodyLoggingInterceptor() {
+        return (request, body, execution) -> {
+            long start = System.currentTimeMillis();
+            String reqBody = truncateHttp(new String(body, StandardCharsets.UTF_8), 2000);
+            log.info("🌐 [HTTP抓包] → {} {}", request.getMethod(), request.getURI());
+            log.info("🌐 [HTTP抓包] 请求体(前{}字符):\n{}", reqBody.length(), reqBody);
+
+            ClientHttpResponse response = execution.execute(request, body);
+            byte[] respBody = StreamUtils.copyToByteArray(response.getBody());
+            long elapsed = System.currentTimeMillis() - start;
+            String respText = truncateHttp(new String(respBody, StandardCharsets.UTF_8), 8000);
+            log.info("🌐 [HTTP抓包] ← {} {} ({}ms)", response.getStatusCode(), response.getStatusText(), elapsed);
+            log.info("🌐 [HTTP抓包] 响应体(前{}字符):\n{}", respText.length(), respText);
+
+            return new BufferingResponse(response, respBody);
+        };
+    }
+
+    /** 把已读取的响应体重新包装，供 Spring AI 下游继续读取（HTTP 抓包后不破坏原数据流）。 */
+    private static final class BufferingResponse implements ClientHttpResponse {
+        private final ClientHttpResponse delegate;
+        private final byte[] body;
+        BufferingResponse(ClientHttpResponse delegate, byte[] body) {
+            this.delegate = delegate;
+            this.body = body;
+        }
+        @Override public HttpStatusCode getStatusCode() throws IOException { return delegate.getStatusCode(); }
+        @Override public String getStatusText() throws IOException { return delegate.getStatusText(); }
+        @Override public HttpHeaders getHeaders() { return delegate.getHeaders(); }
+        @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
+        @Override public void close() { delegate.close(); }
+    }
+
+    private static String truncateHttp(String s, int max) {
+        if (s == null) return "(null)";
+        return s.length() <= max ? s : s.substring(0, max) + "...(截断)";
+    }
+
     // ============================================================
     // 模型工厂方法（在 MyHelperConfig 中调用）
     // ============================================================
@@ -260,7 +310,8 @@ public class ModelRouter {
                 .apiKey("ollama")
                 .completionsPath("/chat/completions")
                 .restClientBuilder(RestClient.builder()
-                        .requestFactory(factory)
+                        .requestFactory(new BufferingClientHttpRequestFactory(factory))
+                        .requestInterceptor(httpBodyLoggingInterceptor())
                         .defaultHeader("Accept", "application/json")
                         .defaultHeader("Content-Type", "application/json"))
                 .build();
@@ -283,7 +334,9 @@ public class ModelRouter {
                 .baseUrl(props.deepseek().baseUrl())
                 .apiKey(props.deepseek().apiKey())
                 .completionsPath("/chat/completions")
-                .restClientBuilder(RestClient.builder().requestFactory(factory))
+                .restClientBuilder(RestClient.builder()
+                        .requestFactory(new BufferingClientHttpRequestFactory(factory))
+                        .requestInterceptor(httpBodyLoggingInterceptor()))
                 .build();
         log.info("{}🔧 [ModelRouter] DeepSeek 备用: {}/chat/completions | model={}{}", C2, props.deepseek().baseUrl(), props.deepseek().model(), R);
         return OpenAiChatModel.builder()

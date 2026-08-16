@@ -157,9 +157,18 @@ public class ReflectService {
             return SignatureExtraction.fallback(toolCalls);
         }
 
+        // 过滤元工具：只从实际执行目标操作的工具调用中提取变量签名（B6 修复）
+        List<ToolCallLog> businessSteps = toolCalls.stream()
+                .filter(tc -> !AiResponseUtils.isMetaTool(tc.toolName()))
+                .toList();
+        if (businessSteps.isEmpty()) {
+            log.info("⚠️ 轨迹仅含元工具（搜索/列举），跳过变量签名提取");
+            return SignatureExtraction.fallback(toolCalls);
+        }
+
         StringBuilder stepsDesc = new StringBuilder();
-        for (int i = 0; i < toolCalls.size(); i++) {
-            ToolCallLog step = toolCalls.get(i);
+        for (int i = 0; i < businessSteps.size(); i++) {
+            ToolCallLog step = businessSteps.get(i);
             stepsDesc.append(i + 1).append(". ").append(step.toolName())
                     .append(" args=").append(AiResponseUtils.truncate(step.args(), 200)).append("\n");
         }
@@ -169,10 +178,10 @@ public class ReflectService {
 
         try {
             String response = client(mode).prompt().user(prompt).call().content();
-            return parseSignatureExtraction(response, toolCalls);
+            return parseSignatureExtraction(response, businessSteps);
         } catch (Exception e) {
             log.error("⚠️ 签名提取失败，原样保留 toolCalls: {}", e.getMessage());
-            return SignatureExtraction.fallback(toolCalls);
+            return SignatureExtraction.fallback(businessSteps);
         }
     }
 

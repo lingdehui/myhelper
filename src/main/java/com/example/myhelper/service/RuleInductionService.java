@@ -1,11 +1,11 @@
 package com.example.myhelper.service;
 
 import com.example.myhelper.common.PromptLoader;
-import com.example.myhelper.memory.graph.FailurePatternNode;
-import com.example.myhelper.memory.graph.FailurePatternRepository;
+import com.example.myhelper.memory.graph.FailureCauseNode;
+import com.example.myhelper.memory.graph.FailureCauseRepository;
 import com.example.myhelper.memory.graph.RuleNode;
 import com.example.myhelper.memory.graph.RuleRepository;
-import com.example.myhelper.memory.vector.episode.EpisodeCacheService;
+import com.example.myhelper.memory.unit.UnitStore;
 import com.example.myhelper.config.ModelRouter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,7 +17,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 规则归纳服务 —— 从 FailurePattern + 成功 Episode 中跨案例泛化出通用规则。
+ * 规则归纳服务 —— 从 FailureCause + 成功 Episode 中跨案例泛化出通用规则。
  *
  * <p>定时任务（每天凌晨 3:00）扫描近期失败模式和成功案例，
  * 调用 LLM 做跨案例归纳，生成抽象的通用规则存入 Neo4j {@code (:Rule)} 节点。
@@ -33,26 +33,26 @@ public class RuleInductionService {
 
     private final ModelRouter modelRouter;
     private final RuleRepository ruleRepo;
-    private final FailurePatternRepository failurePatternRepo;
-    private final EpisodeCacheService episodeCacheService;
+    private final FailureCauseRepository failureCauseRepo;
+    private final UnitStore unitStore;
     private final PromptLoader promptLoader;
 
     public RuleInductionService(ModelRouter modelRouter,
                                  RuleRepository ruleRepo,
-                                 FailurePatternRepository failurePatternRepo,
-                                 EpisodeCacheService episodeCacheService,
+                                 FailureCauseRepository failureCauseRepo,
+                                 UnitStore unitStore,
                                  PromptLoader promptLoader) {
         this.modelRouter = modelRouter;
         this.ruleRepo = ruleRepo;
-        this.failurePatternRepo = failurePatternRepo;
-        this.episodeCacheService = episodeCacheService;
+        this.failureCauseRepo = failureCauseRepo;
+        this.unitStore = unitStore;
         this.promptLoader = promptLoader;
     }
 
     /**
      * 定期归纳规则（每天凌晨 3:00）。
      *
-     * <p>首次运行时没有规则，后续只归纳新增的 FailurePattern（距上次归纳之后产生的）。</p>
+     * <p>首次运行时没有规则，后续只归纳新增的 FailureCause（距上次归纳之后产生的）。</p>
      */
     @Scheduled(cron = "${myhelper.rule-induction.cron:0 0 3 * * ?}")
     public void scheduledInduction() {
@@ -78,14 +78,14 @@ public class RuleInductionService {
         // 1. 获取上次归纳时间（最近一条规则的创建时间）
         long lastInductionTime = getLastInductionTime();
 
-        // 2. 扫描近期 FailurePatterns
-        List<FailurePatternNode> recentFailures = failurePatternRepo.findAll();
-        List<FailurePatternNode> newFailures = recentFailures.stream()
-                .filter(f -> f.getDetectedAt() > lastInductionTime)
+        // 2. 扫描近期失败原因（FailureCause 图）
+        List<FailureCauseNode> recentFailures = failureCauseRepo.findAll();
+        List<FailureCauseNode> newFailures = recentFailures.stream()
+                .filter(f -> f.getTimestamp() > lastInductionTime)
                 .toList();
 
-        // 3. 扫描近期成功 Episodes
-        List<String> recentSuccesses = episodeCacheService.getRecentSuccessfulEpisodeSummaries(30);
+        // 3. 扫描近期成功 Unit（PLAN_STEP）
+        List<String> recentSuccesses = unitStore.getRecentSuccessfulSummaries(30);
 
         // 4. 没有新材料则跳过
         if (newFailures.isEmpty() && recentSuccesses.isEmpty()) {
@@ -150,20 +150,20 @@ public class RuleInductionService {
         return all.get(0).getCreated();
     }
 
-    private String buildInductionPrompt(List<FailurePatternNode> failures,
+    private String buildInductionPrompt(List<FailureCauseNode> failures,
                                          List<String> successes) {
         StringBuilder sb = new StringBuilder();
         sb.append("请从以下案例中归纳出通用规则：\n\n");
 
         if (!failures.isEmpty()) {
-            sb.append("=== 近期失败模式 ===\n");
-            for (FailurePatternNode f : failures) {
-                sb.append("- 类型: ").append(f.getType()).append("\n");
-                sb.append("  描述: ").append(f.getDescription()).append("\n");
-                if (f.getMitigation() != null && !f.getMitigation().isEmpty()) {
-                    sb.append("  建议: ").append(f.getMitigation()).append("\n");
+            sb.append("=== 近期失败原因 ===\n");
+            for (FailureCauseNode f : failures) {
+                sb.append("- 类型: ").append(f.getCategory()).append("\n");
+                sb.append("  描述: ").append(f.getReason()).append("\n");
+                if (f.getAnalysis() != null && !f.getAnalysis().isEmpty()) {
+                    sb.append("  建议: ").append(f.getAnalysis()).append("\n");
                 }
-                sb.append("  失败次数: ").append(f.getCount()).append("\n\n");
+                sb.append("\n");
             }
         }
 
@@ -176,11 +176,11 @@ public class RuleInductionService {
         }
 
         sb.append("请归纳出 3-5 条通用规则，每条规则用一行，格式：\n");
-        sb.append("RULE: 规则描述 | CONFIDENCE: 0.85 | SOURCE: from_failure_pattern | TOOLS: toolA,toolB\n\n");
+        sb.append("RULE: 规则描述 | CONFIDENCE: 0.85 | SOURCE: from_failure_cause | TOOLS: toolA,toolB\n\n");
         sb.append("要求：\n");
         sb.append("- 规则必须是跨案例的通用准则，而非单个案例的描述\n");
         sb.append("- CONFIDENCE 是 0.0-1.0 之间的小数，表示规则的置信度\n");
-        sb.append("- SOURCE 选填 from_failure_pattern 或 from_success_episode\n");
+        sb.append("- SOURCE 选填 from_failure_cause 或 from_success_episode\n");
         sb.append("- TOOLS 是可能受此规则影响的工具名（逗号分隔），不知道就填 unknown\n");
         sb.append("- 不要输出任何其他内容");
 

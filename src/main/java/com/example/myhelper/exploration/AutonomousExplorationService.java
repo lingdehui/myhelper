@@ -3,8 +3,9 @@ package com.example.myhelper.exploration;
 import com.example.myhelper.common.PromptLoader;
 import com.example.myhelper.config.MyHelperProperties;
 import com.example.myhelper.config.SystemEnvironmentService;
-import com.example.myhelper.memory.vector.episode.EpisodeCacheService;
-import com.example.myhelper.memory.vector.episode.FailureExperienceHandler;
+import com.example.myhelper.memory.unit.FailureCause;
+import com.example.myhelper.memory.unit.UnitFailureService;
+import com.example.myhelper.memory.unit.UnitStore;
 import com.example.myhelper.service.TurnProcessor;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,6 +20,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 自主探索服务：空闲时收集上下文 → LLM 决策 → 提交后台执行。
@@ -29,8 +31,8 @@ public class AutonomousExplorationService {
     private static final Logger log = LoggerFactory.getLogger(AutonomousExplorationService.class);
 
     private final IdleDetectionService idleDetection;
-    private final EpisodeCacheService episodeCache;
-    private final FailureExperienceHandler failureHandler;
+    private final UnitStore unitStore;
+    private final UnitFailureService unitFailureService;
     private final TurnProcessor turnProcessor;
     private final PromptLoader promptLoader;
     private final MyHelperProperties props;
@@ -41,31 +43,30 @@ public class AutonomousExplorationService {
     private final SystemEnvironmentService envService;
 
     /** 探索串行锁：同一时间只有一个探索会话在执行（避免多会话抢屏幕/浏览器） */
-    private final java.util.concurrent.locks.ReentrantLock exploreLock = new java.util.concurrent.locks.ReentrantLock();
+    private final AtomicBoolean exploring = new AtomicBoolean(false);
+    private volatile long exploreStartTime = 0;
+
+    /** 单次探索会话最大时长（超过则强制重置锁，防止会话卡死导致新探索永远被跳过） */
+    private static final long EXPLORE_TIMEOUT_MS = 10 * 60_000L;
 
     /** 动态基础能力映射：工具名+描述 → 能力分组（setAllTools 时自动构建，随工具变化而更新） */
     private record CapabilityDef(String name, List<String> toolNames, String taskHint) {}
     private volatile Map<String, CapabilityDef> dynamicCapabilities = Map.of();
 
-    /** 重复目标黑名单：目标（标准化）→ 连续失败次数，≥2次不再作为候选 */
-    private final Map<String, Integer> failedGoalCounts = new java.util.LinkedHashMap<>();
-    /** 黑名单条目记录时间（epoch ms），用于 30 分钟过期 */
-    private final Map<String, Long> goalFailedAt = new java.util.LinkedHashMap<>();
+    /** 黑名单阈值：同一目标 FAILED 次数 ≥ 此值才拉黑 */
     private static final int BLACKLIST_THRESHOLD = 2;
-    /** 黑名单过期时间：30 分钟 */
-    private static final long BLACKLIST_TTL_MS = 30 * 60 * 1000;
 
     public AutonomousExplorationService(IdleDetectionService idleDetection,
-                                         EpisodeCacheService episodeCache,
-                                         FailureExperienceHandler failureHandler,
+                                         UnitStore unitStore,
+                                         UnitFailureService unitFailureService,
                                          TurnProcessor turnProcessor,
                                          PromptLoader promptLoader,
                                          MyHelperProperties props,
                                          ModelRouter modelRouter,
                                          SystemEnvironmentService envService) {
         this.idleDetection = idleDetection;
-        this.episodeCache = episodeCache;
-        this.failureHandler = failureHandler;
+        this.unitStore = unitStore;
+        this.unitFailureService = unitFailureService;
         this.turnProcessor = turnProcessor;
         this.promptLoader = promptLoader;
         this.props = props;
@@ -110,19 +111,26 @@ public class AutonomousExplorationService {
 
     private void doExplore() {
         CompletableFuture.runAsync(() -> {
+            long now = System.currentTimeMillis();
+            // 超时保护：上一个会话超时未结束 → 强制重置，允许新会话进入
+            if (exploring.get() && now - exploreStartTime > EXPLORE_TIMEOUT_MS) {
+                log.warn("⏰ 上一个探索会话超过 {}s 未结束，强制重置", EXPLORE_TIMEOUT_MS / 1000);
+                exploring.set(false);
+            }
             // 串行锁：如果上一个探索会话还在跑，直接跳过
-            if (!exploreLock.tryLock()) {
+            if (!exploring.compareAndSet(false, true)) {
                 log.info("⏭️ 上一个探索会话仍在运行（屏幕/浏览器被占用），跳过本次");
                 return;
             }
+            exploreStartTime = now;
             try {
                 log.info("🔍 开始自主探索会话...");
 
                 // 0. 拉取已有数据（供兜底判断用）
-                List<EpisodeCacheService.LearnedTopic> learnedTopics =
-                        episodeCache.getRecentLearnedTopics(15);
-                List<EpisodeCacheService.AttemptedTopic> attemptedTopics =
-                        episodeCache.getRecentlyAttemptedTopics(20);
+                List<UnitStore.LearnedUnit> learnedTopics =
+                        unitStore.getRecentLearnedUnits(15);
+                List<UnitStore.AttemptedUnit> attemptedTopics =
+                        unitStore.getRecentlyAttemptedUnits(20);
 
                 // 0.5 P0-1: 构建失败目标黑名单（同一目标 FAILED ≥2次 → 跳过，但已有 ACTIVE 的不拉黑）
                 Map<String, Integer> blacklisted = buildBlacklist(attemptedTopics, learnedTopics);
@@ -166,17 +174,6 @@ public class AutonomousExplorationService {
 
                 log.info("📚 探索目标: {} (方法: {}, 分类: {}, 优先级: {})", decision.learningGoal(), decision.learningMethod(), decision.toolCategories(), decision.priority());
 
-                // 3.6 P0-1: 记录本次目标（用于后续黑名单判断）
-                String normalizedGoal = normalizeGoal(decision.learningGoal());
-                failedGoalCounts.merge(normalizedGoal, 1, Integer::sum);
-                goalFailedAt.put(normalizedGoal, System.currentTimeMillis());  // 每次失败刷新过期时间
-                // 清理旧条目（只保留最近 50 个）
-                if (failedGoalCounts.size() > 50) {
-                    String first = failedGoalCounts.keySet().iterator().next();
-                    failedGoalCounts.remove(first);
-                    goalFailedAt.remove(first);
-                }
-
                 // 4. 将学习目标送入主流程管线（TurnProcessor），复用 Plan→Execute→Reflect→Store
                 String methodHint = switch (decision.learningMethod()) {
                     case "internal_tool_probing" -> "【学习方法：工具探测】在临时环境中测试已有工具的参数组合，发现新用法。你可以组合调用多个工具来探索它们的边界行为。";
@@ -190,7 +187,7 @@ public class AutonomousExplorationService {
 
                 String learningInput = "【自主学习会话】\n" + methodHint
                         + "\n\n" + relevantToolsSummary
-                        + "\n\n⚠️ 工具搜索提示：所有工具都是英文名！规划步骤前务必先调用 listAllTools 查看全部工具名称。调用 searchTool 时必须同时传入 中英文两个关键词，例如 searchTool(\"鼠标控制\", \"mouse click\") —— 系统会先用中文搜、搜不到自动用英文兜底。"
+                        + "\n\n⚠️ 工具搜索提示：工具的 name 都是英文（如 leftClick、findTextOnScreen），但 searchTool 用的是向量语义搜索，中文关键词也能匹配到英文工具。调用 searchTool 时同时传入中英文两个关键词最稳妥，例如 searchTool(\"鼠标控制\", \"mouse click\") —— 系统先按中文语义搜、搜不到自动用英文兜底。规划前可先调用 listAllTools 查看全部工具名称。"
                         + "\n\n学习目标：" + decision.learningGoal()
                         + "\n期望成果：" + decision.expectedOutcome()
                         + "\n成功标准：" + decision.successCriteria();
@@ -199,29 +196,29 @@ public class AutonomousExplorationService {
             } catch (Exception e) {
                 log.error("❌ 自主探索决策失败", e);
             } finally {
-                exploreLock.unlock();
+                exploring.set(false);
             }
         });
     }
 
     /** 构建上下文 prompt */
-    private String buildContext(List<EpisodeCacheService.LearnedTopic> learnedTopics,
-                                 List<EpisodeCacheService.AttemptedTopic> attemptedTopics,
+    private String buildContext(List<UnitStore.LearnedUnit> learnedTopics,
+                                 List<UnitStore.AttemptedUnit> attemptedTopics,
                                  Map<String, Integer> blacklisted) {
-        // 直接拉取最近失败模式（不用语义搜索硬编码关键词，让AI自行判断相关性）
-        List<EpisodeCacheService.FailureSearchResult> failures =
-                episodeCache.getRecentFailurePatterns(10);
+        // 直接拉取最近失败原因（指向 FailureCause 图，让 AI 自行判断相关性）
+        List<FailureCause> failures = unitFailureService.getRecentFailureCauses(10);
         StringBuilder failureText = new StringBuilder("无");
         if (failures != null && !failures.isEmpty()) {
             failureText.setLength(0);
-            failures.forEach(f -> failureText.append("- ").append(f.description()).append("\n"));
+            failures.forEach(f -> failureText.append("- [").append(f.category()).append("] ")
+                    .append(f.reason()).append("\n"));
         }
 
         // 近期已学主题（成功经验 = AI 真正学到的东西，可验证/调整/优化）
         StringBuilder learnedText = new StringBuilder("暂无");
         if (learnedTopics != null && !learnedTopics.isEmpty()) {
             learnedText.setLength(0);
-            for (EpisodeCacheService.LearnedTopic t : learnedTopics) {
+            for (UnitStore.LearnedUnit t : learnedTopics) {
                 learnedText.append("- ").append(t.goal());
                 if (t.lesson() != null && !t.lesson().isBlank()) {
                     learnedText.append("（经验: ").append(t.lesson()).append("）");
@@ -238,14 +235,14 @@ public class AutonomousExplorationService {
         StringBuilder attemptedText = new StringBuilder("暂无");
         if (attemptedTopics != null && !attemptedTopics.isEmpty()) {
             attemptedText.setLength(0);
-            for (EpisodeCacheService.AttemptedTopic t : attemptedTopics) {
+            for (UnitStore.AttemptedUnit t : attemptedTopics) {
                 String marker = isBlacklisted(t.goal(), blacklisted) ? " ⛔已黑名单" : "";
                 attemptedText.append("- [").append(t.status()).append("] ").append(t.goal()).append(marker).append("\n");
             }
         }
 
         // 知识库数量（从 Qdrant 实时查询 ACTIVE Episode 总数）
-        int knowledgeCount = episodeCache.countActiveEpisodes();
+        int knowledgeCount = unitStore.countActiveUnits();
 
         // 构建分类化工具概览（按前缀分组，避免单个工具列表过长）
         String toolOverview = buildToolOverview();
@@ -367,17 +364,17 @@ public class AutonomousExplorationService {
     }
 
     /** 构建能力清单：按难度分级展示已掌握+缺失，缺失项附带具体学习任务（黑名单已过滤） */
-    private String buildCapabilityInventory(List<EpisodeCacheService.LearnedTopic> learnedTopics,
+    private String buildCapabilityInventory(List<UnitStore.LearnedUnit> learnedTopics,
                                              Map<String, Integer> blacklisted) {
         // 按难度分组
-        Map<Integer, List<EpisodeCacheService.LearnedTopic>> byLevel = new LinkedHashMap<>();
+        Map<Integer, List<UnitStore.LearnedUnit>> byLevel = new LinkedHashMap<>();
         byLevel.put(1, new ArrayList<>());
         byLevel.put(2, new ArrayList<>());
         byLevel.put(3, new ArrayList<>());
         byLevel.put(4, new ArrayList<>());
 
         if (learnedTopics != null) {
-            for (EpisodeCacheService.LearnedTopic t : learnedTopics) {
+            for (UnitStore.LearnedUnit t : learnedTopics) {
                 int level = classifyDifficulty(t.goal(), t.toolNames());
                 byLevel.get(level).add(t);
             }
@@ -434,14 +431,14 @@ public class AutonomousExplorationService {
     }
 
     /** 从 learnedTopics + 动态能力映射计算缺失的基础能力（黑名单已过滤） */
-    private List<String> computeMissingBasics(List<EpisodeCacheService.LearnedTopic> learnedTopics,
+    private List<String> computeMissingBasics(List<UnitStore.LearnedUnit> learnedTopics,
                                                 Map<String, Integer> blacklisted) {
         if (dynamicCapabilities.isEmpty()) return List.of();
 
         // 收集已学主题中覆盖的能力名称
         Set<String> covered = new HashSet<>();
-        List<EpisodeCacheService.LearnedTopic> safe = learnedTopics != null ? learnedTopics : List.of();
-        for (EpisodeCacheService.LearnedTopic t : safe) {
+        List<UnitStore.LearnedUnit> safe = learnedTopics != null ? learnedTopics : List.of();
+        for (UnitStore.LearnedUnit t : safe) {
             String combined = (t.goal() != null ? t.goal() : "")
                     + " " + String.join(" ", t.toolNames() != null ? t.toolNames() : List.of());
             for (var entry : CAPABILITY_RULES.entrySet()) {
@@ -555,46 +552,42 @@ public class AutonomousExplorationService {
 
     // ========== P0-1: 黑名单机制 ==========
 
-    /** 从最近尝试主题构建黑名单：同一目标 FAILED ≥2次 → 列入。已有 ACTIVE 经验的目标不拉黑。超过 30 分钟自动过期。 */
-    private Map<String, Integer> buildBlacklist(List<EpisodeCacheService.AttemptedTopic> attemptedTopics,
-                                                 List<EpisodeCacheService.LearnedTopic> learnedTopics) {
+    /** 从最近尝试主题构建黑名单：同一目标 FAILED ≥2次 → 列入。已有 ACTIVE 经验的目标不拉黑。 */
+    private Map<String, Integer> buildBlacklist(List<UnitStore.AttemptedUnit> attemptedTopics,
+                                                 List<UnitStore.LearnedUnit> learnedTopics) {
         Map<String, Integer> blacklisted = new LinkedHashMap<>();
-        long now = System.currentTimeMillis();
-        if (attemptedTopics == null || attemptedTopics.isEmpty()) return blacklisted;
 
         // 先收集已掌握的目标（ACTIVE），这些不拉黑
         Set<String> masteredGoals = new LinkedHashSet<>();
         if (learnedTopics != null) {
-            for (EpisodeCacheService.LearnedTopic lt : learnedTopics) {
+            for (UnitStore.LearnedUnit lt : learnedTopics) {
                 String normalized = normalizeGoal(lt.goal());
                 if (!normalized.isBlank()) masteredGoals.add(normalized);
             }
         }
 
-        for (EpisodeCacheService.AttemptedTopic t : attemptedTopics) {
-            if (!"FAILED".equalsIgnoreCase(t.status())) continue;
-            String key = normalizeGoal(t.goal());
-            if (key.isBlank()) continue;
+        // 统计每个目标的 FAILED 次数，只有 ≥ BLACKLIST_THRESHOLD 才真正拉黑
+        Map<String, Integer> failCounts = new LinkedHashMap<>();
+        if (attemptedTopics != null) {
+            for (UnitStore.AttemptedUnit t : attemptedTopics) {
+                if (!"FAILED".equalsIgnoreCase(t.status())) continue;
+                String key = normalizeGoal(t.goal());
+                if (key.isBlank()) continue;
 
-            // 已有 ACTIVE 成功经验 → 不拉黑
-            if (masteredGoals.contains(key)) {
-                log.debug("🛡️ 不拉黑 '{}'（已有 ACTIVE 成功经验）", t.goal());
-                continue;
-            }
-
-            int count = blacklisted.merge(key, 1, Integer::sum);
-            if (count >= BLACKLIST_THRESHOLD) {
-                log.debug("⛔ 黑名单: {}（FAILED {}次）", t.goal(), count);
+                // 已有 ACTIVE 成功经验 → 不拉黑
+                if (masteredGoals.contains(key)) {
+                    log.debug("🛡️ 不拉黑 '{}'（已有 ACTIVE 成功经验）", t.goal());
+                    continue;
+                }
+                failCounts.merge(key, 1, Integer::sum);
             }
         }
-        // 合并内存中的 failedGoalCounts（30 分钟过期）
-        for (var entry : failedGoalCounts.entrySet()) {
-            String key = entry.getKey();
-            Long recordedAt = goalFailedAt.get(key);
-            if (recordedAt != null && (now - recordedAt) > BLACKLIST_TTL_MS) {
-                continue; // 已过期，跳过
+
+        for (var entry : failCounts.entrySet()) {
+            if (entry.getValue() >= BLACKLIST_THRESHOLD) {
+                blacklisted.put(entry.getKey(), entry.getValue());
+                log.debug("⛔ 黑名单: {}（FAILED {}次）", entry.getKey(), entry.getValue());
             }
-            blacklisted.merge(key, entry.getValue(), Integer::sum);
         }
         return blacklisted;
     }

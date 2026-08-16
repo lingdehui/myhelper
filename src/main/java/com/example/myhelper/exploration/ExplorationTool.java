@@ -56,13 +56,13 @@ public class ExplorationTool {
                 maintenanceService.getTarget() * 100);
     }
 
-    @Tool(description = "将指定 Episode 标记为永久保护，防止被凌晨记忆清理任务自动删除。参数 episodeId 为 Episode 的 UUID。")
+    @Tool(description = "将指定 Unit 标记为永久保护，防止被凌晨记忆清理任务自动删除。参数 unitId 为 Unit 的 UUID。")
     public String protectMemory(
-            @ToolParam(description = "Episode 的 UUID") String episodeId) {
-        if (episodeId == null || episodeId.isBlank()) {
-            return "请提供要保护的 Episode ID。";
+            @ToolParam(description = "Unit 的 UUID") String unitId) {
+        if (unitId == null || unitId.isBlank()) {
+            return "请提供要保护的 Unit ID。";
         }
-        maintenanceService.protectMemory(episodeId);
-        return "已标记永久保护: " + episodeId + "。该记忆在凌晨清理时将被跳过。";
+        maintenanceService.protectMemory(unitId);
+        return "已标记永久保护: " + unitId + "。该记忆在凌晨清理时将被跳过。";
     }
 }

@@ -1,6 +1,10 @@
 package com.example.myhelper.registry;
 
 import com.example.myhelper.autogen.GeneratedToolRegistry;
+import com.example.myhelper.common.AiResponseUtils;
+import com.example.myhelper.config.ModelRouter;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
@@ -29,11 +33,14 @@ public class ToolSyncService {
 
     private final ToolRegistry toolRegistry;
     private final GeneratedToolRegistry generatedToolRegistry;
+    private final ModelRouter modelRouter;
 
     public ToolSyncService(ToolRegistry toolRegistry,
-                            GeneratedToolRegistry generatedToolRegistry) {
+                            GeneratedToolRegistry generatedToolRegistry,
+                            ModelRouter modelRouter) {
         this.toolRegistry = toolRegistry;
         this.generatedToolRegistry = generatedToolRegistry;
+        this.modelRouter = modelRouter;
     }
 
     /**
@@ -70,6 +77,9 @@ public class ToolSyncService {
                 currentModels.put(model.id(), model);
             }
         }
+
+        // 2.5 为 MCP 工具批量生成中文描述（B1 次因修复：MCP 描述是英文，中文关键词搜不到）
+        enrichMcpChineseDescriptions(currentModels);
 
         // 3. 对比 Neo4j 已有记录
         Set<String> dbIds;
@@ -116,12 +126,7 @@ public class ToolSyncService {
             } catch (Exception ignored) {}
         }
 
-        // 6. 分类写入图谱
-        if (neo4jAvailable) {
-            syncCategoriesToGraph(currentModels.values(), dbIds);
-        }
-
-        // 7. 重新加载内存缓存（Neo4j 不可用时从 Qdrant 补充））
+        // 6. 重新加载内存缓存（Neo4j 不可用时从 Qdrant 补充））
         try {
             toolRegistry.loadFromNeo4j();
         } catch (Exception e) {
@@ -187,6 +192,88 @@ public class ToolSyncService {
             log.warn("⚠️ 提取工具元数据失败: {}", tc.getToolDefinition().name(), e);
             return null;
         }
+    }
+
+    /**
+     * 为 MCP 工具批量生成中文描述并拼接到 description（B1 次因修复）。
+     * MCP 工具的 description 是英文，导致中文关键词兜底（contains）失效；
+     * 让大模型为每个 MCP 工具生成一句中文描述，拼接到 description 末尾，
+     * 使向量检索和关键词兜底都能命中中文。
+     */
+    private void enrichMcpChineseDescriptions(Map<String, ToolModel> currentModels) {
+        List<ToolModel> mcpModels = currentModels.values().stream()
+                .filter(m -> "MCP".equals(m.type()))
+                .toList();
+        if (mcpModels.isEmpty()) return;
+
+        try {
+            if (!modelRouter.isCloudAvailable()) {
+                log.warn("⚠️ 云端 AI 不可用，跳过 MCP 工具中文描述生成");
+                return;
+            }
+
+            StringBuilder toolList = new StringBuilder();
+            for (int i = 0; i < mcpModels.size(); i++) {
+                ToolModel m = mcpModels.get(i);
+                toolList.append(i + 1).append(". ").append(m.name()).append(": ")
+                        .append(m.description() == null ? "" : m.description()).append("\n");
+            }
+
+            String prompt = """
+                    你是工具描述翻译助手。为下面每个工具生成一句简洁的中文功能描述（5-15字），
+                    用于中文关键词检索。严格只输出一个 JSON 对象，不要输出任何其他文字或解释。
+                    格式：{"工具名": "中文描述", ...}
+                    要求：工具名保持原样作为 key，中文描述要准确概括工具功能，可包含关键词同义词。
+
+                    工具列表：
+                    %s
+                    """.formatted(toolList);
+
+            String response = modelRouter.cloudOnly().prompt().user(prompt).call().content();
+            log.info("🌐 MCP 工具中文描述生成完成: {}", AiResponseUtils.truncate(response, 300));
+
+            Map<String, String> zhMap = parseZhDescriptionMap(response);
+            if (zhMap.isEmpty()) {
+                log.warn("⚠️ MCP 中文描述解析失败，跳过");
+                return;
+            }
+
+            int enriched = 0;
+            for (ToolModel m : mcpModels) {
+                String zh = zhMap.get(m.name());
+                if (zh == null || zh.isBlank()) continue;
+                ToolModel enrichedModel = ToolModel.of(m.id(), m.name(),
+                        m.description() + "\n中文描述: " + zh,
+                        m.type(), m.source(), m.parameters(), m.returnType(),
+                        m.categories(), m.inputSchema());
+                currentModels.put(m.id(), enrichedModel);
+                enriched++;
+            }
+            log.info("✅ 已为 {} 个 MCP 工具补充中文描述", enriched);
+        } catch (Exception e) {
+            log.warn("⚠️ MCP 工具中文描述生成失败: {}", e.getMessage());
+        }
+    }
+
+    /** 容错解析大模型返回的 JSON：{"工具名": "中文描述", ...} */
+    private Map<String, String> parseZhDescriptionMap(String response) {
+        Map<String, String> result = new LinkedHashMap<>();
+        if (response == null || response.isBlank()) return result;
+        try {
+            int start = response.indexOf('{');
+            int end = response.lastIndexOf('}');
+            if (start < 0 || end <= start) return result;
+            String json = response.substring(start, end + 1);
+            Map<String, Object> raw = new ObjectMapper().readValue(json, new TypeReference<>() {});
+            for (Map.Entry<String, Object> e : raw.entrySet()) {
+                if (e.getValue() != null) {
+                    result.put(e.getKey(), String.valueOf(e.getValue()));
+                }
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ 中文描述 JSON 解析失败: {}", e.getMessage());
+        }
+        return result;
     }
 
     /** 从 ToolDefinition 提取参数列表 */
@@ -301,87 +388,7 @@ public class ToolSyncService {
 
     // ==================== 分类图谱同步 ====================
 
-    /**
-     * 将工具的分类关系写入 Neo4j 图谱。
-     * 工具通过 BELONGS_TO 关系关联到 ToolCategory 节点。
-     *
-     * <p>分类来源：</p>
-     * <ul>
-     *   <li>从工具名称/描述推断分类（如 "screenshot" → GUI_CONTROL）</li>
-     *   <li>MCP 工具归入 MCP_SERVICE 分类</li>
-     *   <li>生成工具归入 GENERATED 分类</li>
-     * </ul>
-     */
-    private void syncCategoriesToGraph(Collection<ToolModel> currentModels, Set<String> dbIds) {
-        try {
-            // 预定义分类（硬编码映射，后续可从配置文件读取）
-            Map<String, String> categoryMap = buildCategoryHintMap();
-
-            for (ToolModel model : currentModels) {
-                String category = guessCategory(model, categoryMap);
-                if (category != null) {
-                    toolRegistry.ensureCategory(category, category, "自动分类", 10);
-                    toolRegistry.linkCategory(model.id(), category);
-                }
-            }
-            log.info("📁 工具分类已写入 Neo4j 图谱");
-        } catch (Exception e) {
-            log.warn("⚠️ 分类图谱写入失败: {}", e.getMessage());
-        }
-    }
-
-    /** 根据工具信息推断分类 */
-    private String guessCategory(ToolModel model, Map<String, String> categoryMap) {
-        String nameLower = model.name().toLowerCase();
-        String descLower = model.description() != null ? model.description().toLowerCase() : "";
-
-        // MCP 工具
-        if ("MCP".equals(model.type())) return "MCP_SERVICE";
-        // 生成工具
-        if ("GENERATED".equals(model.type())) return "GENERATED";
-
-        // 按关键词匹配
-        for (Map.Entry<String, String> entry : categoryMap.entrySet()) {
-            if (nameLower.contains(entry.getKey()) || descLower.contains(entry.getKey())) {
-                return entry.getValue();
-            }
-        }
-
-        return "GENERAL";
-    }
-
-    /** 构建关键词→分类映射表 */
-    private Map<String, String> buildCategoryHintMap() {
-        Map<String, String> map = new LinkedHashMap<>();
-        map.put("screen", "GUI_CONTROL");
-        map.put("screenshot", "GUI_CONTROL");
-        map.put("capture", "GUI_CONTROL");
-        map.put("window", "GUI_CONTROL");
-        map.put("click", "GUI_CONTROL");
-        map.put("mouse", "GUI_CONTROL");
-        map.put("keyboard", "GUI_CONTROL");
-        map.put("type", "GUI_CONTROL");
-        map.put("ocr", "SCREEN_OCR");
-        map.put("file", "FILE_SYSTEM");
-        map.put("read", "FILE_SYSTEM");
-        map.put("write", "FILE_SYSTEM");
-        map.put("browser", "NETWORK");
-        map.put("http", "NETWORK");
-        map.put("download", "NETWORK");
-        map.put("search", "SEARCH");
-        map.put("speech", "SPEECH");
-        map.put("asr", "SPEECH");
-        map.put("tts", "SPEECH");
-        map.put("voice", "SPEECH");
-        map.put("home", "SMART_HOME");
-        map.put("light", "SMART_HOME");
-        map.put("device", "SMART_HOME");
-        map.put("skill", "SKILL");
-        map.put("tool", "TOOL_MANAGEMENT");
-        map.put("plan", "TOOL_MANAGEMENT");
-        map.put("memory", "MEMORY");
-        map.put("episode", "MEMORY");
-        map.put("explor", "EXPLORATION");
-        return map;
-    }
+    // 已移除硬编码关键词分类（guessCategory/buildCategoryHintMap）。
+    // 分类统一由 ToolCategoryService.syncCategories() 通过 AI 生成，
+    // 写入 Neo4j 图谱（ToolCategory 节点 + BELONGS_TO 交叉分类关系）。
 }

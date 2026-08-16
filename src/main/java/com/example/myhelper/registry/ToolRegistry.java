@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -105,6 +106,8 @@ public class ToolRegistry {
      * Neo4j + Qdrant 双写。
      */
     public void upsertTool(ToolModel model) {
+        boolean isNew = !memoryCache.containsKey(model.id());
+
         // 1. Neo4j（可降级）
         ToolNode node = modelToNode(model);
         try {
@@ -119,7 +122,12 @@ public class ToolRegistry {
         // 3. 内存缓存
         memoryCache.put(model.id(), model);
         nameToId.put(model.name(), model.id());
-        markDirty();  // 新工具入库，标记需要重新分类
+
+        // 只有「新增真实工具」才需要重新分类；更新已有工具、或 planStep_ 动态工具不触发
+        // （避免每次 turn 动态注册 planStep_ 工具导致分类反复重同步）
+        if (isNew && !model.name().startsWith("planStep_")) {
+            markDirty();
+        }
     }
 
     /**
@@ -253,7 +261,10 @@ public class ToolRegistry {
 
             List<ToolModel> results = new ArrayList<>();
             for (Map<String, Object> point : points) {
-                String toolId = String.valueOf(point.get("id"));
+                @SuppressWarnings("unchecked")
+                Map<String, Object> payload = (Map<String, Object>) point.get("payload");
+                String toolId = payload != null ? String.valueOf(payload.get("toolId")) : null;
+                if (toolId == null || toolId.isBlank() || "null".equals(toolId)) continue;
                 // 优先从内存缓存取（已有完整参数信息）
                 ToolModel model = memoryCache.get(toolId);
                 if (model != null) {
@@ -285,12 +296,47 @@ public class ToolRegistry {
         }
     }
 
-    /** 确保分类节点存在，不存在则创建 */
+    /** 按工具名关联分类（AI 分类的 tools 数组里是工具名，需先映射到 toolId） */
+    public void linkCategoryByName(String toolName, String categoryName) {
+        Optional<ToolModel> tool = findByName(toolName);
+        if (tool.isPresent()) {
+            linkCategory(tool.get().id(), categoryName);
+        }
+    }
+
+    /** 确保分类节点存在（无层级，兼容旧调用），不存在则创建 */
     public void ensureCategory(String name, String displayName, String description, Integer priority) {
-        if (categoryRepo.findById(name).isEmpty()) {
-            ToolCategoryNode cat = new ToolCategoryNode(name, displayName, description, priority);
-            categoryRepo.save(cat);
-            log.info("📁 创建分类: {}", name);
+        ensureCategory(name, displayName, description, priority, null, null);
+    }
+
+    /** 确保分类节点存在（含层级），不存在则创建，存在则更新描述/层级 */
+    public void ensureCategory(String name, String displayName, String description, Integer priority,
+                               String parentId, Integer level) {
+        ToolCategoryNode cat = categoryRepo.findById(name).orElse(null);
+        if (cat == null) {
+            cat = new ToolCategoryNode(name, displayName, description, priority, parentId, level);
+            cat.setDynamic(true);
+            log.info("📁 创建分类: {} (L{})", name, level);
+        } else {
+            if (displayName != null) cat.setDisplayName(displayName);
+            if (description != null) cat.setDescription(description);
+            if (priority != null) cat.setPriority(priority);
+            if (parentId != null) cat.setParentId(parentId);
+            if (level != null) cat.setLevel(level);
+            cat.setDynamic(true);
+        }
+        categoryRepo.save(cat);
+    }
+
+    /** 从 Neo4j 读所有分类节点（含 BELONGS_TO 工具关系） */
+    public List<ToolCategoryNode> listCategoryNodes() {
+        try {
+            List<ToolCategoryNode> result = new ArrayList<>();
+            categoryRepo.findAll().forEach(result::add);
+            return result;
+        } catch (Exception e) {
+            log.warn("⚠️ 从 Neo4j 读分类节点失败: {}", e.getMessage());
+            return List.of();
         }
     }
 
@@ -358,10 +404,18 @@ public class ToolRegistry {
         payload.put("status", m.status());
 
         Map<String, Object> point = new LinkedHashMap<>();
-        point.put("id", m.id());
+        point.put("id", qdrantPointId(m.id()));
         point.put("vector", vector);
         point.put("payload", payload);
         return point;
+    }
+
+    /**
+     * Qdrant point id 只接受 UUID 或 u64 整数，而工具 id 是 "type:source:name" 形式，
+     * 需转换成稳定 UUID（同一 toolId 永远生成同一 UUID，保证幂等可更新/删除）。
+     */
+    private String qdrantPointId(String toolId) {
+        return UUID.nameUUIDFromBytes(toolId.getBytes(StandardCharsets.UTF_8)).toString();
     }
 
     private void upsertToQdrant(ToolModel m) {
@@ -378,7 +432,7 @@ public class ToolRegistry {
 
     private void deleteFromQdrant(String toolId) {
         try {
-            Map<String, Object> body = Map.of("points", List.of(toolId));
+            Map<String, Object> body = Map.of("points", List.of(qdrantPointId(toolId)));
             qdrant.post().uri("/collections/" + collectionName + "/points/delete?wait=true")
                     .header("Content-Type", "application/json")
                     .bodyValue(body).retrieve().toBodilessEntity().block();

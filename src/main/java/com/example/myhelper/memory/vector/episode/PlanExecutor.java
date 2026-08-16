@@ -11,11 +11,11 @@ import java.util.Map;
 /**
  * 计划脚本执行器（决策1：稳定度高时升级成脚本）。
  *
- * <p>当 episode 的 canScript=true（successCount≥5 且 stability>0.9）时，
- * 跳过 AI 决策，直接按 toolCalls 脚本逐步调用工具（ToolCallback.call()）。</p>
+ * <p>当 Unit 的 scriptable=true（successCount≥5 且 stability>0.9）时，
+ * 跳过 AI 决策，直接按 script 脚本逐步调用工具（ToolCallback.call()）。</p>
  *
  * <h3>变量替换</h3>
- * <p>toolCalls 的 args 里的 <code>$varName</code> 占位符替换为 PlanMatcher 提取的变量值。
+ * <p>script 的 args 里的 <code>$varName</code> 占位符替换为 PlanMatcher 提取的变量值。
  * 例：<code>{"name":"$contact"}</code> → <code>{"name":"张三"}</code></p>
  *
  * <h3>失败处理（决策2：失败步重新规划后继续）</h3>
@@ -56,26 +56,24 @@ public class PlanExecutor {
     /**
      * 按计划脚本逐步执行（稳定度高时调用，跳过 AI）。
      *
-     * @param episode    可脚本化的 episode（canScript=true）
-     * @param variables  变量值（PlanMatcher 提取，key=变量名, value=变量值）
-     * @param allTools   所有可用工具
+     * @param script    预编译线性脚本（Unit.script 或 Episode.toolCalls）
+     * @param variables 变量值（PlanMatcher 提取，key=变量名, value=变量值）
+     * @param allTools  所有可用工具
      * @return 执行结果（含已执行步骤日志 + 失败步位置）
      */
-    public ExecutionResult executeScript(Episode episode, Map<String, String> variables,
+    public ExecutionResult executeScript(List<ToolCallLog> script, Map<String, String> variables,
                                           ToolCallback[] allTools) {
-        List<ToolCallLog> script = episode.toolCalls();
         if (script == null || script.isEmpty()) {
             return ExecutionResult.failed(new ArrayList<>(), -1, "脚本为空");
         }
-        return executeFromStep(episode, 0, variables, allTools);
+        return executeFromStep(script, 0, variables, allTools);
     }
 
     /** 从失败步之后继续执行剩余步骤（分段继续，决策2） */
-    public ExecutionResult executeFromStep(Episode episode, int fromStep,
+    public ExecutionResult executeFromStep(List<ToolCallLog> script, int fromStep,
                                             Map<String, String> variables,
                                             ToolCallback[] allTools) {
         List<ToolCallLog> executed = new ArrayList<>();
-        List<ToolCallLog> script = episode.toolCalls();
 
         if (script == null || fromStep >= script.size()) {
             return ExecutionResult.success(executed);

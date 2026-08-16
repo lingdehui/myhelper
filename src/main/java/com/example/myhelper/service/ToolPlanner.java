@@ -5,9 +5,13 @@ import com.example.myhelper.common.PromptLoader;
 import com.example.myhelper.config.MyHelperProperties;
 import com.example.myhelper.config.SystemEnvironmentService;
 import com.example.myhelper.memory.graph.RuleNode;
+import com.example.myhelper.memory.unit.Unit;
+import com.example.myhelper.memory.unit.UnitKind;
+import com.example.myhelper.memory.unit.ExplorationRecord;
+import com.example.myhelper.memory.unit.FailureCause;
+import com.example.myhelper.memory.unit.UnitStore;
+import com.example.myhelper.memory.unit.UnitFailureService;
 import com.example.myhelper.memory.vector.category.ToolCategoryService;
-import com.example.myhelper.memory.vector.episode.Episode;
-import com.example.myhelper.memory.vector.episode.EpisodeCacheService;
 import com.example.myhelper.memory.vector.episode.ToolCallLog;
 import com.example.myhelper.registry.ToolModel;
 import com.example.myhelper.registry.ToolRegistry;
@@ -24,38 +28,35 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * 三阶段工具规划器（升级版：三层缓存 + Episode 经验学习）。
+ * 三阶段工具规划器（升级版：三层缓存 + Unit 图化经验学习）。
  *
- * <p>借鉴 ExpeL/MUSE 经验学习思想，在原有内存缓存基础上增加 Episode 向量检索层，
+ * <p>在原有内存缓存基础上增加 Unit 语义检索层（Neo4j + Qdrant unit-registry），
  * 实现跨重启的语义级方案复用。</p>
  *
  * <h3>三层缓存查询逻辑</h3>
  * <pre>
  * plan(userInput, allTools):
  *   [Layer 1] 内存缓存（ConcurrentHashMap，key=AiResponseUtils.normalizeKey(userInput)）
- *             命中 → 返回 PlanResult(fromCache=true, episodeId=entry.episodeId)
+ *             命中 → 返回 PlanResult(fromCache=true, unitId=entry.unitId)
  *             不查 Qdrant，避免重复 embed（200-500ms）
- *   [Layer 2] Episode 向量检索（Qdrant episodes collection）
- *             embed(userInput) → search(top_k=3, score_threshold=0.65,
- *                                        filter: archived=false AND stability>=0.6)
- *             命中 → 回填内存缓存 → 返回 PlanResult(fromCache=true, episodeId=ep.id)
+ *   [Layer 2] Unit 语义检索（Qdrant unit-registry collection）
+ *             embed(userInput) → unitStore.findSimilar → 过滤 unitKind=PLAN_STEP
+ *             命中 → 回填内存缓存 → 返回 PlanResult(fromCache=true, unitId=unit.unitId)
  *   [Layer 3] AI 规划（现有 doPlan 逻辑）
- *             返回 PlanResult(fromCache=false, episodeId=null)
+ *             返回 PlanResult(fromCache=false, unitId=null)
  * </pre>
  *
  * <h3>淘汰策略（两层独立）</h3>
  * <ul>
  *   <li>内存缓存：连续失败 3 次 → 清除（重启后也清空）</li>
- *   <li>Episode：failureCount+1，stability&lt;0.3 或连续失败 3 次 → archived=true
- *       （不被检索但数据保留，跨重启持久化）</li>
+ *   <li>Unit：PLAN 失败 3 次 → ARCHIVED（不检索但数据保留，跨重启持久化，见 UnitFailureService）</li>
  * </ul>
  *
  * <h3>反馈学习</h3>
  * <ul>
- *   <li>命中缓存+成功 → 内存重置失败计数 + 异步 incrementSuccess（successCount+1，不重置 failureCount，让 stability 自然衰退）</li>
- *   <li>命中缓存+失败 → 内存失败计数+1 + 异步 recordFailure（达阈值 archive）</li>
- *   <li>首次规划+成功 → 内存写入 + 异步 recordSuccess（新建 Episode，返回 episodeId 回填内存缓存）</li>
- *   <li>首次请求就失败 → episodeId=null，所有回调 no-op（Episode 库只存成功方案）</li>
+ *   <li>命中缓存+成功 → 内存重置失败计数 + unitStore.incrementSuccess（successCount+1，脚本化升级判定）</li>
+ *   <li>命中缓存+失败 → 内存失败计数+1 + unitFailureService.recordFailure（PLAN 达阈值归档）</li>
+ *   <li>首次规划+成功 → 由 UnitSedimentationService 沉淀 PLAN_STEP Unit（图化记忆，非本类职责）</li>
  * </ul>
  */
 @Component
@@ -64,7 +65,8 @@ public class ToolPlanner {
     private static final Logger log = LoggerFactory.getLogger(ToolPlanner.class);
 
     private final ModelRouter modelRouter;
-    private final EpisodeCacheService episodeCacheService;
+    private final UnitStore unitStore;
+    private final UnitFailureService unitFailureService;
     private final ToolCategoryService categoryService;
     private final ToolRegistry toolRegistry;
     private final RuleInductionService ruleInductionService;
@@ -72,23 +74,19 @@ public class ToolPlanner {
     private final PromptLoader promptLoader;
     private final SystemEnvironmentService envService;
 
-    /** 脚本化阈值：与 EpisodeCacheService 保持一致，successCount≥此值 且 stability>0.9 时 canScript=true */
-    @Value("${qdrant.episode.script-success-threshold:5}")
-    private int scriptSuccessThreshold;
-
-    /** 缓存条目：方案 + episodeId + episode引用 + 连续失败次数 */
+    /** 缓存条目：方案 + unitId + Unit引用 + 连续失败次数 */
     private static class CacheEntry {
         final List<String> selectedToolNames;
         final List<String> missingDescriptions;
-        final String episodeId;  // 关联的 Qdrant episode id（可能为 null）
-        volatile Episode episode;   // episode 引用（含 successLesson/failureLesson，可能为 null）；volatile 因 onCacheHitSuccess 会更新 canScript
+        final String unitId;  // 关联的 Unit id（可能为 null）
+        volatile Unit unit;   // Unit 引用（含 script/notes，可能为 null）
         volatile int failureCount;     // volatile：onCacheHitSuccess 和 onCacheHitFailure 可能并发
         CacheEntry(List<String> selectedToolNames, List<String> missingDescriptions,
-                   String episodeId, Episode episode) {
+                   String unitId, Unit unit) {
             this.selectedToolNames = selectedToolNames;
             this.missingDescriptions = missingDescriptions;
-            this.episodeId = episodeId;
-            this.episode = episode;
+            this.unitId = unitId;
+            this.unit = unit;
             this.failureCount = 0;
         }
     }
@@ -104,7 +102,8 @@ public class ToolPlanner {
             });
 
     public ToolPlanner(ModelRouter modelRouter,
-                        EpisodeCacheService episodeCacheService,
+                        UnitStore unitStore,
+                        UnitFailureService unitFailureService,
                         ToolCategoryService categoryService,
                         ToolRegistry toolRegistry,
                         RuleInductionService ruleInductionService,
@@ -112,7 +111,8 @@ public class ToolPlanner {
                         PromptLoader promptLoader,
                         SystemEnvironmentService envService) {
         this.modelRouter = modelRouter;
-        this.episodeCacheService = episodeCacheService;
+        this.unitStore = unitStore;
+        this.unitFailureService = unitFailureService;
         this.categoryService = categoryService;
         this.toolRegistry = toolRegistry;
         this.ruleInductionService = ruleInductionService;
@@ -126,9 +126,9 @@ public class ToolPlanner {
      *
      * @param selectedToolNames   选中的工具名列表
      * @param missingDescriptions 缺失的工具描述
-     * @param fromCache           是否来自缓存（内存或 Episode）
-     * @param episodeId           关联的 Episode id（内存命中或 Episode 命中时非 null；AI 规划时为 null）
-     * @param episode             命中的完整 Episode（含 successLesson/failureLesson/toolCalls）；
+     * @param fromCache           是否来自缓存（内存或 Unit）
+     * @param unitId              关联的 Unit id（内存命中或 Unit 命中时非 null；AI 规划时为 null）
+     * @param unit                命中的完整 Unit（含 script/notes）；
      *                            AI 规划时为 null。调用方可据此增强 prompt（参考计划+经验提示）
      * @param failureWarnings     历史失败警告列表（向量检索匹配的 FailurePattern），用于注入 AI prompt 避坑
      */
@@ -136,9 +136,9 @@ public class ToolPlanner {
             List<String> selectedToolNames,
             List<String> missingDescriptions,
             boolean fromCache,
-            String episodeId,
-            Episode episode,
-            List<EpisodeCacheService.FailureSearchResult> failureWarnings,
+            String unitId,
+            Unit unit,
+            List<FailureCause> failureWarnings,
             boolean allowListAllTools
     ) {
         public PlanResult {
@@ -147,79 +147,92 @@ public class ToolPlanner {
             missingDescriptions = missingDescriptions == null ? new ArrayList<>() : new ArrayList<>(missingDescriptions);
         }
 
-        /** AI 规划的便捷工厂（episode=null, failureWarnings=empty） */
+        /** AI 规划的便捷工厂（unit=null, failureWarnings=empty） */
         public static PlanResult ofAIPlan(List<String> tools, List<String> missing) {
             return new PlanResult(tools, missing, false, null, null, List.of(), false);
         }
         /** 带失败警告的 AI 规划工厂 */
         public static PlanResult ofAIPlan(List<String> tools, List<String> missing,
-                                           List<EpisodeCacheService.FailureSearchResult> warnings) {
+                                           List<FailureCause> warnings) {
             return new PlanResult(tools, missing, false, null, null, warnings, false);
         }
         /** 标记本计划已降级为全量工具兜底，执行阶段允许调用 listAllTools 翻页查看全量 */
         public PlanResult withListAllToolsAllowed() {
             return new PlanResult(selectedToolNames, missingDescriptions, fromCache,
-                    episodeId, episode, failureWarnings, true);
+                    unitId, unit, failureWarnings, true);
         }
     }
 
     /**
-     * 正常规划入口：三层缓存查询（内存 → Episode → AI 多轮规划）。
+     * 正常规划入口：三层缓存查询（内存 → Unit → AI 多轮规划）。
      *
      * <h3>查询链路</h3>
      * <ol>
      *   <li><b>Layer 1 — 内存缓存</b>：ConcurrentHashMap 精确匹配（normalizeKey 处理中文标点），
-     *       命中直接返回，附带 episode 引用（含 successLesson/failureLesson/toolCalls）</li>
-     *   <li><b>Layer 2 — Episode 向量检索</b>：Qdrant 语义相似搜索（top_k=3, score≥0.65），
-     *       命中回填 L1 内存缓存，同时并行检索失败模式（searchFailurePatterns）</li>
+     *       命中直接返回，附带 unit 引用（含 script/notes）</li>
+     *   <li><b>Layer 2 — Unit 语义检索</b>：Qdrant unit-registry 语义相似搜索，
+     *       过滤 unitKind=PLAN_STEP，命中回填 L1 内存缓存，同时并行检索失败原因（searchFailureCauses）</li>
      *   <li><b>Layer 3 — AI 多轮规划</b>：调用 {@link #doPlan(String, ToolCallback[], String, List)}，
      *       走完整的 3 阶段树形分类→工具选择流程</li>
      * </ol>
      *
-     * <p>缓存命中时 PlanResult.fromCache=true，PlanResult.episode 非 null，
+     * <p>缓存命中时 PlanResult.fromCache=true，PlanResult.unit 非 null，
      * 调用方可据此判断可用性 + 带参考计划执行。</p>
      *
      * @param userInput 用户输入文本
      * @param allTools  全部可用工具（147 个，MCP + Java + Generated）
-     * @return PlanResult（fromCache 标识命中状态，episode 含历史经验）
+     * @return PlanResult（fromCache 标识命中状态，unit 含历史经验）
      */
     public PlanResult plan(String userInput, ToolCallback[] allTools) {
         String key = AiResponseUtils.normalizeKey(userInput);
+        String retrievalKey = extractRetrievalKey(userInput);
 
         // ===== Layer 1: 内存缓存（精确匹配，最快）=====
         CacheEntry entry = cache.get(key);
         if (entry != null) {
             log.info("💾 命中内存缓存（失败计数: {}/{}{}）", entry.failureCount, props.toolPlanner().failureThreshold(),
-                    (entry.episodeId != null ? ", episode=" + entry.episodeId.substring(0, 8) + "..." : ""));
+                    (entry.unitId != null ? ", unit=" + entry.unitId.substring(0, 8) + "..." : ""));
             // L1 命中但仍检索失败警告（轻量，不额外 embed）
-            List<EpisodeCacheService.FailureSearchResult> warnL1 = episodeCacheService.searchFailurePatterns(userInput, 3);
+            List<FailureCause> warnL1 = unitFailureService.searchFailureCauses(retrievalKey, 3);
             return new PlanResult(entry.selectedToolNames, entry.missingDescriptions,
-                    true, entry.episodeId, entry.episode, warnL1, false);
+                    true, entry.unitId, entry.unit, warnL1, false);
         }
 
-        // ===== Layer 2: Episode 向量检索 + 失败模式并行检索 =====
-        Optional<Episode> ep = episodeCacheService.findSimilarEpisode(userInput);
-        List<EpisodeCacheService.FailureSearchResult> warnings = episodeCacheService.searchFailurePatterns(userInput, 3);
+        // ===== Layer 2: Unit 语义检索（unit-registry）+ 失败模式并行检索 =====
+        List<FailureCause> warnings = unitFailureService.searchFailureCauses(retrievalKey, 3);
+        Optional<Unit> matchedUnit = unitStore.findSimilar(retrievalKey, 1).stream()
+                .filter(u -> u.unitKind() == UnitKind.PLAN_STEP)
+                .findFirst();
 
         if (!warnings.isEmpty()) {
-            log.info("⚠️ 发现 {} 条相关失败警告: {}", warnings.size(),
-                    warnings.stream().map(w -> w.type() + "(" + String.format("%.0f%%", w.score() * 100) + ")")
+            log.info("⚠️ 发现 {} 条相关失败原因: {}", warnings.size(),
+                    warnings.stream().map(w -> "[" + w.category() + "] " + w.reason())
                             .reduce((a, b) -> a + ", " + b).orElse(""));
         }
 
-        if (ep.isPresent()) {
-            Episode episode = ep.get();
-            // 回填内存缓存（带 episode 引用，含 lesson），下次相同输入直接内存命中
-            cache.put(key, new CacheEntry(episode.selectedToolNames(), episode.missingDescriptions(),
-                    episode.id(), episode));
-            log.info("💾 命中 Episode 缓存（稳定度: {}, episode={}...）", String.format("%.2f", episode.computedStability()),
-                    episode.id().substring(0, 8));
-            return new PlanResult(episode.selectedToolNames(), episode.missingDescriptions(),
-                    true, episode.id(), episode, warnings, false);
+        if (matchedUnit.isPresent()) {
+            Unit unit = matchedUnit.get();
+            List<String> toolNames = unit.script().stream().map(ToolCallLog::toolName).toList();
+            // 回填内存缓存（带 Unit 引用，含 script/notes），下次相同输入直接内存命中
+            cache.put(key, new CacheEntry(toolNames, List.of(), unit.unitId(), unit));
+            log.info("💾 命中 Unit 缓存（稳定度: {}, unit={}...）", String.format("%.2f", unit.computedStability()),
+                    unit.unitId().substring(0, 8));
+            return new PlanResult(toolNames, List.of(), true, unit.unitId(), unit, warnings, false);
         }
 
         // ===== Layer 3: AI 规划 =====
         return doPlan(userInput, allTools, null, warnings);
+    }
+
+    /**
+     * 提取检索用的简洁 query。
+     *
+     * <p>探索模式的 userInput 是完整 prompt（学习方法 + 工具清单 + 学习目标 + 期望成果 + 成功标准），
+     * 直接用整段做向量检索会被工具清单噪声污染。这里只取「学习目标」片段，
+     * 普通用户输入（无「学习目标」标记）原样返回。</p>
+     */
+    private String extractRetrievalKey(String userInput) {
+        return AiResponseUtils.extractLearningGoal(userInput);
     }
 
     /**
@@ -229,8 +242,8 @@ public class ToolPlanner {
      *
      * <p>归因结果决定惩罚策略：
      * <ul>
-     *   <li>isPlanIssue=true（计划问题）：内存失败计数+1（达阈值清除）+ Episode failureCount+1（达阈值 archive）</li>
-     *   <li>isPlanIssue=false（环境问题）：不惩罚计划，只存 failureLesson，保留缓存（下次还能用）</li>
+     *   <li>isPlanIssue=true（计划问题）：内存失败计数+1（达阈值清除）+ Unit PLAN 失败+1（达阈值归档）</li>
+     *   <li>isPlanIssue=false（环境问题）：不惩罚计划，只写 Unit notes，保留缓存（下次还能用）</li>
      * </ul>
      *
      * @param userInput    用户原话（用于查内存缓存 key）
@@ -245,8 +258,8 @@ public class ToolPlanner {
         String key = AiResponseUtils.normalizeKey(userInput);
         CacheEntry entry = cache.get(key);
 
-        // 异步更新 Episode（带归因：计划问题才 failureCount+1，环境问题只存 lesson）
-        episodeCacheService.recordFailure(plan.episodeId(), failureLesson, isPlanIssue);
+        // 记录 Unit 失败（PLAN 原因才计数，ENVIRONMENT 只写 notes；达阈值归档 + DISABLES）
+        unitFailureService.recordFailure(plan.unitId(), failureLesson, isPlanIssue, null);
 
         // 环境问题：不惩罚内存缓存，计划本身没问题，保留供下次使用
         if (!isPlanIssue) {
@@ -259,9 +272,7 @@ public class ToolPlanner {
             return true;
         }
         entry.failureCount++;
-        int threshold = entry.episode != null
-                ? effectiveFailureThreshold(entry.episode)
-                : props.toolPlanner().failureThreshold();
+        int threshold = props.toolPlanner().failureThreshold();
         if (entry.failureCount >= threshold) {
             cache.remove(key);
             log.info("🗑️ 缓存连续失败 {} 次（阈值{}），已清除旧方案", entry.failureCount, threshold);
@@ -272,56 +283,39 @@ public class ToolPlanner {
     }
 
     /**
-     * 缓存命中且成功：重置内存失败计数 + 同步更新内存 episode 统计 + 异步 Qdrant 成功计数+1。
+     * 缓存命中且成功：重置内存失败计数 + Unit 成功计数+1（含脚本化升级判定）。
      *
-     * <p>Episode 端用 incrementSuccess（successCount+1，不重置 failureCount），
-     * 让 stability 随环境变化自然衰退，避免老 episode 永不淘汰。</p>
-     *
-     * <p>修复问题3：同步更新内存 CacheEntry 的 episode.successCount 和 canScript，
-     * 使内存命中时也能走脚本执行（否则内存 episode 的 canScript 永远是初始值 false）。</p>
+     * <p>Unit 是 immutable record，脚本化升级由 {@link UnitStore#incrementSuccess} 内部
+     * 走 {@code tryUpgradeScriptable} 判定（successCount≥5 且 stability>0.9）。</p>
      *
      * @param userInput 用户原话（用于查内存缓存 key）
-     * @param plan      当前命中的 PlanResult（用 plan.episodeId() 调 Episode 成功计数）
+     * @param plan      当前命中的 PlanResult（用 plan.unitId() 调 Unit 成功计数）
      */
     public void onCacheHitSuccess(String userInput, PlanResult plan) {
         String key = AiResponseUtils.normalizeKey(userInput);
         CacheEntry entry = cache.get(key);
-        if (entry != null) {
-            if (entry.failureCount > 0) entry.failureCount = 0;
-            // 修复问题3：同步更新内存 episode 的 successCount + canScript
-            if (entry.episode != null) {
-                Episode old = entry.episode;
-                int newSuccess = old.successCount() + 1;
-                int failure = old.failureCount();
-                double newStability = Episode.calcStability(newSuccess, failure);
-                boolean wasScriptable = old.canScript();
-                boolean canScript = newSuccess >= scriptSuccessThreshold && newStability > 0.9;
-                entry.episode = new Episode(
-                        old.id(), old.userInput(), old.selectedToolNames(), old.missingDescriptions(),
-                        old.toolCalls(), old.aiResponse(), old.successLesson(), old.failureLesson(),
-                        old.signature(), old.unitType(), old.isGeneric(), old.parentIds(),
-                        newSuccess, failure, old.archived(), old.timestamp(), newStability,
-                        old.status(), canScript, old.failedStepIndex(),
-                        old.exploreOptimizeCount(), old.exploreDebugCount(),
-                        old.explorationType(), old.explorationSummary());
-                if (canScript && !wasScriptable) {
-                    log.info("🚀 内存缓存 episode 升级为可脚本化（id={}...）", old.id().substring(0, 8));
-                }
-            }
+        if (entry != null && entry.failureCount > 0) {
+            entry.failureCount = 0;
         }
-        episodeCacheService.incrementSuccess(plan.episodeId());
+        unitStore.incrementSuccess(plan.unitId());
     }
 
     // ========== 探索优化权重 ==========
 
+    private static long optimizeCount(Unit unit) {
+        if (unit == null || unit.explorationRecords() == null) return 0;
+        return unit.explorationRecords().stream()
+                .filter(r -> r.declareType() == ExplorationRecord.DeclareType.OPTIMIZE).count();
+    }
+
     /** 计算某计划的优化权重：被优化越多次越不值（权重 ∝ 1/(1+次数)） */
-    public double planOptimizeWeight(Episode episode) {
-        return 1.0 / (1.0 + episode.exploreOptimizeCount());
+    public double planOptimizeWeight(Unit unit) {
+        return 1.0 / (1.0 + optimizeCount(unit));
     }
 
     /** 优化阈值：数据库数据少 → 阈值高（倾向新建扩充），数据多 → 阈值低（倾向优化精炼） */
     public double optimizeThreshold() {
-        int dataVolume = episodeCacheService.countActiveEpisodes();
+        int dataVolume = unitStore.countActiveUnits();
         if (dataVolume < 10) return 0.9;   // 库很小，几乎只新建
         if (dataVolume < 50) return 0.7;
         if (dataVolume < 100) return 0.5;
@@ -329,89 +323,28 @@ public class ToolPlanner {
     }
 
     /** 判断是否值得优化：planWeight >= threshold → 优化，否则新建 */
-    public boolean isWorthOptimizing(Episode episode) {
-        double weight = planOptimizeWeight(episode);
+    public boolean isWorthOptimizing(Unit unit) {
+        double weight = planOptimizeWeight(unit);
         double threshold = optimizeThreshold();
         boolean worth = weight >= threshold;
         log.info("⚖️ 优化权重判断: weight={} threshold={} optimizeCount={} dataVolume={} → {}",
                 String.format("%.2f", weight), String.format("%.2f", threshold),
-                episode.exploreOptimizeCount(),
-                episodeCacheService.countActiveEpisodes(),
+                optimizeCount(unit),
+                unitStore.countActiveUnits(),
                 worth ? "优化" : "新建");
         return worth;
     }
 
     /** 获取优化后的失败删除门槛：基础3次 + 每优化1次多加0.5次（最少3次） */
-    public int effectiveFailureThreshold(Episode episode) {
+    public int effectiveFailureThreshold(Unit unit) {
         return Math.max(props.toolPlanner().failureThreshold(),
-                props.toolPlanner().failureThreshold() + (int)(episode.exploreOptimizeCount() * 0.5));
+                props.toolPlanner().failureThreshold() + (int)(optimizeCount(unit) * 0.5));
     }
 
     // ========== 缓存失败/成功回调 ==========
     public PlanResult replan(String userInput, ToolCallback[] allTools, String failureReason) {
-        List<EpisodeCacheService.FailureSearchResult> warnings = episodeCacheService.searchFailurePatterns(userInput, 3);
+        List<FailureCause> warnings = unitFailureService.searchFailureCauses(userInput, 3);
         return doPlan(userInput, allTools, failureReason, warnings);
-    }
-
-    // ========== DRAFT 生命周期委托 ==========
-
-    /**
-     * 执行前创建 DRAFT episode（委托 EpisodeCacheService.createDraft）。
-     *
-     * @return episodeId（执行失败时返回 null）
-     */
-    public String createDraftEpisode(String userInput, PlanResult plan) {
-        return episodeCacheService.createDraft(userInput,
-                plan.selectedToolNames(), plan.missingDescriptions());
-    }
-
-    /**
-     * DRAFT → ACTIVE（执行成功时调用，委托 EpisodeCacheService.activateDraft）。
-     */
-    public void activateDraftEpisode(String episodeId, List<ToolCallLog> toolCallLogs,
-                                      String aiResponse, String successLesson) {
-        episodeCacheService.activateDraft(episodeId, toolCallLogs, aiResponse, successLesson);
-    }
-
-    /**
-     * DRAFT → FAILED（执行失败时调用，决策4：失败也保存步骤）。
-     */
-    public void failDraftEpisode(String episodeId, List<ToolCallLog> toolCallLogs,
-                                  String failureLesson, int failedStepIndex) {
-        episodeCacheService.failDraft(episodeId, toolCallLogs, failureLesson, failedStepIndex);
-    }
-
-    /** 从失败执行中提取可复用步骤链 */
-    public void saveSalvageableChains(String userInput, List<ToolCallLog> toolCalls,
-                                       List<List<Integer>> chains, String draftId) {
-        episodeCacheService.saveSalvageableAtomicChains(userInput, toolCalls, chains, draftId);
-    }
-
-    /**
-     * 写入新方案到内存缓存（首次规划成功 + draft 转 active 后调用）。
-     *
-     * <p>构造一个 Episode 对象存入内存，使后续内存命中时也能拿到 lesson 和参考计划。
-     * Qdrant 持久化由 {@link #activateDraftEpisode} 完成，本方法只负责内存缓存。</p>
-     *
-     * @param userInput      用户原话
-     * @param plan           首次规划成功的方案
-     * @param episodeId      activateDraft 返回的 episode id
-     * @param toolCallLogs   本次执行的工具调用轨迹
-     * @param aiResponse     AI 最终回复
-     * @param successLesson  成功经验（可为 null）
-     */
-    public void cacheToMemory(String userInput, PlanResult plan, String episodeId,
-                               List<ToolCallLog> toolCallLogs, String aiResponse, String successLesson) {
-        Episode memEpisode = new Episode(episodeId, userInput, plan.selectedToolNames(),
-                plan.missingDescriptions(), toolCallLogs, AiResponseUtils.truncate(aiResponse, 500),
-                successLesson, null, Map.of(), Episode.UnitType.COMPOSITE, false, List.of(),
-                1, 0, false, System.currentTimeMillis(), 1.0,
-                Episode.EpisodeStatus.ACTIVE, false, -1, 0, 0, null, null);
-        cache.put(AiResponseUtils.normalizeKey(userInput), new CacheEntry(
-                plan.selectedToolNames(), plan.missingDescriptions(), episodeId, memEpisode));
-        log.info("💾 已写入内存缓存（{} 个工具，episode={}...{}）", plan.selectedToolNames().size(),
-                episodeId.substring(0, 8),
-                (successLesson != null ? ", 经验: " + AiResponseUtils.truncate(successLesson, 40) : ""));
     }
 
     /**
@@ -462,7 +395,7 @@ public class ToolPlanner {
      * @return PlanResult（含 selectedToolNames、missing、fromCache=false）
      */
     private PlanResult doPlan(String userInput, ToolCallback[] allTools, String failureReason,
-                               List<EpisodeCacheService.FailureSearchResult> warnings) {
+                               List<FailureCause> warnings) {
         // === 入点日志：标识首次规划还是重规划 ===
         // failureReason != null → replan 场景，doFinalRound 使用 replanning.txt 避免重复犯错
         log.info("========== 多轮规划开始 [{}] ========== userInput='{}', allTools={}, reason={}",
@@ -754,7 +687,7 @@ public class ToolPlanner {
      */
     private PlanResult doFinalRound(String contextPrefix, ToolCallback[] allTools,
                                      String userInput, String failureReason,
-                                     List<EpisodeCacheService.FailureSearchResult> warnings,
+                                     List<FailureCause> warnings,
                                      List<String> toolNames, List<String> missing) {
         // 构建工具列表文本（编号 + name + desc），供 AI 浏览和选择
         Set<String> existingNames = collectExisting(allTools);
@@ -958,28 +891,27 @@ public class ToolPlanner {
         }
     }
 
-    /** 获取工具简短描述 */
+    /** 获取工具简短描述（分类混排：展示时加 [组合]/[工具] 标记，§3.3）。 */
     private String getToolDesc(String name, ToolCallback[] allTools) {
         for (ToolCallback tc : allTools) {
             if (tc.getToolDefinition().name().equals(name)) {
-                return AiResponseUtils.truncateNotNull(tc.getToolDefinition().description(), 80);
+                String marker = name.startsWith("planStep_") ? "[组合] " : "[工具] ";
+                return marker + AiResponseUtils.truncateNotNull(tc.getToolDefinition().description(), 80);
             }
         }
         return "";
     }
 
-    /** 注入历史失败警告 */
-    private String injectWarnings(String prompt, List<EpisodeCacheService.FailureSearchResult> warnings) {
+    /** 注入历史失败原因（指向 FailureCause 图） */
+    private String injectWarnings(String prompt, List<FailureCause> warnings) {
         if (warnings == null || warnings.isEmpty()) return prompt;
-        StringBuilder warnBlock = new StringBuilder("\n\n--- ⚠️ 历史失败警告（请避免以下做法） ---\n");
+        StringBuilder warnBlock = new StringBuilder("\n\n--- ⚠️ 历史失败原因（请避免以下做法） ---\n");
         for (int i = 0; i < warnings.size(); i++) {
             var w = warnings.get(i);
-            warnBlock.append((i + 1)).append(". ").append(w.type())
-                    .append("（失败 ").append(w.count()).append(" 次, 相似度 ")
-                    .append(String.format("%.0f%%", w.score() * 100)).append("）\n")
-                    .append("   描述: ").append(w.description()).append("\n");
-            if (w.mitigation() != null && !w.mitigation().isBlank()) {
-                warnBlock.append("   建议: ").append(w.mitigation()).append("\n");
+            warnBlock.append((i + 1)).append(". [").append(w.category()).append("] ")
+                    .append(w.reason()).append("\n");
+            if (w.analysis() != null && !w.analysis().isBlank()) {
+                warnBlock.append("   建议: ").append(w.analysis()).append("\n");
             }
         }
         return prompt + warnBlock;

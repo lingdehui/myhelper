@@ -3,6 +3,8 @@ package com.example.myhelper.memory.vector.episode;
 import com.example.myhelper.common.AiResponseUtils;
 import com.example.myhelper.common.PromptLoader;
 import com.example.myhelper.config.ModelRouter;
+import com.example.myhelper.memory.unit.Unit;
+import com.example.myhelper.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,17 +18,17 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 计划匹配器：AI 判断 episode 是否适用于当前输入 + 提取变量值。
+ * 计划匹配器：AI 判断 Unit 是否适用于当前输入 + 提取变量值。
  *
  * <p>用户核心逻辑："下次再匹配类似的→直接让AI判断这个成功计划是否可用→
  * 可用就按计划走→不可用新拟计划"。</p>
  *
- * <p>命中 Episode 后，不直接复用，而是先调 AI 判断：
+ * <p>命中 Unit 后，不直接复用，而是先调 AI 判断：
  * <ol>
  *   <li>这个计划（步骤+变量签名）是否适用于当前用户输入？</li>
  *   <li>如果适用，从用户输入中提取变量值（如 contact=张三, message=明天开会）</li>
  * </ol>
- * 适用 → PlanExecutor 按计划执行（变量替换）；
+ * 适用 → PlanExecutor 按脚本执行（变量替换）；
  * 不适用 → 走 AI 新规划路径。</p>
  */
 @Service
@@ -36,12 +38,14 @@ public class PlanMatcher {
 
     private final ModelRouter modelRouter;
     private final PromptLoader promptLoader;
+    private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper;
 
-    public PlanMatcher(ModelRouter modelRouter, PromptLoader promptLoader) {
+    public PlanMatcher(ModelRouter modelRouter, PromptLoader promptLoader, EmbeddingService embeddingService) {
         this.modelRouter = modelRouter;
         this.objectMapper = new ObjectMapper();
         this.promptLoader = promptLoader;
+        this.embeddingService = embeddingService;
     }
 
     /**
@@ -63,57 +67,42 @@ public class PlanMatcher {
     }
 
     /**
-     * AI 判断 episode 是否适用于当前输入，提取变量值。
-     *
-     * <p>ATOMIC 通用步骤：直接适用（无需变量匹配，步骤即开即用）。</p>
+     * AI 判断 Unit 是否适用于当前输入，提取变量值。
      *
      * @param userInput 用户原话
-     * @param episode   命中的候选 episode
+     * @param unit      命中的候选 Unit
      * @return 匹配结果；AI 调用失败时返回 notApplicable（降级到新规划）
      */
-    public MatchResult match(String userInput, Episode episode) {
-        return match(userInput, episode, modelRouter.chat());
+    public MatchResult match(String userInput, Unit unit) {
+        return match(userInput, unit, modelRouter.chat());
     }
 
     /** 使用指定 ChatClient 判断（探索模式走云端时传入 cloudOnly 客户端） */
-    public MatchResult match(String userInput, Episode episode, ChatClient client) {
-        if (client == null) return match(userInput, episode);
-        return doMatch(userInput, episode, client);
+    public MatchResult match(String userInput, Unit unit, ChatClient client) {
+        if (client == null) return match(userInput, unit);
+        return doMatch(userInput, unit, client);
     }
 
-    private MatchResult doMatch(String userInput, Episode episode, ChatClient client) {
-        if (episode.toolCalls() == null || episode.toolCalls().isEmpty()) {
+    private MatchResult doMatch(String userInput, Unit unit, ChatClient client) {
+        if (unit.script() == null || unit.script().isEmpty()) {
             return MatchResult.notApplicable("计划没有可执行步骤");
-        }
-
-        // ATOMIC 通用步骤：检查关键词相关性后才适用
-        // 不能无条件适用，否则 "发微信给张三" 的 ATOMIC 会被匹配到 "打开记事本"
-        if (episode.unitType() == Episode.UnitType.ATOMIC && episode.isGeneric()) {
-            String reason = "ATOMIC 通用步骤: " + episode.userInput();
-            if (isSemanticallyRelated(userInput, episode.userInput())) {
-                log.info("🧩 ATOMIC 通用步骤适用: {}", reason);
-                return MatchResult.applicable(Map.of(), reason);
-            } else {
-                log.info("🧩 ATOMIC 通用步骤不匹配当前输入，跳过: {}", reason);
-                return MatchResult.notApplicable("ATOMIC 工具链与用户输入不相关");
-            }
         }
 
         // 构造步骤描述
         StringBuilder stepsDesc = new StringBuilder();
-        for (int i = 0; i < episode.toolCalls().size(); i++) {
-            ToolCallLog step = episode.toolCalls().get(i);
+        for (int i = 0; i < unit.script().size(); i++) {
+            ToolCallLog step = unit.script().get(i);
             stepsDesc.append(i + 1).append(". ").append(step.toolName())
                     .append("(").append(step.args()).append(")\n");
         }
 
         // 构造变量列表
-        String varList = episode.signature() == null || episode.signature().isEmpty()
+        String varList = unit.params() == null || unit.params().isEmpty()
                 ? "（无变量，直接复用即可）"
-                : String.join(", ", episode.signature().keySet());
+                : String.join(", ", unit.params().keySet());
 
         String prompt = promptLoader.getPlanMatch()
-                .formatted(stripPii(userInput), episode.userInput(), stepsDesc, varList);
+                .formatted(stripPii(userInput), unit.goal(), stepsDesc, varList);
 
         try {
             String response = client.prompt().user(prompt).call().content();
@@ -132,15 +121,36 @@ public class PlanMatcher {
      * @param toolChain   工具链描述（如 "findFriend→typeTextViaClipboard"）
      * @return 是否语义相关
      */
-    private static boolean isSemanticallyRelated(String userInput, String toolChain) {
+    private boolean isSemanticallyRelated(String userInput, String toolChain) {
+        if (userInput == null || toolChain == null) return false;
+        try {
+            double sim = cosine(embeddingService.embed(userInput), embeddingService.embed(toolChain));
+            return sim >= 0.45;
+        } catch (Exception e) {
+            log.warn("⚠️ 语义相关性向量化失败，退回关键词兜底: {}", e.getMessage());
+            return keywordRelated(userInput, toolChain);
+        }
+    }
+
+    private static double cosine(List<Float> a, List<Float> b) {
+        if (a == null || b == null || a.isEmpty() || a.size() != b.size()) return 0.0;
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (int i = 0; i < a.size(); i++) {
+            dot += a.get(i) * b.get(i);
+            na += a.get(i) * a.get(i);
+            nb += b.get(i) * b.get(i);
+        }
+        if (na == 0.0 || nb == 0.0) return 0.0;
+        return dot / (Math.sqrt(na) * Math.sqrt(nb));
+    }
+
+    /** 保留原硬编码关键词兜底（仅在向量化失败时使用）。 */
+    private static boolean keywordRelated(String userInput, String toolChain) {
         if (userInput == null || toolChain == null) return false;
 
-        // 1. 提取 ATOMIC 工具链中的中文关键词（从 userInput 字段提取）
         String inputLower = userInput.toLowerCase();
         String chainLower = toolChain.toLowerCase();
 
-        // 2. 从工具名拆出英文关键词（camelCase 拆分）
-        //    例: "findFriend" → ["find", "friend"], "typeTextViaClipboard" → ["type", "text", "via", "clipboard"]
         Set<String> keywords = new HashSet<>();
         for (String toolName : chainLower.split("→")) {
             for (String word : toolName.split("(?=[A-Z])")) {
@@ -148,7 +158,6 @@ public class PlanMatcher {
             }
         }
 
-        // 3. 附加中文语义映射（工具名 → 中文意图关键词）
         Map<String, List<String>> semanticMap = Map.of(
             "findfriend", List.of("找", "查", "搜索", "联系人", "微信", "好友"),
             "type", List.of("发", "输入", "打字", "消息", "发送", "写"),
@@ -162,17 +171,14 @@ public class PlanMatcher {
             "leftclick", List.of("点击", "左键")
         );
 
-        // 4. 检查输入与关键词的匹配
         for (String kw : keywords) {
             List<String> mapped = semanticMap.getOrDefault(kw, List.of());
             for (String mk : mapped) {
                 if (inputLower.contains(mk)) return true;
             }
-            // 英文关键词直接查
             if (inputLower.contains(kw)) return true;
         }
 
-        // 5. 中文 bigram 重叠（来自 MyHelperApplication 的 extractKeywords 思路）
         Set<String> inputBigrams = new HashSet<>();
         for (int i = 0; i < userInput.length() - 1; i++) {
             String bigram = userInput.substring(i, i + 2);
