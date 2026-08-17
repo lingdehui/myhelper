@@ -255,43 +255,16 @@ public class ModelRouter {
                 || (e.getCause() != null && isNetworkError(e.getCause()));
     }
 
-    // ---- HTTP 抓包：日志化请求/响应体，定位工具名截断是 LLM 还是 Spring AI 造成的 ----
+    // ---- HTTP 请求日志（精简版：只记录方法/URI/状态/耗时，不打印请求响应体） ----
     private static ClientHttpRequestInterceptor httpBodyLoggingInterceptor() {
         return (request, body, execution) -> {
             long start = System.currentTimeMillis();
-            String reqBody = truncateHttp(new String(body, StandardCharsets.UTF_8), 2000);
-            log.info("🌐 [HTTP抓包] → {} {}", request.getMethod(), request.getURI());
-            log.info("🌐 [HTTP抓包] 请求体(前{}字符):\n{}", reqBody.length(), reqBody);
-
+            log.info("🌐 [HTTP] → {} {}", request.getMethod(), request.getURI());
             ClientHttpResponse response = execution.execute(request, body);
-            byte[] respBody = StreamUtils.copyToByteArray(response.getBody());
-            long elapsed = System.currentTimeMillis() - start;
-            String respText = truncateHttp(new String(respBody, StandardCharsets.UTF_8), 8000);
-            log.info("🌐 [HTTP抓包] ← {} {} ({}ms)", response.getStatusCode(), response.getStatusText(), elapsed);
-            log.info("🌐 [HTTP抓包] 响应体(前{}字符):\n{}", respText.length(), respText);
-
-            return new BufferingResponse(response, respBody);
+            log.info("🌐 [HTTP] ← {} {} ({}ms)", response.getStatusCode(), response.getStatusText(),
+                    System.currentTimeMillis() - start);
+            return response;
         };
-    }
-
-    /** 把已读取的响应体重新包装，供 Spring AI 下游继续读取（HTTP 抓包后不破坏原数据流）。 */
-    private static final class BufferingResponse implements ClientHttpResponse {
-        private final ClientHttpResponse delegate;
-        private final byte[] body;
-        BufferingResponse(ClientHttpResponse delegate, byte[] body) {
-            this.delegate = delegate;
-            this.body = body;
-        }
-        @Override public HttpStatusCode getStatusCode() throws IOException { return delegate.getStatusCode(); }
-        @Override public String getStatusText() throws IOException { return delegate.getStatusText(); }
-        @Override public HttpHeaders getHeaders() { return delegate.getHeaders(); }
-        @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
-        @Override public void close() { delegate.close(); }
-    }
-
-    private static String truncateHttp(String s, int max) {
-        if (s == null) return "(null)";
-        return s.length() <= max ? s : s.substring(0, max) + "...(截断)";
     }
 
     // ============================================================

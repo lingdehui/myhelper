@@ -1,0 +1,1 @@
+{"statements":[{"statement":"MATCH (t:Tool) WHERE t.id = 'MCP:robot-mcp:ocrRegion' RETURN t.description AS desc, t.name AS name"}]}

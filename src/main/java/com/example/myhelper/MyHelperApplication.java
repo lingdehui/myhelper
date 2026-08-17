@@ -23,6 +23,7 @@ import com.example.myhelper.service.VadService;
 import com.example.myhelper.service.VoiceprintService;
 import com.example.myhelper.integration.HaToolService;
 import com.example.myhelper.memory.unit.UniversalUnitExecutor;
+import com.example.myhelper.schedule.ScheduledTaskService;
 import com.example.myhelper.util.NativeLoader;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.annotation.Tool;
@@ -39,6 +40,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -58,6 +61,7 @@ public class MyHelperApplication {
 
     // ========== 工具管理 ==========
     private volatile ToolCallback[] allTools;
+    private volatile ToolCallback[] cachedMergedTools;
     private volatile TurnProcessor turnProcessor;
     private volatile AutonomousExplorationService explorationService;
 
@@ -96,6 +100,7 @@ public class MyHelperApplication {
                                  AutonomousExplorationService explorationService,
                                  ToolSyncService toolSyncService,
                                  UniversalUnitExecutor universalUnitExecutor,
+                                 ScheduledTaskService scheduledTaskService,
                                  @Qualifier("aiExecutor") ExecutorService aiExecutor) {
         return args -> {
             this.props = props;
@@ -153,6 +158,9 @@ public class MyHelperApplication {
             // 万能执行器接收完整工具列表（脚本化/递归展开执行时按名查找工具）
             universalUnitExecutor.setAllTools(allToolCallbacks);
 
+            // 定时任务服务接收完整工具列表（到点执行时走主流程动态调用工具）
+            scheduledTaskService.setAllTools(allToolCallbacks);
+
             // === 启动工具注册表同步（Neo4j + Qdrant）===
             toolSyncService.syncOnStartup(allToolCallbacks, mcpCount);
 
@@ -192,11 +200,12 @@ public class MyHelperApplication {
             backgroundAudio.start();
 
             // 主线程：文字对话
-            try (Scanner scanner = new Scanner(System.in)) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
                 int roundNum = 0;
                 while (true) {
                     log.info("> （多行输入，空行回车发送）");
-                    String firstLine = scanner.nextLine();
+                    String firstLine = reader.readLine();
+                    if (firstLine == null) break; // Ctrl+Z 结束
                     dialogStateMachine.touch();
 
                     // 单行命令立即生效
@@ -227,8 +236,8 @@ public class MyHelperApplication {
                     StringBuilder sb = new StringBuilder(firstLine);
                     String line;
                     while (true) {
-                        line = scanner.nextLine();
-                        if (line.trim().isEmpty()) break;
+                        line = reader.readLine();
+                        if (line == null || line.trim().isEmpty()) break;
                         sb.append("\n").append(line);
                     }
                     String userInput = sb.toString().trim();
@@ -248,6 +257,10 @@ public class MyHelperApplication {
     // ========== 动态工具管理 ==========
 
     private synchronized ToolCallback[] getMergedTools() {
-        return turnProcessor.mergeTools(allTools);
+        // 启动阶段会被多处调用（工具数日志/分类同步/语音注入），缓存避免重复 mergeDynamicTools（重复查 Neo4j 构建 Unit 工具）
+        if (cachedMergedTools == null) {
+            cachedMergedTools = turnProcessor.mergeTools(allTools);
+        }
+        return cachedMergedTools;
     }
 }

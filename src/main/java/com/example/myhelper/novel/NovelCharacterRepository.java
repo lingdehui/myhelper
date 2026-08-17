@@ -19,4 +19,7 @@ public interface NovelCharacterRepository extends Neo4jRepository<NovelCharacter
 
     @Query("MATCH (c:NovelCharacter {novelName: $novelName})-[r:RELATED_TO]->(t:NovelCharacter) RETURN c, r, t")
     List<NovelCharacterNode> findWithRelationships(String novelName);
+
+    @Query("MATCH (c:NovelCharacter {novelName: $novelName}) DETACH DELETE c")
+    void deleteByNovelName(String novelName);
 }

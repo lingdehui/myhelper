@@ -96,25 +96,36 @@ public class UniversalUnitExecutor {
      */
     public ToolCallback[] buildUnitTools() {
         List<UnitNode> units = unitRepository.findActiveByUnitKind(UnitKind.PLAN_STEP.name());
+        // 一次性拉取所有 PLAN_STEP 的 CONTAINS 子节点，消除逐个查询的 N+1
+        Map<String, List<String>> childNamesByParent = new HashMap<>();
+        for (String row : unitRepository.findPlanStepChildRows()) {
+            // 单列拼接 parentId|childId|toolName|goal（toolName/goal 空串占位）
+            String[] p = row.split("\\|", -1);
+            childNamesByParent.computeIfAbsent(p[0], k -> new ArrayList<>())
+                    .add(stepName(p[2], p[3], p[1]));
+        }
         List<ToolCallback> tools = new ArrayList<>();
         for (UnitNode u : units) {
             String name = "planStep_" + u.getUnitId();
-            tools.add(new UnitToolCallback(u.getUnitId(), name, buildToolDescription(u), this, unitStore));
+            List<String> childNames = childNamesByParent.get(u.getUnitId());
+            if (childNames == null || childNames.isEmpty()) {
+                childNames = childStepNamesFromScript(u);
+            }
+            tools.add(new UnitToolCallback(u.getUnitId(), name, buildToolDescription(u, childNames), this, unitStore));
         }
         return tools.toArray(new ToolCallback[0]);
     }
 
     /** 包装工具描述：goal + 内部步骤列表 + 适用场景（§3.3，标记由展示层统一加）。 */
-    private String buildToolDescription(UnitNode u) {
+    private String buildToolDescription(UnitNode u, List<String> childNames) {
         String goal = (u.getGoal() != null && !u.getGoal().isBlank()) ? u.getGoal()
                 : (u.getMatchText() != null ? u.getMatchText() : u.getUnitId());
         StringBuilder sb = new StringBuilder(goal);
 
-        List<String> steps = childStepNames(u);
-        if (!steps.isEmpty()) {
-            sb.append("。共 ").append(steps.size()).append(" 步，内部按顺序执行：");
-            for (int i = 0; i < steps.size(); i++) {
-                sb.append(" ").append(i + 1).append(") ").append(steps.get(i));
+        if (childNames != null && !childNames.isEmpty()) {
+            sb.append("。共 ").append(childNames.size()).append(" 步，内部按顺序执行：");
+            for (int i = 0; i < childNames.size(); i++) {
+                sb.append(" ").append(i + 1).append(") ").append(childNames.get(i));
             }
         }
         if (u.getDescription() != null && !u.getDescription().isBlank()) {
@@ -123,26 +134,21 @@ public class UniversalUnitExecutor {
         return sb.toString();
     }
 
-    /** 内部步骤名：优先 CONTAINS 子节点，退回预编译 script 的工具名。 */
-    private List<String> childStepNames(UnitNode u) {
+    /** 子步骤名：CONTAINS 子节点用预加载数据（见 buildUnitTools），这里只兜底预编译 script 的工具名。 */
+    private List<String> childStepNamesFromScript(UnitNode u) {
         List<String> names = new ArrayList<>();
-        List<String> childIds = unitRepository.findChildUnitIdsOrdered(u.getUnitId());
-        if (childIds != null && !childIds.isEmpty()) {
-            for (String childId : childIds) {
-                UnitNode child = unitRepository.findByUnitId(childId).orElse(null);
-                if (child == null) continue;
-                names.add((child.getToolName() != null && !child.getToolName().isBlank())
-                        ? child.getToolName()
-                        : (child.getGoal() != null && !child.getGoal().isBlank()
-                            ? child.getGoal() : child.getUnitId()));
-            }
-            return names;
-        }
         List<ToolCallLog> script = parseScript(u.getScriptJson());
         for (ToolCallLog step : script) {
             names.add(step.toolName());
         }
         return names;
+    }
+
+    /** 子节点概要 → 步骤名（toolName 优先，退回 goal，再退回 unitId）。 */
+    private String stepName(String toolName, String goal, String childId) {
+        if (toolName != null && !toolName.isBlank()) return toolName;
+        if (goal != null && !goal.isBlank()) return goal;
+        return childId;
     }
 
     /** 从包装工具名反查 unitId（planStep_<uuid> → uuid），非包装工具返回 null。 */

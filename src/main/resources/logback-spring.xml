@@ -26,4 +26,10 @@
     <logger name="io.modelcontextprotocol" level="WARN"/>
     <logger name="org.springframework.web" level="WARN"/>
     <logger name="org.neo4j" level="WARN"/>
+
+    <!-- 抑制无害的 Neo4j 诊断噪音：
+         标签/属性/关系类型"尚不存在"、内部 Long id 已废弃、无 @Version 属性 -->
+    <logger name="org.springframework.data.neo4j.cypher.unrecognized" level="ERROR"/>
+    <logger name="org.springframework.data.neo4j.core.mapping.Neo4jPersistentEntity" level="ERROR"/>
+    <logger name="org.springframework.data.neo4j.core.mapping.DefaultNeo4jIsNewStrategy" level="ERROR"/>
 </configuration>

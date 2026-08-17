@@ -301,6 +301,11 @@ public class TurnProcessor {
             String name = def.name();
             if (name == null || !name.startsWith("planStep_")) return;
             String id = "GENERATED:planStep:" + name;
+            // 已存在且描述未变 → 跳过，避免每次 turn 重复 Neo4j save + Qdrant 向量化（Ollama embed 很慢）
+            Optional<ToolModel> existing = toolRegistry.findById(id);
+            if (existing.isPresent() && java.util.Objects.equals(existing.get().description(), def.description())) {
+                return;
+            }
             ToolModel model = ToolModel.of(id, name, def.description(), "GENERATED",
                     "planStep", List.of(), "String", List.of(), null);
             toolRegistry.upsertTool(model);
@@ -471,8 +476,11 @@ public class TurnProcessor {
                 : planMatcher.match(userInput, unit);
         if (!matchResult.applicable()) {
             log.info("❌ 计划不适用（{}），降级为 AI 新规划", matchResult.reason());
-            handleNewPlan(modelRouter, tools, effectiveInput, userInput,
-                    ToolPlanner.PlanResult.ofAIPlan(plan.selectedToolNames(), plan.missingDescriptions()),
+            // 重新规划（绕过缓存），而不是复用旧缓存的 selectedToolNames —— 否则 AI 拿不到
+            // 真正需要的工具（如写小说却只拿到"打开番茄网站"的旧工具 + searchTool）
+            ToolPlanner.PlanResult freshPlan = toolPlanner.replan(userInput, tools, matchResult.reason());
+            log.info("📦 降级重新规划: 选中 {} 个工具", freshPlan.selectedToolNames().size());
+            handleNewPlan(modelRouter, tools, effectiveInput, userInput, freshPlan,
                     toolCallLogs, myTurnId, ttsService);
             return;
         }

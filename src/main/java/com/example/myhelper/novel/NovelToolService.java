@@ -5,7 +5,6 @@ import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
-import java.util.stream.Collectors;
 
 /**
  * 小说创作工具集。
@@ -14,13 +13,13 @@ import java.util.stream.Collectors;
  * 和 Qdrant novel-memory 集合中，与主项目的 Device/UserPreference/Episodes 数据完全隔离。
  * 只有 AI 显式调用这些 @Tool 方法时，小说数据空间才会被访问。</p>
  *
- * <p>使用流程：</p>
+ * <p>使用流程（大纲先行）：</p>
  * <ol>
- *   <li>create_novel(novelName) - 创建小说（可选，记录状态）</li>
- *   <li>add_character(...) - 逐个添加人物</li>
- *   <li>add_character_relationship(...) - 建立人物关系</li>
- *   <li>add_chapter(...) - 写入章节（每章写完立即存入）</li>
- *   <li>get_novel_state(novelName) - 任何时候查看小说整体进度</li>
+ *   <li>set_outline(...) - 写正文前先定大纲（世界观/主线/分章简要），存图谱+向量</li>
+ *   <li>add_character(...) + add_character_relationship(...) - 大纲阶段就定好人物与人物关系</li>
+ *   <li>build_writing_context(...) - 写每章前取上下文（大纲+人物关系+前文摘要+伏笔）</li>
+ *   <li>add_chapter(...) - 写正文（自动落文件，每章一个 .txt）</li>
+ *   <li>set_chapter_summary(...) - 每章摘要存图谱+向量</li>
  * </ol>
  */
 @Component
@@ -38,6 +37,61 @@ public class NovelToolService {
     public String getNovelState(
             @ToolParam(description = "小说名称") String novelName) {
         return memory.getNovelStateAsPrompt(novelName);
+    }
+
+    @Tool(description = "删除一部小说的全部数据（大纲/分卷/章节/人物/情节线 + 向量 + 已导出文件）。" +
+            "用于彻底重写或清理旧稿，删除后不可恢复。")
+    public String deleteNovel(
+            @ToolParam(description = "小说名称") String novelName) {
+        return memory.deleteNovel(novelName);
+    }
+
+    // ========== 大纲管理 ==========
+
+    @Tool(description = "保存/更新小说粗大纲。写正文前必须先完成这一步。" +
+            "worldview 为世界观设定，mainPlot 为主线大纲，totalChapters 为预设总章数（默认 1000）。" +
+            "粗大纲存入图谱和向量库。分卷细节请用 set_volume 逐卷补充。")
+    public String setOutline(
+            @ToolParam(description = "小说名称") String novelName,
+            @ToolParam(description = "世界观/设定") String worldview,
+            @ToolParam(description = "主线大纲") String mainPlot,
+            @ToolParam(description = "预设总章数，默认 1000") int totalChapters) {
+        memory.setOutline(novelName, worldview, mainPlot, totalChapters);
+        return "✅ 粗大纲已保存（世界观 + 主线 + 总章数 " + totalChapters + "），已同步到图谱和向量库";
+    }
+
+    @Tool(description = "查看小说粗大纲（世界观/主线/预设总章数）。写新章节前可用 build_writing_context 一次取全。")
+    public String getOutline(
+            @ToolParam(description = "小说名称") String novelName) {
+        String outline = memory.getOutlineAsPrompt(novelName);
+        return outline.isEmpty() ? "❌ 尚未设置大纲，请先调用 set_outline" : outline;
+    }
+
+    // ========== 分卷管理 ==========
+
+    @Tool(description = "保存/更新某一卷的大纲。长篇（默认1000章）不要一次写完全部大纲，按卷切分、一次一卷。" +
+            "volumeNumber 卷序号从1开始，chapterStart/chapterEnd 为本章起止章号（含）。" +
+            "mainPlot 本卷主线，chapterOutlines 本卷分章简要（每行一章），" +
+            "foreshadowings 本卷伏笔计划（每行一条，如 '第3章埋：xxx，第20章回收'）。伏笔要提前规划好，不要等写每章时临时想。")
+    public String setVolume(
+            @ToolParam(description = "小说名称") String novelName,
+            @ToolParam(description = "卷序号，从1开始") int volumeNumber,
+            @ToolParam(description = "卷标题，如 第一卷：初入都市") String title,
+            @ToolParam(description = "本卷起始章号（含）") int chapterStart,
+            @ToolParam(description = "本卷结束章号（含）") int chapterEnd,
+            @ToolParam(description = "本卷主线") String mainPlot,
+            @ToolParam(description = "本卷分章简要，每行一章，格式：'第N章：一句话细纲（出场：人物A、人物B）'，出场人物用于写该章时精确筛人物卡") String chapterOutlines,
+            @ToolParam(description = "本卷伏笔计划，每行一条") String foreshadowings) {
+        memory.setVolume(novelName, volumeNumber, title, chapterStart, chapterEnd,
+                mainPlot, chapterOutlines, foreshadowings);
+        return "✅ 第" + volumeNumber + "卷《" + title + "》已保存（第" + chapterStart + "-" + chapterEnd + "章）";
+    }
+
+    @Tool(description = "查看小说所有分卷大纲（各卷标题、章节范围、主线）。")
+    public String getVolumes(
+            @ToolParam(description = "小说名称") String novelName) {
+        String volumes = memory.getVolumesAsPrompt(novelName);
+        return volumes.isEmpty() ? "❌ 尚未设置分卷，请先调用 set_volume" : volumes;
     }
 
     // ========== 人物管理 ==========
@@ -96,7 +150,7 @@ public class NovelToolService {
 
     // ========== 章节管理 ==========
 
-    @Tool(description = "一键获取写下一章所需的完整上下文。包括人物设定、最近章节摘要、未回收伏笔。" +
+    @Tool(description = "一键获取写下一章所需的完整上下文。包括大纲（世界观/主线/分章简要）、人物设定与关系、最近章节摘要、未回收伏笔。" +
             "这是写每章前最核心的工具，用一次就行，无需逐个调用 getCharacters/getRecentSummaries/getUnresolvedPlotThreads。")
     public String buildWritingContext(
             @ToolParam(description = "小说名称") String novelName) {
@@ -104,14 +158,14 @@ public class NovelToolService {
     }
 
     @Tool(description = "添加/保存一个章节。每章写完立即调用此工具存入记忆。" +
-            "content 为章节完整正文。保存后会自动记录到小说数据库。")
+            "content 为章节完整正文。保存后会自动写入图谱，并落盘到文件（每章一个 .txt）。同章号重复保存会覆盖旧内容。")
     public String addChapter(
             @ToolParam(description = "小说名称") String novelName,
             @ToolParam(description = "章节序号，从1开始") int chapterNumber,
             @ToolParam(description = "章节标题") String title,
             @ToolParam(description = "章节完整正文") String content) {
         memory.addChapter(novelName, chapterNumber, title, content);
-        return "✅ 第" + chapterNumber + "章《" + title + "》已保存（" + content.length() + "字）";
+        return "✅ 第" + chapterNumber + "章《" + title + "》已保存（" + content.length() + "字），正文已落盘到文件";
     }
 
     @Tool(description = "设置章节的摘要、人物调度和情节伏笔标记。每章写完应调用此工具标记关键信息。" +
@@ -212,5 +266,13 @@ public class NovelToolService {
         boolean updated = memory.updateCharacterStatus(novelName, name, newStatus);
         return updated ? "✅ " + name + " 状态已变为 " + newStatus
                        : "❌ 未找到人物: " + name;
+    }
+
+    // ========== 导出 ==========
+
+    @Tool(description = "把已写的所有章节正文导出成一个完整的 .txt 文件，返回文件路径，供用户查看质量。")
+    public String exportNovel(
+            @ToolParam(description = "小说名称") String novelName) {
+        return memory.exportNovel(novelName);
     }
 }

@@ -26,6 +26,17 @@ public interface UnitRepository extends Neo4jRepository<UnitNode, String> {
     @Query("MATCH (u:Unit {status: 'ACTIVE'}) WHERE u.unitKind IN $kinds RETURN u")
     List<UnitNode> findActiveByUnitKinds(List<String> kinds);
 
+    /**
+     * 一次性拉取所有 PLAN_STEP 的直接 CONTAINS 子节点（父 unitId + 子节点概要），
+     * 替代 {@link #findChildUnitIdsOrdered} + 逐个 {@link #findByUnitId} 的 N+1 查询。
+     * <p>单列拼接返回（parentId|childId|toolName|goal），规避 SDN 多列投影映射限制，
+     * toolName/goal 为 null 时用空串占位。</p>
+     */
+    @Query("MATCH (u:Unit {unitKind: 'PLAN_STEP', status: 'ACTIVE'})-[r:CONTAINS]->(c:Unit) " +
+            "RETURN u.unitId + '|' + c.unitId + '|' + coalesce(c.toolName, '') + '|' + coalesce(c.goal, '') AS row " +
+            "ORDER BY u.unitId, r.order")
+    List<String> findPlanStepChildRows();
+
     /** 直接子单元 unitId，按 CONTAINS.order 升序返回（供递归展开使用）。 */
     @Query("MATCH (u:Unit {unitId: $unitId})-[r:CONTAINS]->(c:Unit) " +
             "RETURN c.unitId AS childId ORDER BY r.order")

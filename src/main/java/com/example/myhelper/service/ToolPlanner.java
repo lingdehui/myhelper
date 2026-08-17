@@ -221,7 +221,15 @@ public class ToolPlanner {
         }
 
         // ===== Layer 3: AI 规划 =====
-        return doPlan(userInput, allTools, null, warnings);
+        PlanResult result = doPlan(userInput, allTools, null, warnings);
+
+        // 回填内存缓存：AI 规划结果也缓存，避免相同输入重复走多轮规划（约 50s）。
+        // 注意 unitId=null、unit=null：下次命中走 handleNewPlan 正常 AI 执行，不触发脚本化/Unit 回调。
+        if (result != null && result.selectedToolNames() != null && !result.selectedToolNames().isEmpty()) {
+            cache.put(key, new CacheEntry(result.selectedToolNames(), result.missingDescriptions(), null, null));
+            log.info("💾 AI 规划结果已回填内存缓存（key 长度 {}，工具 {} 个）", key.length(), result.selectedToolNames().size());
+        }
+        return result;
     }
 
     /**

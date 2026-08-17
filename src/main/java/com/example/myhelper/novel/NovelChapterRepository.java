@@ -11,12 +11,15 @@ public interface NovelChapterRepository extends Neo4jRepository<NovelChapterNode
     @Query("MATCH (ch:NovelChapter {novelName: $novelName}) RETURN ch ORDER BY ch.chapterNumber")
     List<NovelChapterNode> findByNovelName(String novelName);
 
-    @Query("MATCH (ch:NovelChapter {novelName: $novelName, chapterNumber: $chapterNumber}) RETURN ch")
-    Optional<NovelChapterNode> findByNovelNameAndNumber(String novelName, int chapterNumber);
+    @Query("MATCH (ch:NovelChapter {novelName: $novelName, chapterNumber: $chapterNumber}) RETURN ch ORDER BY ch.updatedAt DESC")
+    List<NovelChapterNode> findByNovelNameAndNumber(String novelName, int chapterNumber);
 
     @Query("MATCH (ch:NovelChapter {novelName: $novelName}) RETURN ch ORDER BY ch.chapterNumber DESC LIMIT 1")
     Optional<NovelChapterNode> findLatestChapter(String novelName);
 
     @Query("MATCH (ch:NovelChapter {novelName: $novelName}) RETURN count(ch)")
     long countByNovelName(String novelName);
+
+    @Query("MATCH (ch:NovelChapter {novelName: $novelName}) DETACH DELETE ch")
+    void deleteByNovelName(String novelName);
 }

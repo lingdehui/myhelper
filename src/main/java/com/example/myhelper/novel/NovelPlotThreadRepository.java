@@ -18,4 +18,7 @@ public interface NovelPlotThreadRepository extends Neo4jRepository<NovelPlotThre
 
     @Query("MATCH (pt:NovelPlotThread {novelName: $novelName, threadName: $threadName}) RETURN pt")
     NovelPlotThreadNode findByName(String novelName, String threadName);
+
+    @Query("MATCH (pt:NovelPlotThread {novelName: $novelName}) DETACH DELETE pt")
+    void deleteByNovelName(String novelName);
 }

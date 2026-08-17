@@ -53,17 +53,6 @@ public class ToolSyncService {
         log.info("🔄 启动工具同步: {} 个工具 (MCP {} + 本地 {})...",
                 allTools.length, mcpCount, allTools.length - mcpCount);
 
-        // 🔍 诊断：打印前 30 个 MCP 工具的注册名（看是否有前缀）
-        if (mcpCount > 0) {
-            int dumpCount = Math.min(mcpCount, 30);
-            StringBuilder mcpNames = new StringBuilder("🔍 [诊断] MCP工具注册名 (前" + dumpCount + "):\n");
-            for (int i = 0; i < dumpCount; i++) {
-                String name = allTools[i].getToolDefinition().name();
-                mcpNames.append("  [").append(i).append("] ").append(name).append("\n");
-            }
-            log.info(mcpNames.toString());
-        }
-
         // 1. 确保 Qdrant 集合存在
         toolRegistry.ensureCollection();
 
@@ -77,19 +66,23 @@ public class ToolSyncService {
             }
         }
 
-        // 3. 对比 Neo4j 已有记录（先读库，用于判断增量）
+        // 3. 一次性从 Neo4j 加载全部现有工具到内存缓存（同时拿到已有 id）。
+        //    必须先预热缓存，否则下面第 4 步的 findById/upsertTool 会逐条查 Neo4j，产生 N+1 卡顿。
         Set<String> dbIds;
         try {
+            toolRegistry.loadFromNeo4j();
             dbIds = toolRegistry.findAllActive().stream()
                     .map(ToolModel::id).collect(Collectors.toSet());
         } catch (Exception e) {
             log.warn("⚠️ 无法读取 Neo4j 工具记录，全量入库: {}", e.getMessage());
             dbIds = Set.of();
         }
+        // dbIds 在 try/catch 两处赋值，非 effectively final；复制为 final 供 lambda 使用
+        final Set<String> existingIds = dbIds;
 
         // 3.5 只为【新增】的 MCP 工具补中文描述（已有数据的跳过，避免每次启动全量调 DeepSeek）
         Set<String> newToolIds = currentModels.keySet().stream()
-                .filter(id -> !dbIds.contains(id))
+                .filter(id -> !existingIds.contains(id))
                 .collect(Collectors.toSet());
         enrichMcpChineseDescriptions(currentModels, newToolIds);
 
@@ -117,11 +110,28 @@ public class ToolSyncService {
         }
 
         // 5. 废弃（数据库有但代码中没有的）
+        //    GENERATED: 前缀是计划步骤/动态生成工具，重启后仍由 Unit 系统重新包装生效，
+        //    跳过废弃以保留其 Neo4j 记录 + Qdrant 向量 + 分类关联（计划和步骤也要进分类）。
         int deprecated = 0;
         if (neo4jAvailable) {
             Set<String> currentIds = currentModels.keySet();
             try {
+                List<String> generatedIds = dbIds.stream()
+                        .filter(id -> id.startsWith("GENERATED:"))
+                        .sorted().toList();
+                List<String> toDeprecate = dbIds.stream()
+                        .filter(id -> !id.startsWith("GENERATED:") && !currentIds.contains(id))
+                        .sorted().toList();
+                log.info("🔍 [废弃检查] dbIds={} currentIds={} | GENERATED跳过={} 待废弃={}",
+                        dbIds.size(), currentIds.size(), generatedIds.size(), toDeprecate.size());
+                if (!generatedIds.isEmpty()) {
+                    log.info("🔍 [废弃检查] GENERATED跳过明细: {}", generatedIds);
+                }
+                if (!toDeprecate.isEmpty()) {
+                    log.info("🔍 [废弃检查] 待废弃明细: {}", toDeprecate);
+                }
                 for (String dbId : dbIds) {
+                    if (dbId.startsWith("GENERATED:")) continue;
                     if (!currentIds.contains(dbId)) {
                         toolRegistry.deprecateTool(dbId);
                         deprecated++;
@@ -130,12 +140,8 @@ public class ToolSyncService {
             } catch (Exception ignored) {}
         }
 
-        // 6. 重新加载内存缓存（Neo4j 不可用时从 Qdrant 补充））
-        try {
-            toolRegistry.loadFromNeo4j();
-        } catch (Exception e) {
-            log.warn("⚠️ 无法从 Neo4j 加载缓存，使用空内存缓存");
-        }
+        // 6. 内存缓存已在第 3 步预热，且第 4/5 步的 upsertTool/deprecateTool 会同步更新缓存，
+        //    无需再全量重查 Neo4j（避免重复加载导致启动变慢）。
 
         log.info("✅ 工具同步完成: +{} 新增, ~{} 更新, -{} 废弃, 当前 {} 个活跃工具",
                 added, updated, deprecated, toolRegistry.countActive());

@@ -1,4 +1,4 @@
-﻿# MyHelper 环境一键启动（PowerShell 版，UTF-8）
+﻿﻿# MyHelper 环境一键启动（PowerShell 版，UTF-8）
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
@@ -41,13 +41,31 @@ docker compose up -d
 Write-Host '      容器已启动'
 Write-Host ''
 
-# ============ 3. 本地 Ollama ============
+# ============ 3. 本地 Ollama（嵌入向量 bge-m3，必须启动） ============
 Write-Host '[3/5] 检查本地 Ollama (11434) ...'
+$ollamaUp = $false
 try {
     Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 3 | Out-Null
+    $ollamaUp = $true
     Write-Host '      Ollama 运行中'
 } catch {
-    Write-Host '      [警告] Ollama 未运行，嵌入向量不可用（可手动执行 ollama serve）'
+    Write-Host '      未运行，正在启动 ollama serve ...'
+    Start-Process cmd -ArgumentList '/k', 'ollama serve'
+    $n = 0
+    while ($n -lt 15) {
+        Start-Sleep -Seconds 2
+        try {
+            Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 2 | Out-Null
+            $ollamaUp = $true
+            break
+        } catch {}
+        $n++
+    }
+    if ($ollamaUp) {
+        Write-Host '      Ollama 已启动'
+    } else {
+        Write-Host '      [警告] Ollama 启动失败，请确认已安装并加入 PATH（嵌入向量将不可用）'
+    }
 }
 Write-Host ''
 
