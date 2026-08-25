@@ -33,6 +33,21 @@ public class NovelMemoryService {
     @Value("${novel.output-dir:novels}")
     private String outputDir;
 
+    /** 最近活跃的小说名：AI 漏传 novelName 时自动补用，避免更新空转 */
+    private volatile String lastActiveNovelName;
+
+    /**
+     * 解析小说名：有值则记录为最近活跃并返回；为空则回退到最近活跃的小说。
+     * 返回 null 表示无法确定（从未有活跃小说）。
+     */
+    public String resolveNovelName(String novelName) {
+        if (novelName != null && !novelName.isBlank()) {
+            this.lastActiveNovelName = novelName;
+            return novelName;
+        }
+        return lastActiveNovelName;
+    }
+
     public NovelMemoryService(NovelCharacterRepository characterRepo,
                                NovelChapterRepository chapterRepo,
                                NovelPlotThreadRepository plotThreadRepo,
@@ -97,21 +112,24 @@ public class NovelMemoryService {
     /** 保存/更新某卷（upsert by novelName + volumeNumber）。长篇大纲按卷切分，一次一卷。 */
     public NovelVolumeNode setVolume(String novelName, int volumeNumber, String title,
                                      int chapterStart, int chapterEnd,
-                                     String mainPlot, String chapterOutlines, String foreshadowings) {
+                                     String mainPlot, String chapterOutlines, String foreshadowings,
+                                     String secretList) {
         Optional<NovelVolumeNode> existing = volumeRepo.findByNovelNameAndVolumeNumber(novelName, volumeNumber);
         NovelVolumeNode v;
         if (existing.isPresent()) {
             v = existing.get();
+            v.setNovelName(novelName);   // 更新时也写回 novelName，防止旧卷缺失该属性导致查不到
             v.setTitle(title);
             v.setChapterStart(chapterStart);
             v.setChapterEnd(chapterEnd);
             v.setMainPlot(mainPlot);
             v.setChapterOutlines(chapterOutlines);
             v.setForeshadowings(foreshadowings);
+            v.setSecretList(secretList);
             v.setUpdatedAt(System.currentTimeMillis());
         } else {
             v = new NovelVolumeNode(novelName, volumeNumber, title, chapterStart, chapterEnd,
-                    mainPlot, chapterOutlines, foreshadowings);
+                    mainPlot, chapterOutlines, foreshadowings, secretList);
         }
         return volumeRepo.save(v);
     }
@@ -351,6 +369,29 @@ public class NovelMemoryService {
         return sb.toString();
     }
 
+    /** 目标章之前的 N 章摘要（重写旧章时用，避免错位到全书结尾） */
+    private String getRecentSummariesBefore(String novelName, int targetChapter, int count) {
+        List<NovelChapterNode> before = new ArrayList<>();
+        for (NovelChapterNode ch : chapterRepo.findByNovelName(novelName)) {
+            if (ch.getChapterNumber() < targetChapter) before.add(ch);
+        }
+        before.sort((a, b) -> Integer.compare(a.getChapterNumber(), b.getChapterNumber()));
+        int total = before.size();
+        if (total == 0) return "";
+        int start = Math.max(0, total - count);
+        StringBuilder sb = new StringBuilder("【前文摘要】\n");
+        for (int i = start; i < total; i++) {
+            NovelChapterNode ch = before.get(i);
+            sb.append("第").append(ch.getChapterNumber()).append("章 ")
+              .append(ch.getTitle()).append(": ");
+            if (ch.getSummary() != null && !ch.getSummary().isEmpty()) {
+                sb.append(ch.getSummary());
+            }
+            sb.append("\n");
+        }
+        return sb.toString();
+    }
+
     public List<NovelChapterNode> getAllChapters(String novelName) {
         return chapterRepo.findByNovelName(novelName);
     }
@@ -416,42 +457,148 @@ public class NovelMemoryService {
     /**
      * 组装写下一章所需的上下文。按「精确注入、控 token」原则，只注入少量必要内容，不塞全书：
      * 设定（世界观/主线精简）+ 当前卷主线与当前章细纲 + 出场人物卡（2-3人）+ 前文摘要 + 上一章结尾 + 当前章相关伏笔。
+     *
+     * @param chapterNumber 指定目标章号（用于重写旧章）；为空时默认"已写N章 → 下一章 N+1"
      */
-    public String buildWritingContext(String novelName) {
+    public String buildWritingContext(String novelName, Integer chapterNumber) {
+        novelName = resolveNovelName(novelName);
+        if (novelName == null) return "❌ 无法确定小说名称";
         StringBuilder ctx = new StringBuilder();
         long chapterCount = chapterRepo.countByNovelName(novelName);
-        int nextChapter = (int) chapterCount + 1;
+        boolean rewriting = chapterNumber != null && chapterNumber > 0;
+        int targetChapter = rewriting ? chapterNumber : (int) chapterCount + 1;
 
         // 1. 写作任务 + 总进度
-        ctx.append(String.format("【写作任务】现在写《%s》第%d章（已写%d章）\n\n", novelName, nextChapter, chapterCount));
+        ctx.append(String.format("【写作任务】现在%s《%s》第%d章（已写%d章）\n\n",
+                rewriting ? "重写" : "写", novelName, targetChapter, chapterCount));
 
         // 2. 设定：世界观 + 主线（精简 ~150 字）
         String outline = getOutlineBriefAsPrompt(novelName, 150);
         if (!outline.isEmpty()) ctx.append(outline).append("\n");
 
         // 3. 当前卷主线 + 当前章节细纲（细纲里声明出场人物）
-        String volume = getVolumeContextForChapter(novelName, nextChapter);
+        String volume = getVolumeContextForChapter(novelName, targetChapter);
         if (!volume.isEmpty()) ctx.append(volume).append("\n");
 
+        // 3.5 反泄露清单（本卷禁止提前透露的信息，防止写正文时剧透）
+        String secrets = getSecretsForChapter(novelName, targetChapter);
+        if (!secrets.isEmpty()) ctx.append(secrets).append("\n");
+
         // 4. 出场人物卡（2-3 人，按当前章细纲声明的出场人物筛）
-        String characters = getCharactersForChapterAsPrompt(novelName, nextChapter);
+        String characters = getCharactersForChapterAsPrompt(novelName, targetChapter);
         if (!characters.isEmpty()) ctx.append(characters).append("\n");
 
-        // 5. 前文摘要（最近 5 章）
-        String summaries = getRecentSummariesAsPrompt(novelName, 5);
+        // 5. 前文摘要（目标章之前 5 章，重写旧章时不会错位到全书结尾）
+        String summaries = rewriting
+                ? getRecentSummariesBefore(novelName, targetChapter, 5)
+                : getRecentSummariesAsPrompt(novelName, 5);
         if (!summaries.isEmpty()) ctx.append(summaries).append("\n");
 
         // 6. 上一章结尾（按段落取整段，500-1000 字，剧情衔接）
-        String tail = getPreviousChapterTail(novelName, nextChapter, 500);
+        String tail = getPreviousChapterTail(novelName, targetChapter, 500);
         if (!tail.isEmpty()) ctx.append(tail).append("\n");
 
         // 7. 当前章相关伏笔提醒
-        String threads = getForeshadowingsForChapter(novelName, nextChapter);
+        String threads = getForeshadowingsForChapter(novelName, targetChapter);
         if (!threads.isEmpty()) ctx.append(threads).append("\n");
 
-        // 8. 输出要求
-        ctx.append("【输出要求】正文 2000-3000 字，保持既定文风（偏白描、短句、章末留钩）。");
+        // 7.5 每 5 章边界强制回看：查已揭晓/未回收伏笔与搁置的强制元素（查缺补漏方案）
+        if (targetChapter % 5 == 1) {
+            ctx.append("【伏笔回看】现在检查：1) 最近5章已揭晓哪些伏笔 2) 哪些线索尚未回收、最后一次出现于哪章 3) 本卷强制元素（玉坠/身份线等）是否被搁置过久。据此决定本章优先处理哪条线。\n");
+        }
+
+        // 8. 输出要求（含三要三不要风格指令 + 情绪目标落实）
+        ctx.append("【输出要求】正文 1500-2000 字，保持既定文风（偏白描、短句、章末留钩）。");
+        ctx.append("【风格指令】三要三不要：1) 要有一句突如其来的、不符合人设但符合当前情绪的话；不要每句话都符合人设。"
+                + "2) 要让对话偶尔被动作打断；不要对话工整得像剧本。"
+                + "3) 要给本章留一个收尾的余味；不要每章都写'夜色沉沉'或'他望向窗外'。"
+                + "避免'他感到''他意识到''他心里明白'这类概括词，改用具体动作替换。"
+                + "若当前章细纲标注了情绪目标（如'疲惫但专业'），必须用具体的动作、语气、环境细节落实它。"
+                + "【文笔与比喻】文风偏白描、朴素自然，像面对面讲故事，禁止做作："
+                + "1) 少用形容词和四字成语堆砌，禁止华丽辞藻、排比、抒情腔（如'他深深吸了一口气，仿佛要把世间的悲欢都吸进肺里'）；能用短句说完不用长句。"
+                + "2) 描写落在具体动作、对话、感官细节上，用大白话，不煽情、不文艺腔。"
+                + "3) 比喻要少而新：能不比喻就不比喻，直接写动作；同一比喻绝不跨章复用，不用俗套比喻（如'心如刀绞''脸色惨白如纸'）。"
+                + "4) 检查标准：读完一句如果觉得'这不像人话''太绕'，就重写得更直白。"
+                + "【人称与逻辑硬约束（必须遵守）】1) 每句对话必须明确归属：写'韩言说''沈砚说'，不用'他说'开头连续两句以上。"
+                + "2) 禁止出现主宾颠倒的句式：检查'A对B做某事'是否写成了'B对A做某事'。"
+                + "3) 因果方向必须清晰：'因为A所以B'不能写成'因为B所以A'。"
+                + "4) 生成完后在心里复核一遍：这句话如果换一个角色来说是不是也成立？如果成立，说明人称指向不明确，必须重写。");
         return ctx.toString();
+    }
+
+    /**
+     * 组装校验某章正文所需的「预期上下文」：设定 + 当前卷主线与本章细纲 + 反泄露清单 + 出场人物 +
+     * 前文摘要 + 上一章结尾 + 本章相关伏笔 + 风格要求。用于 verify_chapter 生成后自查。
+     */
+    public String buildCheckContext(String novelName, int chapterNumber) {
+        StringBuilder ctx = new StringBuilder();
+        ctx.append(String.format("【检查对象】《%s》第%d章\n\n", novelName, chapterNumber));
+
+        String outline = getOutlineBriefAsPrompt(novelName, 150);
+        if (!outline.isEmpty()) ctx.append(outline).append("\n");
+
+        String volume = getVolumeContextForChapter(novelName, chapterNumber);
+        if (!volume.isEmpty()) ctx.append(volume).append("\n");
+
+        String secrets = getSecretsForChapter(novelName, chapterNumber);
+        if (!secrets.isEmpty()) ctx.append(secrets).append("\n");
+
+        String characters = getCharactersForChapterAsPrompt(novelName, chapterNumber);
+        if (!characters.isEmpty()) ctx.append(characters).append("\n");
+
+        String summaries = getRecentSummariesAsPrompt(novelName, 5);
+        if (!summaries.isEmpty()) ctx.append(summaries).append("\n");
+
+        String tail = getPreviousChapterTail(novelName, chapterNumber, 300);
+        if (!tail.isEmpty()) ctx.append(tail).append("\n");
+
+        String threads = getForeshadowingsForChapter(novelName, chapterNumber);
+        if (!threads.isEmpty()) ctx.append(threads).append("\n");
+
+        ctx.append("【风格要求】三要三不要：1) 要有一句突如其来的、不符合人设但符合当前情绪的话；不要每句话都符合人设。"
+                + "2) 要让对话偶尔被动作打断；不要对话工整得像剧本。"
+                + "3) 要给本章留一个收尾的余味；不要每章都写'夜色沉沉'或'他望向窗外'。"
+                + "避免'他感到''他意识到''他心里明白'这类概括词，改用具体动作替换。"
+                + "文笔要好、有画面感；比喻少而新，同一比喻不跨章复用，不用俗套比喻。");
+        return ctx.toString();
+    }
+
+    /** 批量检查用：全局上下文（设定精简 + 风格要求），整批只发一次。 */
+    public String buildGlobalCheckContext(String novelName) {
+        StringBuilder ctx = new StringBuilder();
+        ctx.append("【小说设定】\n");
+        String outline = getOutlineBriefAsPrompt(novelName, 200);
+        if (!outline.isEmpty()) ctx.append(outline).append("\n");
+        ctx.append("【风格要求】三要三不要：1) 要有一句突如其来的、不符合人设但符合当前情绪的话；不要每句话都符合人设。"
+                + "2) 要让对话偶尔被动作打断；不要对话工整得像剧本。"
+                + "3) 要给本章留一个收尾的余味；不要每章都写'夜色沉沉'或'他望向窗外'。"
+                + "避免'他感到''他意识到''他心里明白'这类概括词，改用具体动作替换。"
+                + "文笔要好、有画面感；比喻少而新，同一比喻不跨章复用，不用俗套比喻。");
+        return ctx.toString();
+    }
+
+    /** 批量检查用：某章的精简上下文（当前卷主线+本章细纲+反泄露清单+本章相关伏笔），按章发。 */
+    public String buildCheckBrief(String novelName, int chapterNumber) {
+        StringBuilder ctx = new StringBuilder();
+        String volume = getVolumeContextForChapter(novelName, chapterNumber);
+        if (!volume.isEmpty()) ctx.append(volume).append("\n");
+        String secrets = getSecretsForChapter(novelName, chapterNumber);
+        if (!secrets.isEmpty()) ctx.append(secrets).append("\n");
+        String threads = getForeshadowingsForChapter(novelName, chapterNumber);
+        if (!threads.isEmpty()) ctx.append(threads).append("\n");
+        return ctx.toString();
+    }
+
+    /** 本卷反泄露清单（禁止提前透露的信息），每行一条。 */
+    private String getSecretsForChapter(String novelName, int chapterNumber) {
+        return volumeRepo.findByNovelName(novelName).stream()
+                .filter(v -> chapterNumber >= v.getChapterStart() && chapterNumber <= v.getChapterEnd())
+                .findFirst()
+                .map(v -> {
+                    if (v.getSecretList() == null || v.getSecretList().isBlank()) return "";
+                    return "【反泄露清单（本卷禁止提前透露，注意避开）】\n" + truncate(v.getSecretList(), 300) + "\n";
+                })
+                .orElse("");
     }
 
     // ========== 写上下文辅助：精确注入 ==========

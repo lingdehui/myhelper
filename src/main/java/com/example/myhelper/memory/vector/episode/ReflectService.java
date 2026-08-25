@@ -11,6 +11,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 反思服务（ExpeL/MUSE 的 Reflect 环节）。
@@ -83,18 +84,56 @@ public class ReflectService {
      * @return 校验结果；AI 调用失败时默认返回 success=true（不阻塞流程）
      */
     public VerificationResult verifyExecution(ModelRouter.Mode mode, String userInput, List<ToolCallLog> toolCalls, String aiResponse) {
+        boolean longTask = isLongContinuableTask(userInput, toolCalls);
+        boolean hasProgress = hasNovelProgress(toolCalls);
+
         String stepsSummary = formatSteps(toolCalls);
         String prompt = promptLoader.getVerifyExecution()
                 .formatted(userInput, stepsSummary, AiResponseUtils.truncate(aiResponse, 300));
+        if (longTask) {
+            prompt += "\n\n【长任务特别规则】本任务属于可续写的长任务（如写小说、分章创作）："
+                    + "只要本次已产出并保存了部分有效进度（章节/大纲/人物等已落盘），就判定 success=true（部分成功），"
+                    + "reason 说明已完成的部分；不要因为「未完成全部章节/全部目标」而判失败。";
+        }
 
         try {
             String response = client(mode).prompt().user(prompt).call().content();
-            return parseVerificationResult(response);
+            VerificationResult result = parseVerificationResult(response);
+            // 兜底：长任务已产出部分进度时，即使 AI 仍判失败也强制按部分成功处理，避免重试/沉淀死循环
+            if (longTask && hasProgress && !result.success()) {
+                log.info("🔍 长任务已产生部分进度，判定为部分成功（忽略AI失败判定: {}）", result.reason());
+                return new VerificationResult(true, "长任务部分成功: " + result.reason(), result.salvageableChains());
+            }
+            return result;
         } catch (Exception e) {
             log.error("⚠️ 执行校验失败: {}", e.getMessage());
             // AI故障时保守处理：不存错误结果，让上层重试
             return VerificationResult.failed("校验服务不可用: " + e.getMessage(), List.of());
         }
+    }
+
+    /** 可续写长任务中「保存进度」的工具名（调用成功即代表有可续写的部分进度）。 */
+    private static final Set<String> NOVEL_PROGRESS_TOOLS = Set.of(
+            "addChapter", "updateChapter", "setOutline", "setVolume",
+            "addCharacter", "setChapterSummary", "addPlotThread");
+
+    /** 是否属于可续写的长任务（如写小说、分章创作）：命中关键词或调用了小说进度工具。 */
+    private boolean isLongContinuableTask(String userInput, List<ToolCallLog> toolCalls) {
+        if (userInput != null && !userInput.isBlank()) {
+            if (userInput.contains("小说") || userInput.contains("写书") || userInput.contains("长篇")
+                    || userInput.contains("续写") || userInput.contains("网文") || userInput.contains("番茄")
+                    || userInput.contains("分卷") || userInput.contains("章节")) {
+                return true;
+            }
+        }
+        return toolCalls != null && toolCalls.stream()
+                .anyMatch(tc -> tc.toolName() != null && NOVEL_PROGRESS_TOOLS.contains(tc.toolName()));
+    }
+
+    /** 本次是否已有「保存进度」类的成功工具调用（即已落盘部分成果）。 */
+    private boolean hasNovelProgress(List<ToolCallLog> toolCalls) {
+        return toolCalls != null && toolCalls.stream()
+                .anyMatch(tc -> tc.success() && tc.toolName() != null && NOVEL_PROGRESS_TOOLS.contains(tc.toolName()));
     }
 
     @SuppressWarnings("unchecked")

@@ -29,6 +29,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -255,16 +257,79 @@ public class ModelRouter {
                 || (e.getCause() != null && isNetworkError(e.getCause()));
     }
 
-    // ---- HTTP 请求日志（精简版：只记录方法/URI/状态/耗时，不打印请求响应体） ----
+    // ---- HTTP 请求日志（记录方法/URI/状态/耗时 + token 用量） ----
     private static ClientHttpRequestInterceptor httpBodyLoggingInterceptor() {
         return (request, body, execution) -> {
             long start = System.currentTimeMillis();
             log.info("🌐 [HTTP] → {} {}", request.getMethod(), request.getURI());
             ClientHttpResponse response = execution.execute(request, body);
-            log.info("🌐 [HTTP] ← {} {} ({}ms)", response.getStatusCode(), response.getStatusText(),
-                    System.currentTimeMillis() - start);
-            return response;
+            long elapsed = System.currentTimeMillis() - start;
+            ClientHttpResponse buffered = new BufferedResponse(response);
+            log.info("🌐 [HTTP] ← {} {} ({}ms){}",
+                    response.getStatusCode(), response.getStatusText(), elapsed,
+                    extractUsage(buffered));
+            return buffered;
         };
+    }
+
+    /** 从响应体解析 usage 字段（DeepSeek/Ollama 均返回 prompt/completion/total_tokens）。 */
+    private static String extractUsage(ClientHttpResponse response) {
+        try (InputStream in = response.getBody()) {
+            String json = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            if (json == null || json.isBlank()) return "";
+            Matcher m = Pattern.compile("\"usage\"\\s*:\\s*\\{([^}]*)\\}").matcher(json);
+            if (!m.find()) return "";
+            String usage = m.group(1);
+            long prompt = extractLong(usage, "prompt_tokens");
+            long completion = extractLong(usage, "completion_tokens");
+            long total = extractLong(usage, "total_tokens");
+            return String.format(" | tokens: in=%d out=%d total=%d", prompt, completion, total);
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static long extractLong(String json, String key) {
+        Matcher m = Pattern.compile("\"" + key + "\"\\s*:\\s*(\\d+)").matcher(json);
+        return m.find() ? Long.parseLong(m.group(1)) : -1L;
+    }
+
+    /** 缓存响应体的 ClientHttpResponse 包装器：先读一次 body 记录日志，再返回可重复读取的 body。 */
+    private static final class BufferedResponse implements ClientHttpResponse {
+        private final ClientHttpResponse delegate;
+        private final byte[] body;
+
+        BufferedResponse(ClientHttpResponse delegate) throws IOException {
+            this.delegate = delegate;
+            try (InputStream in = delegate.getBody()) {
+                this.body = in.readAllBytes();
+            }
+        }
+
+        @Override
+        public HttpStatusCode getStatusCode() throws IOException {
+            return delegate.getStatusCode();
+        }
+
+        @Override
+        public String getStatusText() throws IOException {
+            return delegate.getStatusText();
+        }
+
+        @Override
+        public HttpHeaders getHeaders() {
+            return delegate.getHeaders();
+        }
+
+        @Override
+        public InputStream getBody() {
+            return new ByteArrayInputStream(body);
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
+        }
     }
 
     // ============================================================

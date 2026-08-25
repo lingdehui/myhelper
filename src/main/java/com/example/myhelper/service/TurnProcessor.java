@@ -13,6 +13,7 @@ import com.example.myhelper.memory.unit.UnitFailureService;
 import com.example.myhelper.memory.unit.UniversalUnitExecutor;
 import com.example.myhelper.memory.unit.ExplorationRecord;
 import com.example.myhelper.config.ModelRouter;
+import com.example.myhelper.novel.NovelMemoryService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -22,6 +23,8 @@ import org.springframework.stereotype.Component;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -58,6 +61,7 @@ public class TurnProcessor {
     private final UniversalUnitExecutor universalUnitExecutor;
     private final UnitSedimentationService unitSedimentationService;
     private final UnitFailureService unitFailureService;
+    private final NovelMemoryService novelMemoryService;
     private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     // ========== AI 中断控制 ==========
@@ -75,6 +79,21 @@ public class TurnProcessor {
     /** 当前 Turn 是否为探索模式（由 processExploration 设置，process 结束时复位） */
     private boolean explorationMode = false;
 
+    /** 非长任务校验失败后的重试上限（重规划/分段继续次数） */
+    private static final int MAX_RETRY = 3;
+    /** 当前 Turn 已重试次数（在 process 开头清零） */
+    private int retryCount = 0;
+
+    /** 重试预算：未超上限则计数 +1 并放行，超限则拒绝并停止重试。 */
+    private boolean canRetry() {
+        if (retryCount >= MAX_RETRY) {
+            log.info("🛑 已达重试上限 {} 次，停止重试", MAX_RETRY);
+            return false;
+        }
+        retryCount++;
+        return true;
+    }
+
     private ModelRouter.Mode currentMode() {
         return explorationMode ? ModelRouter.Mode.EXPLORATION : ModelRouter.Mode.NORMAL;
     }
@@ -91,7 +110,8 @@ public class TurnProcessor {
                           SystemEnvironmentService envService,
                           UniversalUnitExecutor universalUnitExecutor,
                           UnitSedimentationService unitSedimentationService,
-                          UnitFailureService unitFailureService) {
+                          UnitFailureService unitFailureService,
+                          NovelMemoryService novelMemoryService) {
         this.toolPlanner = toolPlanner;
         this.planMatcher = planMatcher;
         this.reflectService = reflectService;
@@ -105,6 +125,7 @@ public class TurnProcessor {
         this.universalUnitExecutor = universalUnitExecutor;
         this.unitSedimentationService = unitSedimentationService;
         this.unitFailureService = unitFailureService;
+        this.novelMemoryService = novelMemoryService;
         this.objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
     }
 
@@ -170,6 +191,13 @@ public class TurnProcessor {
      */
     public void process(ModelRouter modelRouter, ToolCallback[] baseTools,
                          String userInput, TtsService ttsService) {
+        // 批量续写：用户说「写N章 / 写到第N章 / 一口气写」等 → 自动连续写，无需逐章「继续写」
+        int batchTarget = parseBatchTarget(userInput);
+        String batchNovel = batchTarget > 0 ? extractNovelName(userInput) : null;
+        if (batchTarget > 0 && batchNovel != null) {
+            runNovelBatch(modelRouter, baseTools, batchNovel, batchTarget, ttsService);
+            return;
+        }
         process(modelRouter, baseTools, userInput, ttsService, false);
     }
 
@@ -179,6 +207,7 @@ public class TurnProcessor {
         long myTurnId = aiTurnId.incrementAndGet();
         currentAiTurnId = myTurnId;
         silenceCount = 0;
+        retryCount = 0;
         this.lastBaseTools = baseTools;
         universalUnitExecutor.clearExplorationDeclareType();
 
@@ -542,7 +571,7 @@ public class TurnProcessor {
             recordUnitFailures(toolCallLogs, analysis.lesson(), analysis.isPlanIssue(), userInput);
             unitFailureService.recordFailure(null, analysis.lesson(), analysis.isPlanIssue(), null);
 
-            if (!analysis.isPlanIssue()) {
+            if (canRetry() && !analysis.isPlanIssue()) {
                 int fromStep = execResult.failedStepIndex() + 1;
                 if (fromStep < unit.script().size()) {
                     log.info("ℹ️ 脚本环境问题，从第 {} 步继续执行", (fromStep + 1));
@@ -560,8 +589,10 @@ public class TurnProcessor {
                 }
             }
             toolPlanner.onCacheHitFailure(userInput, plan, analysis.lesson(), analysis.isPlanIssue());
-            handleCacheFailure(modelRouter, tools, effectiveInput, userInput, plan,
-                    toolCallLogs, myTurnId, ttsService, execResult.errorMessage());
+            if (canRetry()) {
+                handleCacheFailure(modelRouter, tools, effectiveInput, userInput, plan,
+                        toolCallLogs, myTurnId, ttsService, execResult.errorMessage());
+            }
         }
     }
 
@@ -595,7 +626,12 @@ public class TurnProcessor {
                 toolPlanner.onCacheHitFailure(userInput, plan, analysis.lesson(), analysis.isPlanIssue());
                 unitFailureService.recordFailure(null, analysis.lesson(), analysis.isPlanIssue(), null);
 
-                if (!analysis.isPlanIssue()) {
+                if (analysis.isPlanIssue()) {
+                    if (canRetry()) {
+                        handleCacheFailure(modelRouter, tools, effectiveInput, userInput, plan,
+                                toolCallLogs, myTurnId, ttsService, e.getMessage());
+                    }
+                } else if (canRetry()) {
                     log.info("ℹ️ 环境问题导致失败，分段继续执行");
                     String continuePrompt = buildContinuePrompt(userInput, e.getMessage(), analysis.lesson());
                     toolCallLogs.clear();
@@ -615,9 +651,6 @@ public class TurnProcessor {
                             speakIfPossible(ttsService, resp);
                         }
                     }
-                } else {
-                    handleCacheFailure(modelRouter, tools, effectiveInput, userInput, plan,
-                            toolCallLogs, myTurnId, ttsService, e.getMessage());
                 }
             }
         }
@@ -679,7 +712,7 @@ public class TurnProcessor {
             log.info("❌ {}", e.getMessage());
 
             // 探索模式不重试执行，下轮巡检重新规划
-            if (!analysis.isPlanIssue() && !explorationMode) {
+            if (canRetry() && !analysis.isPlanIssue() && !explorationMode) {
                 String continuePrompt = buildContinuePrompt(userInput, e.getMessage(), analysis.lesson());
                 toolCallLogs.clear();
                 String resp = executeWithTools(modelRouter, continuePrompt, tools, plan, toolCallLogs);
@@ -1103,6 +1136,152 @@ public class TurnProcessor {
     // ============================================================
     // 工具分类缓存同步
     // ============================================================
+
+    // ============================================================
+    // 小说批量续写（「写N章 / 写到第N章 / 一口气写」自动连续写）
+    // ============================================================
+
+    /** 批量续写时提供给 AI 的小说工具集（写作主链路 + 上下文 + 伏笔） */
+    private static final Set<String> NOVEL_BATCH_TOOLS = Set.of(
+            "getNovelState", "buildWritingContext", "addChapter", "setChapterSummary",
+            "getRecentSummaries", "getUnresolvedPlotThreads", "getOutline", "getVolumes",
+            "getCharacters", "getAllChapters", "addPlotThread", "resolvePlotThread");
+
+    /** 未显式指定章数时的默认批量章数 */
+    private static final int DEFAULT_BATCH_CHAPTERS = 100;
+    /** 批量续写硬上限，防止误触发写太多 */
+    private static final int MAX_BATCH_CHAPTERS = 500;
+
+    private static final Pattern BATCH_N_PATTERN = Pattern.compile(
+            "(?:写\\s*到\\s*第?|写\\s*至\\s*第?|续写|再写|连续写|一口气写|自动写|批量写|写)\\s*((?:\\d{1,4}|[〇零一二三四五六七八九十百千万]+))\\s*章");
+
+    /** 解析批量续写目标章数；0 表示不是批量指令。支持阿拉伯数字与中文数字（如 100 / 十 / 一百）。 */
+    private int parseBatchTarget(String input) {
+        if (input == null || input.isBlank()) return 0;
+        Matcher m = BATCH_N_PATTERN.matcher(input);
+        if (m.find()) {
+            int n = parseChapterNumber(m.group(1));
+            if (n > 0) return Math.min(n, MAX_BATCH_CHAPTERS);
+        }
+        if (input.contains("一口气") || input.contains("连续写") || input.contains("自动写")
+                || input.contains("批量写") || input.contains("一直写") || input.contains("不停写")) {
+            return DEFAULT_BATCH_CHAPTERS;
+        }
+        return 0;
+    }
+
+    /** 解析章数字符串：阿拉伯数字直接转，中文数字走 chineseToInt。 */
+    private int parseChapterNumber(String s) {
+        if (s == null || s.isBlank()) return 0;
+        if (s.matches("\\d+")) {
+            try {
+                return Integer.parseInt(s);
+            } catch (NumberFormatException ignore) {
+                return 0;
+            }
+        }
+        return chineseToInt(s);
+    }
+
+    /** 中文数字转 int（支持 十/十一/一百二十/一千零五 等，上限到万）。 */
+    private int chineseToInt(String s) {
+        int total = 0, section = 0, number = 0;
+        for (char c : s.toCharArray()) {
+            int v = chineseDigit(c);
+            if (v >= 0) {
+                number = v;
+            } else if (c == '十') {
+                section += (number == 0 ? 1 : number) * 10;
+                number = 0;
+            } else if (c == '百') {
+                section += (number == 0 ? 1 : number) * 100;
+                number = 0;
+            } else if (c == '千') {
+                section += (number == 0 ? 1 : number) * 1000;
+                number = 0;
+            } else if (c == '万') {
+                total = (section + number) * 10000;
+                section = 0;
+                number = 0;
+            }
+        }
+        return total + section + number;
+    }
+
+    private int chineseDigit(char c) {
+        switch (c) {
+            case '零': case '〇': return 0;
+            case '一': return 1;
+            case '二': return 2;
+            case '三': return 3;
+            case '四': return 4;
+            case '五': return 5;
+            case '六': return 6;
+            case '七': return 7;
+            case '八': return 8;
+            case '九': return 9;
+            default: return -1;
+        }
+    }
+
+    /** 从输入中提取《书名》。 */
+    private String extractNovelName(String input) {
+        if (input == null) return null;
+        Matcher m = Pattern.compile("《([^》]{1,50})》").matcher(input);
+        return m.find() ? m.group(1).trim() : null;
+    }
+
+    /** 自动连续写章节：每次用 executeWithTools 写一章（静音），直到达到目标章数或被中断。 */
+    private void runNovelBatch(ModelRouter modelRouter, ToolCallback[] baseTools,
+                               String novelName, int target, TtsService ttsService) {
+        long myTurnId = aiTurnId.incrementAndGet();
+        currentAiTurnId = myTurnId;
+        silenceCount = 0;
+        long turnStart = System.currentTimeMillis();
+        log.info("===== TurnProcessor.processTurn 开始(批量续写) ===== novel='{}', target={}章", novelName, target);
+
+        ToolCallback[] tools = mergeDynamicTools(baseTools);
+        long current = novelMemoryService.getChapterCount(novelName);
+        if (current >= target) {
+            log.info("📚 已写 {} 章，达到目标 {}，无需续写", current, target);
+        } else {
+            int safety = (int) (target - current) + 3;
+            while (current < target && currentAiTurnId == myTurnId && safety-- > 0) {
+                int next = (int) current + 1;
+                String input = String.format(
+                        "继续写《%s》的第 %d 章（已写 %d 章，目标写到第 %d 章）。"
+                                + "请先调用 buildWritingContext 获取写作上下文，写出第 %d 章正文，"
+                                + "调用 addChapter 保存，再调用 setChapterSummary 记录本章摘要。",
+                        novelName, next, current, target, next);
+                List<ToolCallLog> logs = Collections.synchronizedList(new ArrayList<>());
+                ToolPlanner.PlanResult plan = ToolPlanner.PlanResult.ofAIPlan(new ArrayList<>(NOVEL_BATCH_TOOLS), List.of());
+                try {
+                    executeWithTools(modelRouter, input, tools, plan, logs);
+                    long after = novelMemoryService.getChapterCount(novelName);
+                    if (after <= current) {
+                        log.warn("⚠️ 自动续写第 {} 章未推进（{} -> {}），停止", next, current, after);
+                        break;
+                    }
+                    current = after;
+                    log.info("📚 自动续写完成第 {} 章（进度 {} / {}）", current, current, target);
+                } catch (Exception e) {
+                    log.warn("⚠️ 自动续写第 {} 章异常，停止: {}", next, e.getMessage());
+                    break;
+                }
+            }
+        }
+
+        long elapsed = System.currentTimeMillis() - turnStart;
+        log.info("===== TurnProcessor.processTurn 结束(批量续写) ===== 已写 {} 章, 耗时={}s",
+                current, elapsed / 1000.0);
+        if (currentAiTurnId == myTurnId) {
+            speakIfPossible(ttsService, "已自动续写完成，当前共 " + current + " 章");
+        }
+        if (currentAiTurnId == myTurnId) {
+            currentAiTurnId = -1;
+            silenceCount = 0;
+        }
+    }
 
     /** TTS null-safe 包装 */
     private void speakIfPossible(TtsService ttsService, String text) {

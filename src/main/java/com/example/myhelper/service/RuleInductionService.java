@@ -1,6 +1,7 @@
 package com.example.myhelper.service;
 
 import com.example.myhelper.common.PromptLoader;
+import com.example.myhelper.config.MyHelperProperties;
 import com.example.myhelper.memory.graph.FailureCauseNode;
 import com.example.myhelper.memory.graph.FailureCauseRepository;
 import com.example.myhelper.memory.graph.RuleNode;
@@ -36,17 +37,20 @@ public class RuleInductionService {
     private final FailureCauseRepository failureCauseRepo;
     private final UnitStore unitStore;
     private final PromptLoader promptLoader;
+    private final MyHelperProperties props;
 
     public RuleInductionService(ModelRouter modelRouter,
                                  RuleRepository ruleRepo,
                                  FailureCauseRepository failureCauseRepo,
                                  UnitStore unitStore,
-                                 PromptLoader promptLoader) {
+                                 PromptLoader promptLoader,
+                                 MyHelperProperties props) {
         this.modelRouter = modelRouter;
         this.ruleRepo = ruleRepo;
         this.failureCauseRepo = failureCauseRepo;
         this.unitStore = unitStore;
         this.promptLoader = promptLoader;
+        this.props = props;
     }
 
     /**
@@ -56,6 +60,7 @@ public class RuleInductionService {
      */
     @Scheduled(cron = "${myhelper.rule-induction.cron:0 0 3 * * ?}")
     public void scheduledInduction() {
+        if (!props.autonomous().enabled()) return;
         log.info("🧠 开始定时规则归纳...");
         try {
             int newRules = induceRules();

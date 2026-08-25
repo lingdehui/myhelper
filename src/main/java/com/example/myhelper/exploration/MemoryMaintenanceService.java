@@ -61,7 +61,7 @@ public class MemoryMaintenanceService {
 
     @Scheduled(cron = "${myhelper.memory-maintenance.cron:0 0 4 * * ?}")
     public void scheduledCleanup() {
-        if (!props.memoryMaintenance().enabled()) return;
+        if (!props.autonomous().enabled()) return;
         try {
             cleanup();
         } catch (Exception e) {

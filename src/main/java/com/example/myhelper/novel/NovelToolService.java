@@ -26,9 +26,15 @@ import java.util.List;
 public class NovelToolService {
 
     private final NovelMemoryService memory;
+    private final NovelQualityChecker qualityChecker;
+    private final NovelChapterCheckService chapterCheckService;
 
-    public NovelToolService(NovelMemoryService memory) {
+    public NovelToolService(NovelMemoryService memory,
+                            NovelQualityChecker qualityChecker,
+                            NovelChapterCheckService chapterCheckService) {
         this.memory = memory;
+        this.qualityChecker = qualityChecker;
+        this.chapterCheckService = chapterCheckService;
     }
 
     // ========== 状态查询 ==========
@@ -72,7 +78,8 @@ public class NovelToolService {
     @Tool(description = "保存/更新某一卷的大纲。长篇（默认1000章）不要一次写完全部大纲，按卷切分、一次一卷。" +
             "volumeNumber 卷序号从1开始，chapterStart/chapterEnd 为本章起止章号（含）。" +
             "mainPlot 本卷主线，chapterOutlines 本卷分章简要（每行一章），" +
-            "foreshadowings 本卷伏笔计划（每行一条，如 '第3章埋：xxx，第20章回收'）。伏笔要提前规划好，不要等写每章时临时想。")
+            "foreshadowings 本卷伏笔计划（每行一条，如 '第3章埋：xxx，第20章回收'）。伏笔要提前规划好，不要等写每章时临时想。" +
+            "secrets 本卷反泄露清单（每行一条，如 '沈砚身份：第45章前绝不可提'），写正文时注入防止提前剧透。")
     public String setVolume(
             @ToolParam(description = "小说名称") String novelName,
             @ToolParam(description = "卷序号，从1开始") int volumeNumber,
@@ -81,9 +88,13 @@ public class NovelToolService {
             @ToolParam(description = "本卷结束章号（含）") int chapterEnd,
             @ToolParam(description = "本卷主线") String mainPlot,
             @ToolParam(description = "本卷分章简要，每行一章，格式：'第N章：一句话细纲（出场：人物A、人物B）'，出场人物用于写该章时精确筛人物卡") String chapterOutlines,
-            @ToolParam(description = "本卷伏笔计划，每行一条") String foreshadowings) {
+            @ToolParam(description = "本卷伏笔计划，每行一条") String foreshadowings,
+            @ToolParam(description = "本卷反泄露清单（可选），每行一条，如 '沈砚身份：第45章前绝不可提'") String secrets) {
+        if (novelName == null || novelName.isBlank()) {
+            return "❌ 缺少 novelName：set_volume 必须携带小说名称，否则分卷会丢失归属、写正文时无法读取。请带上书名重新调用";
+        }
         memory.setVolume(novelName, volumeNumber, title, chapterStart, chapterEnd,
-                mainPlot, chapterOutlines, foreshadowings);
+                mainPlot, chapterOutlines, foreshadowings, secrets);
         return "✅ 第" + volumeNumber + "卷《" + title + "》已保存（第" + chapterStart + "-" + chapterEnd + "章）";
     }
 
@@ -151,21 +162,35 @@ public class NovelToolService {
     // ========== 章节管理 ==========
 
     @Tool(description = "一键获取写下一章所需的完整上下文。包括大纲（世界观/主线/分章简要）、人物设定与关系、最近章节摘要、未回收伏笔。" +
-            "这是写每章前最核心的工具，用一次就行，无需逐个调用 getCharacters/getRecentSummaries/getUnresolvedPlotThreads。")
+            "这是写每章前最核心的工具，用一次就行，无需逐个调用 getCharacters/getRecentSummaries/getUnresolvedPlotThreads。" +
+            "新写或重写每一章都必须先调用它；返回内容已内置文笔要求（有画面感）、比喻要求（不跨章复用、不用俗套比喻）、" +
+            "伏笔回看、反泄露清单等写作约束。" +
+            "重写旧章时（如从第6章开始重写），必须传 chapterNumber 指定目标章号，上下文会按该章所在卷生成；不传则默认取下一章上下文。")
     public String buildWritingContext(
-            @ToolParam(description = "小说名称") String novelName) {
-        return memory.buildWritingContext(novelName);
+            @ToolParam(description = "小说名称") String novelName,
+            @ToolParam(description = "目标章号（重写旧章时必传，例如 6），不传则默认写下一章") Integer chapterNumber) {
+        if (novelName == null || novelName.isBlank()) {
+            novelName = memory.resolveNovelName(novelName);
+        }
+        if (novelName == null) {
+            return "❌ 无法确定小说名称：请带上完整小说名（例如\"心理师专治修仙心魔劫\"）重新调用本工具。";
+        }
+        return memory.buildWritingContext(novelName, chapterNumber);
     }
 
     @Tool(description = "添加/保存一个章节。每章写完立即调用此工具存入记忆。" +
-            "content 为章节完整正文。保存后会自动写入图谱，并落盘到文件（每章一个 .txt）。同章号重复保存会覆盖旧内容。")
+            "content 为章节完整正文。保存后会自动写入图谱，并落盘到文件（每章一个 .txt），并自动触发章节质量检查。" +
+            "同章号重复保存会覆盖旧内容（用于重写）。重写章节的固定流程：get_chapter 读该章原文 → build_writing_context 取上下文 → " +
+            "在原文基础上重写（保持与前后章衔接、不改变大纲细纲）→ add_chapter 用新内容覆盖保存。")
     public String addChapter(
             @ToolParam(description = "小说名称") String novelName,
             @ToolParam(description = "章节序号，从1开始") int chapterNumber,
             @ToolParam(description = "章节标题") String title,
             @ToolParam(description = "章节完整正文") String content) {
         memory.addChapter(novelName, chapterNumber, title, content);
-        return "✅ 第" + chapterNumber + "章《" + title + "》已保存（" + content.length() + "字），正文已落盘到文件";
+        String base = "✅ 第" + chapterNumber + "章《" + title + "》已保存（" + content.length() + "字），正文已落盘到文件";
+        String report = chapterCheckService.onChapterSaved(novelName, chapterNumber, content);
+        return report == null || report.isBlank() ? base : base + report;
     }
 
     @Tool(description = "设置章节的摘要、人物调度和情节伏笔标记。每章写完应调用此工具标记关键信息。" +
@@ -177,6 +202,12 @@ public class NovelToolService {
             @ToolParam(description = "章节摘要，200字以内") String summary,
             @ToolParam(description = "本章出场人物，逗号分隔") String characters,
             @ToolParam(description = "本章情节线，逗号分隔") String plotThreads) {
+        if (novelName == null || novelName.isBlank()) {
+            novelName = memory.resolveNovelName(novelName);
+        }
+        if (novelName == null) {
+            return "❌ 无法确定小说名称：请带上完整小说名（例如\"心理师专治修仙心魔劫\"）重新调用本工具。";
+        }
         memory.setChapterSummary(novelName, chapterNumber, summary, characters, plotThreads);
         return "✅ 第" + chapterNumber + "章摘要已记录 | 人物: " + characters + " | 情节: " + plotThreads;
     }
@@ -201,7 +232,7 @@ public class NovelToolService {
         return sb.toString();
     }
 
-    @Tool(description = "获取指定章节的完整正文。用于回顾或修改旧章节。")
+    @Tool(description = "获取指定章节的完整正文。用于回顾旧章节；重写章节时第一步必须先调它读原文，再在原文基础上重写。")
     public String getChapter(
             @ToolParam(description = "小说名称") String novelName,
             @ToolParam(description = "章节序号") int chapterNumber) {
@@ -210,13 +241,35 @@ public class NovelToolService {
                 .orElse("❌ 未找到第" + chapterNumber + "章");
     }
 
-    @Tool(description = "修改已存在的章节内容。用于润色或重写。")
+    @Tool(description = "修改已存在的章节内容。用于润色或重写。novelName 必须携带完整小说名，每次都要传！保存后会自动触发章节质量检查（每6章合并检查逻辑/文风等）。")
     public String updateChapter(
-            @ToolParam(description = "小说名称") String novelName,
+            @ToolParam(description = "小说名称，必须完整传入，缺失会导致更新失败") String novelName,
             @ToolParam(description = "章节序号") int chapterNumber,
             @ToolParam(description = "新的章节完整正文") String content) {
+        if (novelName == null || novelName.isBlank()) {
+            novelName = memory.resolveNovelName(novelName);
+        }
+        if (novelName == null) {
+            return "❌ 无法确定小说名称：请带上完整小说名（例如\"心理师专治修仙心魔劫\"）重新调用本工具。";
+        }
         memory.updateChapter(novelName, chapterNumber, content);
-        return "✅ 第" + chapterNumber + "章已更新（" + content.length() + "字）";
+        String base = "✅ 第" + chapterNumber + "章已更新（" + content.length() + "字），正文已落盘到文件";
+        String report = chapterCheckService.onChapterSaved(novelName, chapterNumber, content);
+        return report == null || report.isBlank() ? base : base + report;
+    }
+
+    @Tool(description = "检查某一章的正文质量（写完/重写后抽查）：重复表达（与最近5章重复的句子、每章都用的高频描写、重复比喻）、" +
+            "反泄露违规、伏笔冲突、剧情衔接、文风偏离、情绪目标落实。" +
+            "建议每写 5-10 章抽查一次最近章节：查出有问题的章节统一轻微修改（补情节或改词），不重写整章。" +
+            "content 可留空，为空时自动读取该章已保存的正文。")
+    public String verifyChapter(
+            @ToolParam(description = "小说名称") String novelName,
+            @ToolParam(description = "章节序号") int chapterNumber,
+            @ToolParam(description = "要检查的正文（可选，留空则读取已保存的正文）") String content) {
+        String text = (content == null || content.isBlank())
+                ? memory.getChapter(novelName, chapterNumber).map(ch -> ch.getContent()).orElse("")
+                : content;
+        return qualityChecker.verify(novelName, chapterNumber, text);
     }
 
     // ========== 情节线管理 ==========

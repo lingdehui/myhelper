@@ -25,6 +25,7 @@ public class NovelVolumeNode {
     private String mainPlot;       // 本卷主线
     private String chapterOutlines; // 本卷分章简要（每行一章，如 "第1章：xxx"）
     private String foreshadowings; // 本卷埋设/回收的伏笔计划（每行一条，如 "第3章埋：xxx"）
+    private String secretList;     // 反泄露清单：本卷禁止提前透露的信息（每行一条，如 "沈砚身份：第45章前绝不可提"）
     private Long createdAt;
     private Long updatedAt;
 
@@ -33,6 +34,14 @@ public class NovelVolumeNode {
     public NovelVolumeNode(String novelName, int volumeNumber, String title,
                            int chapterStart, int chapterEnd,
                            String mainPlot, String chapterOutlines, String foreshadowings) {
+        this(novelName, volumeNumber, title, chapterStart, chapterEnd,
+                mainPlot, chapterOutlines, foreshadowings, null);
+    }
+
+    public NovelVolumeNode(String novelName, int volumeNumber, String title,
+                           int chapterStart, int chapterEnd,
+                           String mainPlot, String chapterOutlines, String foreshadowings,
+                           String secretList) {
         this.novelName = novelName;
         this.volumeNumber = volumeNumber;
         this.title = title;
@@ -41,6 +50,7 @@ public class NovelVolumeNode {
         this.mainPlot = mainPlot;
         this.chapterOutlines = chapterOutlines;
         this.foreshadowings = foreshadowings;
+        this.secretList = secretList;
         long now = System.currentTimeMillis();
         this.createdAt = now;
         this.updatedAt = now;
@@ -64,6 +74,8 @@ public class NovelVolumeNode {
     public void setChapterOutlines(String chapterOutlines) { this.chapterOutlines = chapterOutlines; }
     public String getForeshadowings() { return foreshadowings; }
     public void setForeshadowings(String foreshadowings) { this.foreshadowings = foreshadowings; }
+    public String getSecretList() { return secretList; }
+    public void setSecretList(String secretList) { this.secretList = secretList; }
     public Long getCreatedAt() { return createdAt; }
     public void setCreatedAt(Long createdAt) { this.createdAt = createdAt; }
     public Long getUpdatedAt() { return updatedAt; }

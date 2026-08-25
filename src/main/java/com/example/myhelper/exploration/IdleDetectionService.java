@@ -29,7 +29,7 @@ public class IdleDetectionService {
      */
     public boolean shouldExplore() {
         MyHelperProperties.Exploration exp = props.exploration();
-        if (!exp.enabled()) return false;
+        if (!props.autonomous().enabled()) return false;
 
         // 1. 空闲时间检查
         long idleMs = System.currentTimeMillis() - dialogStateMachine.getLastInteractionTime();

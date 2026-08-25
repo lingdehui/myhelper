@@ -24,7 +24,8 @@ public record MyHelperProperties(
         Vad vad,
         Execution execution,
         MemoryMaintenance memoryMaintenance,
-        String normalModel
+        String normalModel,
+        @NotNull Autonomous autonomous
 ) {
 
     /** 语音交互参数 */
@@ -99,7 +100,6 @@ public record MyHelperProperties(
 
     /** 自主探索引擎参数（模型 2: DeepSeek 云端备用） */
     public record Exploration(
-            boolean enabled,
             String explorationModel,
             int idleThresholdMinutes,
             int maxDurationMinutes,
@@ -111,7 +111,6 @@ public record MyHelperProperties(
 
     /** 记忆维护参数 */
     public record MemoryMaintenance(
-            boolean enabled,
             String cron,
             double threshold,
             double target,
@@ -121,4 +120,9 @@ public record MyHelperProperties(
         public record Weights(double recency, double usage, double userProduced, double dependency) {}
         public record RetentionRules(int userTask, int autonomousExploration, int failurePattern, int defaultDays) {}
     }
+
+    /** 后台自主任务总开关（自主探索 + 规则归纳 + 记忆维护） */
+    public record Autonomous(
+            boolean enabled
+    ) {}
 }

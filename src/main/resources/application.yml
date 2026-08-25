@@ -47,8 +47,8 @@ myhelper:
   normal-model: model2                # model1=本地Ollama优先(搞不定请教云端), model2=全程云端DeepSeek
   deepseek:                           # 模型 2: DeepSeek API（远程）
     base-url: https://api.deepseek.com
-    api-key: sk-f2fcd2a4bdb44f02a410c3f030d6fb8b
-    model: deepseek-v4-pro
+    api-key: sk-99fb97b7689b4817a9f9a3c2b722637b
+    model: deepseek-v4-flash
   exploration:
     exploration-model: model2         # model1=本地, model2=云端
 
@@ -61,6 +61,13 @@ homeassistant:
 # ===== Ollama 嵌入模型 =====
 embedding:
   model: bge-m3
+
+# ===== 小说章节自动检查（add_chapter 保存后触发） =====
+novel:
+  verify:
+    enabled: true              # 总开关
+    batch-threshold: 6         # 单批少于6章：每章全量检查；达到6章：之后每组抽查一次
+    batch-gap-minutes: 15      # 两次保存间隔超过15分钟视为新一批次
 
 logging:
   level:

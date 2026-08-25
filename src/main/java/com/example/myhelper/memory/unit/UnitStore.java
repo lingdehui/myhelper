@@ -284,12 +284,15 @@ public class UnitStore {
         return notes.isEmpty() ? null : notes.get(0);
     }
 
-    /** 成功计数 +1（差异更新：命中相同目标 Unit 时不重复新建，只增量）。 */
+    /** 成功计数 +1 且抵消一次历史失败（奖惩对称，下限0；差异更新：命中相同目标 Unit 时不重复新建，只增量）。 */
     public void incrementSuccess(String unitId) {
         unitRepository.findByUnitId(unitId).ifPresent(node -> {
             int success = node.getSuccessCount() + 1;
+            // 奖惩对称：成功抵消一次历史失败（仅计划问题计入的失败），"改过自新"的 Unit 不被旧账永久压住稳定性
+            int failure = Math.max(0, node.getFailureCount() - 1);
             node.setSuccessCount(success);
-            node.setStability(Unit.calcStability(success, node.getFailureCount()));
+            node.setFailureCount(failure);
+            node.setStability(Unit.calcStability(success, failure));
             // §7.2 条件3：successCount≥5 且 stability>0.9 时，若满足其它条件则升级为可脚本化
             if (success >= 5 && node.getStability() > 0.9 && !node.isScriptable()) {
                 tryUpgradeScriptable(node);
