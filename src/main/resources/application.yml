@@ -61,6 +61,7 @@ homeassistant:
 # ===== Ollama 嵌入模型 =====
 embedding:
   model: bge-m3
+  cache-size: 256              # 相同文本嵌入复用；设为 0 可关闭并恢复逐次请求
 
 # ===== 小说章节自动检查（add_chapter 保存后触发） =====
 novel:

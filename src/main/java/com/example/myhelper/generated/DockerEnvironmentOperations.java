@@ -6,6 +6,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * Docker 运行环境检查与操作工具，用于诊断或管理本机容器环境。
+ */
 @Component
 @GeneratedTool
 public class DockerEnvironmentOperations {

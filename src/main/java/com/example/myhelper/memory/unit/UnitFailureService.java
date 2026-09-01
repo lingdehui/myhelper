@@ -86,14 +86,14 @@ public class UnitFailureService {
                 notes.add("环境失败: " + failureLesson);
             }
             node.setNotesJson(toJson(notes));
-            unitRepository.save(node);
+            unitStore.saveExperienceUpdate(node);
             log.info("ℹ️ Unit 环境失败（不惩罚，id={}...）", shortId(unitId));
             return causeId;
         }
 
         // MCP 工具保护：失败只记录，不计数、不归档、不禁用、无 FALLBACK（§6）
         if (mcpTool) {
-            unitRepository.save(node);
+            unitStore.saveExperienceUpdate(node);
             log.info("🛡️ MCP 工具失败仅记录（不惩罚，id={}...）", shortId(unitId));
             return causeId;
         }
@@ -105,7 +105,7 @@ public class UnitFailureService {
         if (archive) {
             node.setStatus("ARCHIVED");
         }
-        unitRepository.save(node);
+        unitStore.saveExperienceUpdate(node);
         log.info("⚠️ Unit 计划失败+1（id={}...，failure={}/{}{}）",
                 shortId(unitId), failure, failureThreshold, archive ? "，已归档" : "");
 

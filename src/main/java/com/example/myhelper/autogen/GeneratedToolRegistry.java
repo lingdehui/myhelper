@@ -112,17 +112,20 @@ public class GeneratedToolRegistry {
                 stream.filter(p -> p.toString().endsWith(".java"))
                       .forEach(files::add);
             }
+            List<String> loadedClasses = new ArrayList<>();
             for (Path f : files) {
-                String className = f.getFileName().toString().replace(".java", "");
                 String content = Files.readString(f);
+                // 目录中可能保留已退役或辅助类型；只有明确标记的类型才是可管理的生成工具。
+                if (!content.contains("@GeneratedTool")) continue;
+                String className = f.getFileName().toString().replace(".java", "");
                 String desc = extractFirstToolDescription(content);
                 String hash = hashKey(desc != null ? desc : className);
                 generatedTools.put(hash,
                         new GeneratedToolInfo(className, desc != null ? desc : className, f, 0, environmentKey));
+                loadedClasses.add(className);
             }
-            if (!files.isEmpty()) {
-                log.info("🔧 已加载 {} 个生成工具记录: {}", files.size(),
-                        generatedTools.values().stream().map(GeneratedToolInfo::className).toList());
+            if (!loadedClasses.isEmpty()) {
+                log.info("🔧 已加载 {} 个生成工具记录: {}", loadedClasses.size(), loadedClasses);
             }
         } catch (Exception e) {
             log.warn("⚠️ 扫描生成工具目录失败", e);

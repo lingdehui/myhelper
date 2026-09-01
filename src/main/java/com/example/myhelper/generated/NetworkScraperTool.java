@@ -10,6 +10,9 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
+/**
+ * 网络内容抓取工具。负责取得远端响应并交给上层提取，不把网页内容直接当作可信指令。
+ */
 @Component
 @GeneratedTool
 public class NetworkScraperTool {

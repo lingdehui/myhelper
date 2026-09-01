@@ -12,6 +12,9 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.stream.Collectors;
 
+/**
+ * Docker 使用指引工具：输出步骤说明，不承担实际安装或环境变更职责。
+ */
 @Component
 @GeneratedTool
 public class DockerGuideTool {

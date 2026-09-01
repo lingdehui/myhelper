@@ -28,6 +28,7 @@ import java.util.Map;
  * @param successCount        成功次数
  * @param failureCount        失败次数（仅计 PLAN 原因）
  * @param stability           稳定度 = success/(success+failure)
+ * @param qualityScore        经验质量分（0~1，综合可靠性、样本量、新鲜度和完整度）
  * @param failureCauses       失败原因引用列表（指向 FailureCause 的 causeId）
  * @param explorationRecords  探索模式操作记录
  * @param status              生命周期状态：ACTIVE / ARCHIVED
@@ -47,6 +48,7 @@ public record Unit(
         int successCount,
         int failureCount,
         double stability,
+        double qualityScore,
         List<String> failureCauses,
         List<ExplorationRecord> explorationRecords,
         UnitStatus status
@@ -69,6 +71,11 @@ public record Unit(
     /** Java 端实时计算稳定度（不依赖存储的 stability 字段） */
     public double computedStability() {
         return calcStability(successCount, failureCount);
+    }
+
+    /** 是否达到经验质量门槛，可作为跨轮次复用计划。 */
+    public boolean isReusable(double minQualityScore) {
+        return status == UnitStatus.ACTIVE && qualityScore >= minQualityScore;
     }
 
     /** 是否可脚本化执行（稳定度高时跳过 AI，直接遍历 script） */

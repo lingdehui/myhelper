@@ -6,6 +6,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * 面向网页元素的浏览器操作工具；调用方应提供明确页面与目标信息，避免隐式猜测。
+ */
 @Component
 @GeneratedTool
 public class BrowserWebpageOperationTool {

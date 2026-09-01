@@ -1,0 +1,147 @@
+请求 URL
+https://fanqienovel.com/api/author/publish_article/v0/?aid=2503&app_name=muye_novel&msToken=PHiFPlcndUgfhan7vjzu4j6KGdK5RbR2L2GThWP12Oy0BUfABymA-LoXc6IsQ0zaKAkAtxKXwxrcYIDtuuWZOsNqijbKMHcGPoPjnbtsYE50U0UkDrP4Xr0vlH6VqKmKdA3chzBxNpBYGZiJ0mNWh1UfmwKQHl-q1MlkbKQuj72tlw%3D%3D&a_bogus=Ov4nkFSwDxm5PpAbuCDleU1l5IjArsWyJBT2SKWSHxzCyheYS%2FpGOaIMnoiCo5Xf-SBWio57QiYoSVVbZ84hRCxkLmpkSFtjUG%2FnV6sL2qqXTMidEqDheh8FLwBeUYvNa5C1iID51s0rIfdRIrVNAQBGy5zo5bDgbqB5p2b9jDS83TyTIx%2FaecbWF76%3D
+请求方法
+POST
+状态代码
+200 OK
+远程地址
+[2409:8c04:1007:a00b:3::64]:443
+引用站点策略
+strict-origin-when-cross-origin
+content-length
+128
+content-type
+application/json; charset=utf-8
+date
+Tue, 18 Aug 2026 16:19:54 GMT
+eagleid
+6f3eb73117870699936764176e
+server
+Tengine
+server-timing
+inner; dur=728,tt_agw; dur=719
+server-timing
+cdn-cache;desc=MISS,edge;dur=16,origin;dur=797
+strict-transport-security
+max-age=63072000; includeSubDomains; preload
+timing-allow-origin
+*
+upstream-caught
+1787069993748833
+via
+cache74.l2nu20-17[797,0], ens-dynamic9.cn9208[813,0]
+x-agw-info
+4HSrqU0niXhNCwHgJqQu21snDhJqiOwqGOU2tdCwGY8cYqztpB-x7a7xUNr_C_kGo8CCeU_RS8CJIXISnTc1rZUaxYktnFZjyC3d6cUWtMs69qJMj6PxamH07FAVx03xIKjmrpCi7GcRSPruMk2yW1rlaxAJWfGNAyl85gZnN8QDLU9J-Do_uieEeMxp74uXC_dEkwEbsRnnDhY=
+x-ms-token
+ofEHTLrMAvuaO1T7KlRaMmOJd_hCltCh-qyLQYiKd0LZvyu-PJJxEubRcgaNDqFKcGa-JDr0uGJLdEJTc4Rfc9KjiHi3VgK_-NF_nmjtVcD2T-QNLr_zN2gm8fxjKUykRULXYLOe19aWw7bcP4G7Y8GShnC4HvQNdUqE0nybbYY29g==
+x-tt-agw-login
+1
+x-tt-logid
+20260819001953BF1BAE9F02273C0ABC0E
+x-tt-trace-host
+01d6375f33239df02e80e950909e9269f7e8751b70a3606f91ba87d041481e5a531644665efd2bb5f358678df0aebafd4481c309e4a9ddec057b92ff6590af687e7532159a1848c355cc48da554c8ffae2d419f231545dd0ba42cb96d81c874618c314c1da232d26647c6789eeb6cd8adb8b763a98a5ff4fb3944adcb2f7b4d653
+x-tt-trace-id
+00-260819001953BF1BAE9F02273C0ABC0E-0C92B314609B8512-00
+x-tt-trace-tag
+id=03;cdn-cache=miss;type=dyn
+:authority
+fanqienovel.com
+:method
+POST
+:path
+/api/author/publish_article/v0/?aid=2503&app_name=muye_novel&msToken=PHiFPlcndUgfhan7vjzu4j6KGdK5RbR2L2GThWP12Oy0BUfABymA-LoXc6IsQ0zaKAkAtxKXwxrcYIDtuuWZOsNqijbKMHcGPoPjnbtsYE50U0UkDrP4Xr0vlH6VqKmKdA3chzBxNpBYGZiJ0mNWh1UfmwKQHl-q1MlkbKQuj72tlw%3D%3D&a_bogus=Ov4nkFSwDxm5PpAbuCDleU1l5IjArsWyJBT2SKWSHxzCyheYS%2FpGOaIMnoiCo5Xf-SBWio57QiYoSVVbZ84hRCxkLmpkSFtjUG%2FnV6sL2qqXTMidEqDheh8FLwBeUYvNa5C1iID51s0rIfdRIrVNAQBGy5zo5bDgbqB5p2b9jDS83TyTIx%2FaecbWF76%3D
+:scheme
+https
+accept
+application/json, text/plain, */*
+accept-encoding
+gzip, deflate, br, zstd
+accept-language
+zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6
+content-length
+25502
+content-type
+application/x-www-form-urlencoded;charset=UTF-8
+cookie
+s_v_web_id=verify_mssh8um8_bZXjC5bu_ejYV_4HX8_BglM_xhkLYG1WR0qE; novel_web_id=7673747290499597865; serial_uuid=7673747290499597865; serial_webid=7673747290499597865; passport_csrf_token=9721f30b0e3fbd2b666be89314e4b8ad; passport_csrf_token_default=9721f30b0e3fbd2b666be89314e4b8ad; passport_mfa_token=Cjdtxg1m%2BYYVRVD%2FesqeVWZrgjAw%2F%2B2i7PXqTyJzeGRoqi3Dhj5t5hWH33kcfnrk9lnzajG%2FoJobGkoKPAAAAAAAAAAAAABQxyX0ev4JY7cyxPUyOX7LOW9Min6%2FPMxpdHYZGxpGbHLLeiBgKrB1B4HjqJR6QTcpthC8xJkOGPax0WwgAiIBA%2Fw8OuU%3D; d_ticket=97530f75e6dd05236679db205ebdf00bcc639; odin_tt=100a5a8706e206a2e09805e5b6fc9afcdb0606c54dd1dcc2a20ad760e2b61d6006b67758e53acda732e4cee0b703efdbd7a9b9500d7769170d822ad129b28578; n_mh=dpsAz1oXOLe6HmNEL10Y1RzoHWhVI9HT_FswDLgHvUY; passport_auth_status=8008f7cb6da7cb8bf95df7344ce92865%2C; passport_auth_status_ss=8008f7cb6da7cb8bf95df7344ce92865%2C; sid_guard=2d26d03c02161522d64d8e5f296f13f6%7C1786716635%7C5184000%7CTue%2C+13-Oct-2026+14%3A10%3A35+GMT; uid_tt=736b71cf1e65406d969b07fd80d2dafb; uid_tt_ss=736b71cf1e65406d969b07fd80d2dafb; sid_tt=2d26d03c02161522d64d8e5f296f13f6; sessionid=2d26d03c02161522d64d8e5f296f13f6; sessionid_ss=2d26d03c02161522d64d8e5f296f13f6; session_tlb_tag=sttt%7C16%7CLSbQPAIWFSLWTY5fKW8T9v_________IbW7H0sMu7diAiiQhAW5ADnPzRlTV_-WMB8vBlZdSRSc%3D; is_staff_user=false; has_biz_token=false; sid_ucp_v1=1.0.0-KDA2NjEwYThjOWQ0NDZhOTYwMmQwOGI0MTdhZGMxNTQ1YWYzMDU1MzEKHwie3qCl84y4BhDbw_zTBhjHEyAMMISfzYMGOAJA8QcaAmxmIiAyZDI2ZDAzYzAyMTYxNTIyZDY0ZDhlNWYyOTZmMTNmNg; ssid_ucp_v1=1.0.0-KDA2NjEwYThjOWQ0NDZhOTYwMmQwOGI0MTdhZGMxNTQ1YWYzMDU1MzEKHwie3qCl84y4BhDbw_zTBhjHEyAMMISfzYMGOAJA8QcaAmxmIiAyZDI2ZDAzYzAyMTYxNTIyZDY0ZDhlNWYyOTZmMTNmNg; gfkadpd=2503,36144; Hm_lvt_2667d29c8e792e6fa9182c20a3013175=1786683534,1787069845; Hm_lpvt_2667d29c8e792e6fa9182c20a3013175=1787069845; HMACCOUNT=A6602DEAB8B206FC; csrf_session_id=c41248e94d08ac6fff11cd05f31901df; ttwid=1%7CSbgZEI9_hw-QSU8UhXNwPU5jfliOAdkx3pEcOVGKSD4%7C1787069874%7C1cc306d85654ee19aea26a1edd0c72c40d85b087d8c926c7107adc8b92db10ba
+origin
+https://fanqienovel.com
+priority
+u=1, i
+referer
+https://fanqienovel.com/main/writer/7623322338934672409/publish/7675037185170489881/?enter_from=modifychapter
+sec-ch-ua
+"Not=A?Brand";v="99", "Microsoft Edge";v="151", "Chromium";v="151"
+sec-ch-ua-mobile
+?0
+sec-ch-ua-platform
+"Windows"
+sec-fetch-dest
+empty
+sec-fetch-mode
+cors
+sec-fetch-site
+same-origin
+user-agent
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36 Edg/151.0.0.0
+x-secsdk-csrf-token
+0001000000015d7fa4545510bdfb855e13a0a48812d5f9b7a32260296c7763ef7d4bf1b80a3e18ccf295186720a0
+
+
+
+aid
+2503
+app_name
+muye_novel
+msToken
+PHiFPlcndUgfhan7vjzu4j6KGdK5RbR2L2GThWP12Oy0BUfABymA-LoXc6IsQ0zaKAkAtxKXwxrcYIDtuuWZOsNqijbKMHcGPoPjnbtsYE50U0UkDrP4Xr0vlH6VqKmKdA3chzBxNpBYGZiJ0mNWh1UfmwKQHl-q1MlkbKQuj72tlw==
+a_bogus
+Ov4nkFSwDxm5PpAbuCDleU1l5IjArsWyJBT2SKWSHxzCyheYS/pGOaIMnoiCo5Xf-SBWio57QiYoSVVbZ84hRCxkLmpkSFtjUG/nV6sL2qqXTMidEqDheh8FLwBeUYvNa5C1iID51s0rIfdRIrVNAQBGy5zo5bDgbqB5p2b9jDS83TyTIx/aecbWF76=
+aid
+2503
+app_name
+muye_novel
+item_id
+7675037185170489881
+book_id
+7623322338934672409
+content
+<p>车子在西郊老殡仪馆后门停下时，陈野看清了仪表盘上的时间：九点过七分。</p><p>后门锈得只剩半扇，门口一盏灯没亮。荒草里停着三辆车，都熄了火。疤脸男人从一辆黑色轿车后座下来，还是那身黑夹克，脸上那道疤从眉骨裂到嘴角，在暗处发白。</p><p>陈野下车。戴帽子的司机锁了车，站在他身后两步，像堵墙。</p><p>“手机。”疤脸男人说。</p><p>陈野把手机举起来，亮给他看：屏幕黑着，没拨号。男人没接，只抬了抬下巴，示意往里走。</p><p>殡仪馆废弃已久，院子里长满蒿草，铁皮棚顶塌了一半。一间旧灵堂里点着两盏应急灯，白得刺眼。灯下摆着一张折叠桌，桌上摊着一沓纸，一支笔。</p><p>陈野一眼看见桌边站着的人：个子不高，袖口卷着，左手背上一道疤，横的。</p><p>是那个拧阀门的，也是往医院送药的。</p><p>“认得？”疤脸男人问。</p><p>陈野说：“燃气公司，左手背有疤。”</p><p>那人笑了笑，把袖子往下拉了拉。</p><p>疤脸男人在桌后坐下，把纸往陈野面前一推。</p><p>“你爸陈国安，二十年前借了堂口一条命。”男人说，“连本带利，现在该还了。签了字，你妈的命堂口保；不签，明早煤气就再漏一回。”</p><p>陈野没看纸。他看男人的头顶。</p><p>男人头顶悬着一串数字，红得发暗，他看不太清，只看见打头是个“三”。</p><p>“签字。”男人把笔推过来。</p><p>“我签了，我妈的命就是你们的。”陈野说。</p><p>“你妈现在这条命，本来就是抢回来的。”男人说，“抢命的人，要么还命，要么还债。陈国安的儿子，应该懂规矩。”</p><p>陈野盯着他：“那纸上写的是什么。”</p><p>“认债书。”男人说，“你爸欠的寿数，你替他还。”</p><p>陈野慢慢伸手，拿起那沓纸。纸很薄，像旧黄历，上面印着些他不认识的字，还有一行行空白，等着按手印。</p><p>他把纸举到应急灯下看了看，忽然问：“我按了，折多少年？”</p><p>男人眼里亮了一下：“痛快。你爸借了三十年，你这条命现在还剩——”</p><p>“我还剩多少，你们比谁都清楚。”陈野打断他，“可我不签。”</p><p>灵堂里静了一秒。</p><p>戴帽子的司机往前迈了半步。</p><p>陈野从兜里掏出那个微型摄像头，拍在桌上。</p><p>“我妈家煤气表后头，你们装的。”他说，“这是物证。”</p><p>他又掏出手机，按了一下。屏幕亮起来，录音的红点正跳着。</p><p>“从上车到现在，全录了。”他说，“实时传给我一个朋友。她现在就在派出所门口。”</p><p>疤脸男人看着他，脸上的疤抽了一下。</p><p>“报警？”他笑了一声，“你去报。你看警察管不管。”</p><p>陈野说：“我试试。”</p><p>他拿起桌上的摄像头，揣回兜里，转身往外走。司机横了一步，挡住门。</p><p>“让他走。”疤脸男人说，“让他去试。试完了，他还得回来签字。”</p><p>司机让开。</p><p>陈野走出灵堂。夜风里全是荒草和铁锈味。他没回头，一直走到后门外的大路上。手机震动了一下，是林默发来的位置。</p><p>她没在派出所门口。她在三条街外一辆租来的车里，车灯灭了，引擎没熄。</p><p>陈野拉开车门坐进副驾。</p><p>“录了多少？”林默问。</p><p>“从头到尾。”陈野把手机递给她，“走，去派出所。”</p><p>林默看他一眼：“你一个人进去的？”</p><p>“一个人。”</p><p>“刀呢？”</p><p>“没亮。”陈野说，“没到时候。”</p><p>车子拐出西郊，往城区开。后视镜里，那辆黑车没有跟来。</p><p>派出所的值班室亮着灯。接待他们的民警姓周，四十来岁，泡了杯茶，把笔帽拔开又合上，听他们说完，才抬头。</p><p>“你的意思是，有人松动你妈家煤气阀门，想制造意外？”周警官问。</p><p>“是。”陈野把摄像头推过去，“这个，他们装在我妈煤气表后头。还有这个，我家厨房阀门的照片，铜杆上有扳手划痕。医院那边的药材，我朋友查过进货单，非正规渠道。”</p><p>林默把一份打印好的单子放在桌上：“中药房近两个月进过一批滋补药材，没走医院招标，也没入库单。这批药和患者药渣里的异常成分，来源是同一家。”</p><p>周警官翻了翻，把单子合上。</p><p>“煤气阀门呢？”他问。</p><p>“我拧紧了。”陈野说。</p><p>“动过现场？”</p><p>“漏气，不拧会出事。”</p><p>周警官点点头，在纸上写了两笔，又抬头：“阀门松动，很多老房子都有，老化、热胀冷缩。你说有人故意，得拿证据。摄像头，你说是在煤气表后头找到的，那上面有没有指纹？”</p><p>陈野说：“不知道。”</p><p>“有没有人能证明，是谁装上去的？”</p><p>“没有。”</p><p>周警官喝了口茶：“医院药材的事，归药监管。进货渠道不正规，那是行政问题，不是我们刑警队能立的案子。”</p><p>林默说：“那绑架呢？今晚，他们强行把人带到西郊老殡仪馆，逼着签一份‘认债书’，威胁不签就再对老人下手。这总归是绑架、敲诈。”</p><p>周警官看着陈野：“是你自己上的车？”</p><p>陈野说：“是。”</p><p>“有人拿刀逼你？锁车门不让你下？”</p><p>“没有。”</p><p>“下车之后，他们打你了吗？”</p><p>“没有。”</p><p>周警官把笔放下。</p><p>“你自己愿意上车，人也没打你。说绑架，立案标准不够。”他说，“至于什么‘认债书’、借命、还债，这是民事纠纷，不是刑事案件。建议你们走法院。”</p><p>林默还想说什么，陈野按住了她。</p><p>“那煤气阀门、摄像头，你们查不查？”他问。</p><p>周警官把材料往抽屉里一放：“你留个电话。有情况再通知你。”</p><p>陈野说：“没别的了？”</p><p>“没了。”周警官撕下一张回执递过来，“回去把阀门换了，换个新的，注意用气安全。”</p><p>值班室的灯很白，白得陈野眼睛发酸。</p><p>他看见周警官头顶的数字。</p><p>二十二年零十一个月。</p><p>很普通，普通人还有半辈子。可陈野盯着那数字看了两秒，忽然觉得哪里不对——那数字在他眼里，比别人的淡。</p><p>像被水泡过，随时会化。</p><p>“打扰了。”陈野说。</p><p>他和林默走出派出所。夜已经深了，街上车少，路灯把两人的影子拉得很长。</p><p>林默站在台阶上，深吸一口气：“他们早就知道我们会来报警。”</p><p>陈野说：“周警官从头到尾没问过一句‘他们是谁’。”</p><p>“对。”林默说，“正常人听到‘逼签认债书’‘威胁杀人’，第一反应该是问对方是谁。他没问。”</p><p>陈野望向马路对面。</p><p>一辆黑车停在梧桐树影下，车头朝西，没亮灯。驾驶座车窗摇下一半，一只手搭在外面，手背上一道疤。</p><p>陈野说：“他们在等我们出来。”</p><p>林默顺着他的视线看过去，手慢慢伸进包里。</p><p>“别。”陈野说，“大街上，他们不会动手。他们是要我看清楚。”</p><p>他低头看自己的手。指节上的旧伤在路灯下发白。</p><p>“警察不管，我们自己查。”他说，“先从那个疤手的人查起。他是拧阀门的，也是送药的。他既然露面了，就肯定有痕迹。”</p><p>林默点头：“医院监控，我天亮去调。送药的进了中药房几趟，人脸总能对上。”</p><p>陈野说：“对上了，也别急着动。我要顺着这根线，把后面的人全拽出来。”</p><p>那辆黑车慢慢发动，驶入车流，向西边去了。</p><p>陈野站在原地，看那车尾灯一点点变小，直到看不见。</p><p>夜雾从街口漫过来，盖住了半条街。</p><p>他忽然想起父亲照片里那个憨憨的笑，还有那句话。</p><p>“你欠的，我替你还。”</p><p>他攥了攥拳头。</p><p>“不还了。”他低声说，“我要他们连本带利，吐出来。”</p>
+timer_status
+0
+need_pay
+0
+volume_name
+第一卷：默认
+volume_id
+7623322341304437785
+title
+第11章 报警
+timer_time
+publish_status
+1
+device_platform
+pc
+speak_type
+0
+use_ai
+2
+timer_chapter_preview
+[]
+has_chapter_ad
+false
+chapter_ad_types
+
+
+
+出参
+
+{
+    "code": 0,
+    "data": {
+        "item_id": "7675037185170489881",
+        "tips": ""
+    },
+    "log_id": "20260819001953BF1BAE9F02273C0ABC0E",
+    "message": "success"
+}

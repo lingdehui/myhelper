@@ -11,6 +11,7 @@ import com.example.myhelper.memory.unit.ExplorationRecord;
 import com.example.myhelper.memory.unit.FailureCause;
 import com.example.myhelper.memory.unit.UnitStore;
 import com.example.myhelper.memory.unit.UnitFailureService;
+import com.example.myhelper.memory.unit.ExperienceQualityService;
 import com.example.myhelper.memory.vector.category.ToolCategoryService;
 import com.example.myhelper.memory.vector.episode.ToolCallLog;
 import com.example.myhelper.registry.ToolModel;
@@ -67,6 +68,7 @@ public class ToolPlanner {
     private final ModelRouter modelRouter;
     private final UnitStore unitStore;
     private final UnitFailureService unitFailureService;
+    private final ExperienceQualityService experienceQualityService;
     private final ToolCategoryService categoryService;
     private final ToolRegistry toolRegistry;
     private final RuleInductionService ruleInductionService;
@@ -104,6 +106,7 @@ public class ToolPlanner {
     public ToolPlanner(ModelRouter modelRouter,
                         UnitStore unitStore,
                         UnitFailureService unitFailureService,
+                        ExperienceQualityService experienceQualityService,
                         ToolCategoryService categoryService,
                         ToolRegistry toolRegistry,
                         RuleInductionService ruleInductionService,
@@ -113,6 +116,7 @@ public class ToolPlanner {
         this.modelRouter = modelRouter;
         this.unitStore = unitStore;
         this.unitFailureService = unitFailureService;
+        this.experienceQualityService = experienceQualityService;
         this.categoryService = categoryService;
         this.toolRegistry = toolRegistry;
         this.ruleInductionService = ruleInductionService;
@@ -189,6 +193,22 @@ public class ToolPlanner {
 
         // ===== Layer 1: 内存缓存（精确匹配，最快）=====
         CacheEntry entry = cache.get(key);
+        if (entry != null && entry.unitId != null) {
+            Optional<Unit> latestUnit = unitStore.findById(entry.unitId);
+            if (latestUnit.isPresent()) {
+                entry.unit = latestUnit.get();
+            } else {
+                cache.remove(key);
+                entry = null;
+            }
+        }
+        if (entry != null && entry.unit != null && !experienceQualityService.isReusable(entry.unit)) {
+            cache.remove(key);
+            log.info("📉 内存缓存关联经验质量不足（{} < {}），降级为重新检索/规划",
+                    String.format("%.2f", entry.unit.qualityScore()),
+                    String.format("%.2f", experienceQualityService.minReuseScore()));
+            entry = null;
+        }
         if (entry != null) {
             log.info("💾 命中内存缓存（失败计数: {}/{}{}）", entry.failureCount, props.toolPlanner().failureThreshold(),
                     (entry.unitId != null ? ", unit=" + entry.unitId.substring(0, 8) + "..." : ""));
@@ -200,8 +220,9 @@ public class ToolPlanner {
 
         // ===== Layer 2: Unit 语义检索（unit-registry）+ 失败模式并行检索 =====
         List<FailureCause> warnings = unitFailureService.searchFailureCauses(retrievalKey, 3);
-        Optional<Unit> matchedUnit = unitStore.findSimilar(retrievalKey, 1).stream()
-                .filter(u -> u.unitKind() == UnitKind.PLAN_STEP)
+        // 多取几条再按质量筛选，避免“最相似但低质量”的经验遮蔽可用候选。
+        Optional<Unit> matchedUnit = unitStore.findSimilar(retrievalKey, 5).stream()
+                .filter(u -> u.unitKind() == UnitKind.PLAN_STEP && experienceQualityService.isReusable(u))
                 .findFirst();
 
         if (!warnings.isEmpty()) {
@@ -215,7 +236,8 @@ public class ToolPlanner {
             List<String> toolNames = unit.script().stream().map(ToolCallLog::toolName).toList();
             // 回填内存缓存（带 Unit 引用，含 script/notes），下次相同输入直接内存命中
             cache.put(key, new CacheEntry(toolNames, List.of(), unit.unitId(), unit));
-            log.info("💾 命中 Unit 缓存（稳定度: {}, unit={}...）", String.format("%.2f", unit.computedStability()),
+            log.info("💾 命中 Unit 缓存（稳定度: {}, 质量: {}, unit={}...）",
+                    String.format("%.2f", unit.computedStability()), String.format("%.2f", unit.qualityScore()),
                     unit.unitId().substring(0, 8));
             return new PlanResult(toolNames, List.of(), true, unit.unitId(), unit, warnings, false);
         }
@@ -503,7 +525,9 @@ public class ToolPlanner {
             boolean allValid = true;                         // 是否全部有效（无任何拒绝/缺失）
             List<String> validatedNames = new ArrayList<>(); // 只收集通过验证的分类名
             for (String name : selectedL1Names) {            // 遍历 AI 选中的分类名
-                var l1Opt = categoryService.findByName(name); // 按名查找（含模糊包含匹配）
+                // 本轮已读取过完整分类树。后续查找复用这一快照，避免每个名称再次访问 Neo4j；
+                // 分类变化只会在下一轮请求生效，原有分类与回退逻辑保持不变。
+                var l1Opt = findCategory(name, allCategories); // 按名查找（含模糊包含匹配）
                 if (l1Opt.isPresent()) {                     // 分类名存在
                     String id = l1Opt.get().id();            // Qdrant point UUID
                     if (visitedIds.contains(id)) {            // 路径记忆：已展开过 → 拒绝（§4.2）
@@ -524,7 +548,7 @@ public class ToolPlanner {
                             List<String> retryNames = parseCategoryNames(retryResponse); // 解析重选结果
                             roundCount++;                    // 重试消耗 1 轮
                             for (String rn : retryNames) {   // 验证重选结果
-                                var ro = categoryService.findByName(rn);
+                                var ro = findCategory(rn, allCategories);
                                 if (ro.isPresent() && !visitedIds.contains(ro.get().id())) {
                                     visitedIds.add(ro.get().id());
                                     validatedNames.add(rn);  // 重选有效 → 加入
@@ -578,12 +602,12 @@ public class ToolPlanner {
         log.info("===== 阶段2: L2子类展开 ===== selectedL1={}, roundCount={}/{}",
                 selectedL1Names, roundCount, maxRounds);
         for (String name : selectedL1Names) {                 // 遍历阶段1 选中的每个 L1
-            var l1Opt = categoryService.findByName(name);     // 按名查找 L1
+            var l1Opt = findCategory(name, allCategories);     // 按名查找 L1
             if (l1Opt.isEmpty()) continue;                    // 防御：找不到则跳过
             var l1 = l1Opt.get();
 
             // 获取该 L1 的直接子节点（L2），并排除已访问的
-            List<ToolCategoryService.CategorySummary> l2Children = categoryService.getChildren(l1.id());
+            List<ToolCategoryService.CategorySummary> l2Children = findChildren(allCategories, l1.id());
             l2Children = l2Children.stream()
                     .filter(c -> !visitedIds.contains(c.id())) // 路径记忆过滤
                     .toList();
@@ -887,11 +911,27 @@ public class ToolPlanner {
     /** 按名称查找分类（模糊匹配） */
     private Optional<ToolCategoryService.CategorySummary> findCategory(String name,
             List<ToolCategoryService.CategorySummary> candidates) {
+        if (name == null || name.isBlank()) return Optional.empty();
         String key = name.toLowerCase().trim();
         return candidates.stream()
                 .filter(c -> c.name().toLowerCase().trim().equals(key)
                         || c.name().contains(name) || name.contains(c.name()))
                 .findFirst();
+    }
+
+    /**
+     * 在本轮规划已读取的分类快照中查找直属子类。
+     *
+     * <p>分类树在 {@link #doPlan(String, ToolCallback[], String, List)} 开头一次性读取。
+     * 这里不再调用分类服务，避免 L1/L2 导航期间产生重复的 Neo4j 查询，同时保证同一轮
+     * 规划看到的是一致的分类视图。</p>
+     */
+    private List<ToolCategoryService.CategorySummary> findChildren(
+            List<ToolCategoryService.CategorySummary> categories, String parentId) {
+        if (categories == null || categories.isEmpty() || parentId == null) return List.of();
+        return categories.stream()
+                .filter(category -> parentId.equals(category.parentId()))
+                .toList();
     }
 
     /** 安全调用 AI，异常时返回空字符串 */

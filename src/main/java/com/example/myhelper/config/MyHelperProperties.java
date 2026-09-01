@@ -100,6 +100,7 @@ public record MyHelperProperties(
 
     /** 自主探索引擎参数（模型 2: DeepSeek 云端备用） */
     public record Exploration(
+            Boolean enabled,
             String explorationModel,
             int idleThresholdMinutes,
             int maxDurationMinutes,

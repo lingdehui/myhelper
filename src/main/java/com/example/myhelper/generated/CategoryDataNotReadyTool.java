@@ -4,6 +4,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * 当工具分类数据尚未就绪时提供明确反馈，防止规划器把“暂无数据”误判为真实能力。
+ */
 @Component
 public class CategoryDataNotReadyTool {
 

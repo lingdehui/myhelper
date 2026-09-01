@@ -29,7 +29,8 @@ public class IdleDetectionService {
      */
     public boolean shouldExplore() {
         MyHelperProperties.Exploration exp = props.exploration();
-        if (!props.autonomous().enabled()) return false;
+        // exploration.enabled 是旧文档/单功能配置的兼容开关；autonomous.enabled 是当前总开关。
+        if (!props.autonomous().enabled() && !Boolean.TRUE.equals(exp.enabled())) return false;
 
         // 1. 空闲时间检查
         long idleMs = System.currentTimeMillis() - dialogStateMachine.getLastInteractionTime();

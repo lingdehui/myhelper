@@ -12,6 +12,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 
+/**
+ * 软件包下载工具，负责网络传输与结果反馈，不负责静默信任未知来源的软件。
+ */
 @Component
 @GeneratedTool
 public class SoftwareDownloader {

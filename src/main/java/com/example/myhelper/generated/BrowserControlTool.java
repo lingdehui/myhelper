@@ -6,6 +6,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * 浏览器会话控制工具，封装导航与页面操作，并通过工具描述暴露给规划器。
+ */
 @Component
 @GeneratedTool
 public class BrowserControlTool {

@@ -4,6 +4,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * 面向常见环境故障的修复入口。每个修复动作均应返回可理解的结果，不能将异常直接泄露给调用方。
+ */
 @Component
 public class AutoFaultRepairTool {
 

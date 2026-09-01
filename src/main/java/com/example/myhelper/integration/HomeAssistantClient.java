@@ -105,12 +105,18 @@ public class HomeAssistantClient {
      */
     public List<Map<String, Object>> searchEntities(String keyword) {
         try {
+            if (keyword == null || keyword.isBlank()) return Collections.emptyList();
             List<Map<String, Object>> all = getAllStates();
             List<Map<String, Object>> result = new ArrayList<>();
-            String lowerKeyword = keyword.toLowerCase();
+            String lowerKeyword = keyword.toLowerCase(Locale.ROOT);
             for (Map<String, Object> state : all) {
                 String entityId = (String) state.get(ENTITY_ID);
-                if (entityId != null && entityId.toLowerCase().contains(lowerKeyword)) {
+                String attributes = objectMapper.writeValueAsString(state.getOrDefault("attributes", Map.of()));
+                String searchable = String.join(" ",
+                        entityId == null ? "" : entityId,
+                        String.valueOf(state.getOrDefault("state", "")),
+                        attributes);
+                if (searchable.toLowerCase(Locale.ROOT).contains(lowerKeyword)) {
                     result.add(state);
                 }
             }
@@ -134,10 +140,11 @@ public class HomeAssistantClient {
                                Map<String, Object> params) {
         try {
             Map<String, Object> payload = new HashMap<>();
-            payload.put(ENTITY_ID, entityId);
             if (params != null) {
                 payload.putAll(params);
             }
+            // 调用方参数不得篡改工具已明确指定的目标实体。
+            payload.put(ENTITY_ID, entityId);
 
             webClient.post()
                     .uri(SERVICES + "/" + domain + "/" + service)
@@ -226,5 +233,10 @@ public class HomeAssistantClient {
         } catch (Exception e) {
             return Collections.emptyMap();
         }
+    }
+
+    /** 供同包的设备发现服务发起 HA 配置流时使用，避免反射访问私有字段。 */
+    String getAccessToken() {
+        return accessToken;
     }
 }

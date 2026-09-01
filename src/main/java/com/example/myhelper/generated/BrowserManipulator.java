@@ -6,9 +6,24 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Locale;
+
+/**
+ * 基于桌面自动化的浏览器操作工具。适用于没有专用浏览器连接器时的受控兜底操作。
+ */
 @Component
 @GeneratedTool
 public class BrowserManipulator {
+
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
     @Tool(description = "打开给定的URL并在默认浏览器中显示。")
     public String browseWebsite(@ToolParam(description = "要浏览的网页Url。") String url) {
@@ -27,25 +42,18 @@ public class BrowserManipulator {
         }
     }
 
-    @Tool(description = "模拟鼠标点击，向给定的URL发送GET请求。此方法不会在浏览器中显示结果。")
+    @Tool(description = "向给定 URL 发送实际 HTTP GET 请求并返回状态码；此方法不会在浏览器中显示页面。")
     public String requestWebsite(@ToolParam(description = "要访问的网页Url。") String url) {
         try {
-            ProcessBuilder processBuilder;
-            if (System.getProperty("os.name").toLowerCase().contains("windows")) {
-                processBuilder = new ProcessBuilder("cmd", "/c", "curl.exe", "-o", "NUL", url); // Windows 系统可能使用 curl 工具
-            } else if (System.getProperty("os.name").toLowerCase().contains("mac") || System.getProperty("os.name").toLowerCase().contains("linux")) {
-                processBuilder = new ProcessBuilder("bash", "-c", String.format("curl -o /dev/null %s", url));
-            } else {
-                return "未知操作系统；请求可能未执行。";
-            }
-            Process process = processBuilder.start();
-            if (process.waitFor() == 0) {
-                return "成功向 URL 发送 GET 请求：" + url;
-            } else {
-                return "发送请求时遇到问题：非零返回状态码";
-            }
+            URI uri = URI.create(url);
+            String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
+            if (!"http".equals(scheme) && !"https".equals(scheme)) return "只支持 http 或 https URL。";
+            HttpResponse<Void> response = httpClient.send(HttpRequest.newBuilder(uri)
+                            .timeout(Duration.ofSeconds(20)).GET().build(),
+                    HttpResponse.BodyHandlers.discarding());
+            return "HTTP GET 已完成：" + uri + "，状态码 " + response.statusCode();
         } catch (Exception e) {
-            return "模拟点击并获取网页内容时出现问题：" + e.getMessage();
+            return "HTTP GET 请求失败：" + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
         }
     }
 

@@ -4,6 +4,7 @@ import com.example.myhelper.config.MyHelperProperties;
 import com.example.myhelper.memory.graph.UnitNode;
 import com.example.myhelper.memory.graph.UnitRepository;
 import com.example.myhelper.memory.unit.UnitStore;
+import com.example.myhelper.memory.unit.ExperienceQualityService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -22,7 +23,7 @@ import java.util.stream.Collectors;
  * <ol>
  *   <li>计算 Unit 占用率（Neo4j 节点数 / 上限），≥threshold 触发清理</li>
  *   <li>加载所有 Unit，跳过保护期内 + 白名单条目</li>
- *   <li>逐条计算 valueScore = w1×recency + w2×usage + w3×userProduced + w4×dependency</li>
+ *   <li>逐条计算价值分，并将经验质量分纳入保留优先级</li>
  *   <li>按分数升序取前 N 个删除候选</li>
  *   <li>通过 {@link UnitStore#delete(String)} 删除 Neo4j 节点 + Qdrant 索引</li>
  * </ol>
@@ -36,6 +37,7 @@ public class MemoryMaintenanceService {
 
     private final UnitStore unitStore;
     private final UnitRepository unitRepository;
+    private final ExperienceQualityService experienceQualityService;
     private final MyHelperProperties props;
 
     /** Unit 数量上限（估算上限，超出视为 100% 占用） */
@@ -49,9 +51,11 @@ public class MemoryMaintenanceService {
 
     public MemoryMaintenanceService(UnitStore unitStore,
                                      UnitRepository unitRepository,
+                                     ExperienceQualityService experienceQualityService,
                                      MyHelperProperties props) {
         this.unitStore = unitStore;
         this.unitRepository = unitRepository;
+        this.experienceQualityService = experienceQualityService;
         this.props = props;
     }
 
@@ -166,7 +170,7 @@ public class MemoryMaintenanceService {
     /**
      * 计算 Unit 的综合价值评分。
      * <pre>
-     * valueScore = w1 × recencyScore + w2 × usageScore + w3 × userProducedScore + w4 × dependencyScore
+     * valueScore = 0.7 × lifecycleValue + 0.3 × experienceQuality
      * </pre>
      */
     double computeValueScore(UnitNode node, int ageDays, int retentionDays) {
@@ -189,8 +193,10 @@ public class MemoryMaintenanceService {
             dependency = Math.min((parents != null ? parents.size() : 0) / 5.0, 1.0);
         }
 
-        return w.recency() * recency + w.usage() * usage
+        double lifecycleValue = w.recency() * recency + w.usage() * usage
                 + w.userProduced() * userProduced + w.dependency() * dependency;
+        double quality = experienceQualityService.assess(node).score();
+        return 0.7 * lifecycleValue + 0.3 * quality;
     }
 
     /** 根据 Unit 来源解析类型 */

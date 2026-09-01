@@ -1,5 +1,6 @@
 package com.example.myhelper.exploration;
 
+import jakarta.annotation.PreDestroy;
 import com.example.myhelper.common.PromptLoader;
 import com.example.myhelper.config.MyHelperProperties;
 import com.example.myhelper.config.SystemEnvironmentService;
@@ -20,8 +21,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 自主探索服务：空闲时收集上下文 → LLM 决策 → 提交后台执行。
@@ -44,12 +47,20 @@ public class AutonomousExplorationService {
     private volatile ToolCallback[] tools;  // volatile: 启动后由 MyHelperApplication 设置完整列表
     private final SystemEnvironmentService envService;
 
-    /** 探索串行锁：同一时间只有一个探索会话在执行（避免多会话抢屏幕/浏览器） */
-    private final AtomicBoolean exploring = new AtomicBoolean(false);
+    /**
+     * 会话状态和执行器双重保证串行：锁避免提交竞态，单线程执行器避免抢占屏幕/浏览器。
+     * 超时只请求中断，不会在旧会话退出前放行新的会话。
+     */
+    private final ReentrantLock exploreLock = new ReentrantLock();
+    private final ExecutorService explorationExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "myhelper-exploration");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private volatile boolean sessionActive;
+    private volatile boolean timeoutCancellationRequested;
+    private volatile Future<?> activeSession;
     private volatile long exploreStartTime = 0;
-
-    /** 单次探索会话最大时长（超过则强制重置锁，防止会话卡死导致新探索永远被跳过） */
-    private static final long EXPLORE_TIMEOUT_MS = 10 * 60_000L;
 
     /** 动态基础能力映射：工具名+描述 → 能力分组（setAllTools 时自动构建，随工具变化而更新） */
     private record CapabilityDef(String name, List<String> toolNames, String taskHint) {}
@@ -103,7 +114,7 @@ public class AutonomousExplorationService {
     }
 
     /**
-     * 定时巡检：每 1 分钟触发 3 个并发探索会话（包月模式，全速运行）。
+     * 定时巡检：每 1 分钟尝试触发一次探索会话；运行中的会话不会并发。
      * 与手动触发（ExplorationTool）共享同一入口。
      */
     @Scheduled(fixedDelayString = "${myhelper.exploration.check-interval-ms:60000}",
@@ -129,20 +140,30 @@ public class AutonomousExplorationService {
     }
 
     private void doExplore() {
-        CompletableFuture.runAsync(() -> {
-            long now = System.currentTimeMillis();
-            // 超时保护：上一个会话超时未结束 → 强制重置，允许新会话进入
-            if (exploring.get() && now - exploreStartTime > EXPLORE_TIMEOUT_MS) {
-                log.warn("⏰ 上一个探索会话超过 {}s 未结束，强制重置", EXPLORE_TIMEOUT_MS / 1000);
-                exploring.set(false);
-            }
-            // 串行锁：如果上一个探索会话还在跑，直接跳过
-            if (!exploring.compareAndSet(false, true)) {
+        requestTimedOutSessionCancellation();
+        if (sessionActive || !exploreLock.tryLock()) {
+            log.info("⏭️ 上一个探索会话仍在运行（屏幕/浏览器被占用），跳过本次");
+            return;
+        }
+        try {
+            // tryLock 到这里前会话可能已经开始或结束，需再次确认。
+            if (sessionActive) {
                 log.info("⏭️ 上一个探索会话仍在运行（屏幕/浏览器被占用），跳过本次");
                 return;
             }
-            exploreStartTime = now;
-            try {
+            sessionActive = true;
+            timeoutCancellationRequested = false;
+            exploreStartTime = System.currentTimeMillis();
+            activeSession = explorationExecutor.submit(this::runExploreSession);
+        } finally {
+            exploreLock.unlock();
+        }
+    }
+
+    /** 真正的会话体始终由单线程执行器运行，绝不与另一探索会话并行。 */
+    private void runExploreSession() {
+        exploreLock.lock();
+        try {
                 log.info("🔍 开始自主探索会话...");
 
                 // 0. 拉取已有数据（供兜底判断用）
@@ -218,12 +239,36 @@ public class AutonomousExplorationService {
                         + "\n成功标准：" + decision.successCriteria();
                 turnProcessor.processExploration(modelRouter, tools, learningInput);
 
-            } catch (Exception e) {
-                log.error("❌ 自主探索决策失败", e);
-            } finally {
-                exploring.set(false);
-            }
-        });
+        } catch (Exception e) {
+            log.error("❌ 自主探索决策失败", e);
+        } finally {
+            sessionActive = false;
+            timeoutCancellationRequested = false;
+            activeSession = null;
+            exploreStartTime = 0;
+            exploreLock.unlock();
+        }
+    }
+
+    /** 使用配置时长请求取消；即使底层操作不响应中断，也保持会话占用以避免并发操作。 */
+    private void requestTimedOutSessionCancellation() {
+        if (!sessionActive || timeoutCancellationRequested) return;
+        long maxDurationMs = Math.max(1, props.exploration().maxDurationMinutes()) * 60_000L;
+        long elapsed = System.currentTimeMillis() - exploreStartTime;
+        if (elapsed <= maxDurationMs) return;
+
+        timeoutCancellationRequested = true;
+        Future<?> session = activeSession;
+        if (session != null) session.cancel(true);
+        log.warn("⏰ 探索会话已运行 {} 秒（上限 {} 秒），已请求取消；将在当前会话退出后再允许下一次探索。",
+                elapsed / 1_000, maxDurationMs / 1_000);
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        Future<?> session = activeSession;
+        if (session != null) session.cancel(true);
+        explorationExecutor.shutdownNow();
     }
 
     /** 估算文本 token 数（粗略：字符数 / 3，用于上下文止血守卫） */

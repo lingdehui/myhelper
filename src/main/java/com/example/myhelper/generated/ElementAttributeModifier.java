@@ -1,30 +1,15 @@
 package com.example.myhelper.generated;
 
-import com.example.myhelper.generated.GeneratedTool;
-
-import org.springframework.ai.tool.annotation.Tool;
-import org.springframework.ai.tool.annotation.ToolParam;
-import org.springframework.stereotype.Component;
-
-@Component
-@GeneratedTool
+/**
+ * 已退役的生成工具占位类型。
+ *
+ * <p>原接口没有目标系统或持久化位置，无法实现真实“元素属性修改”。因此不再注册为
+ * Spring AI 工具，也不会向模型报告虚假的成功结果。应使用具有明确目标的文件、设备或应用工具。</p>
+ */
+@Deprecated(forRemoval = true)
 public class ElementAttributeModifier {
 
-    @Tool(description = "Update the attribute of an element")
-    public String updateElementAttribute(@ToolParam(description = "The ID or key of the element") String elementId,
-                                         @ToolParam(description = "Name of the attribute to be updated") String attributeName,
-                                         @ToolParam(description = "New value for the attribute") String newValue) {
-        try {
-            // Placeholder for actual implementation, in a real case scenario there would
-            // be logic here to update an attribute in a database or file system etc.
-            
-            // Simulating updating and returning success message
-            return "Attribute '" + attributeName + "' of element with ID '" + elementId 
-                   + "' has been successfully updated to: " + newValue;
-        } catch (Exception e) {
-            // Catching exception to provide a user-friendly message instead of throwing exceptions
-            return "Failed to update attribute for the given element. Error: " + e.getMessage();
-        }
+    public String updateElementAttribute(String elementId, String attributeName, String newValue) {
+        return "该占位工具已退役：未指定可修改的目标系统。请改用具体的文件、设备或应用控制工具。";
     }
-
 }

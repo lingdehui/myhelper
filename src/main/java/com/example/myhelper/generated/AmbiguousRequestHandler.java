@@ -6,6 +6,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * 兜底澄清工具：当输入缺少足够上下文时，返回可执行的补充信息提示而不猜测用户意图。
+ */
 @Component
 @GeneratedTool
 public class AmbiguousRequestHandler {

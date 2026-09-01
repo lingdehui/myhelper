@@ -50,6 +50,12 @@ public class UnitNode {
     private int failureCount;
     private double stability;
 
+    /**
+     * 经验质量分（0~1）：综合可靠性、样本量、新鲜度与经验完整度。
+     * 用于决定 PLAN_STEP 是否可复用，并参与记忆清理排序。
+     */
+    private double qualityScore;
+
     /** List&lt;String&gt; JSON（FailureCause causeId 列表） */
     private String failureCausesJson;
 
@@ -131,6 +137,9 @@ public class UnitNode {
 
     public double getStability() { return stability; }
     public void setStability(double stability) { this.stability = stability; }
+
+    public double getQualityScore() { return qualityScore; }
+    public void setQualityScore(double qualityScore) { this.qualityScore = qualityScore; }
 
     public String getFailureCausesJson() { return failureCausesJson; }
     public void setFailureCausesJson(String failureCausesJson) { this.failureCausesJson = failureCausesJson; }

@@ -1,5 +1,7 @@
 package com.example.myhelper.integration;
 
+import com.example.myhelper.config.SystemEnvironmentService;
+import com.example.myhelper.memory.vector.EmbeddingService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -41,32 +43,39 @@ public class DeviceDiscoveryService {
 
     private final WebClient qdrant;
     private final HomeAssistantClient haClient;
+    private final EmbeddingService embeddingService;
     private final String haUrl;
+    private final String collectionName;
+    private final int vectorSize;
     private final ObjectMapper mapper = new ObjectMapper();
     private final ExecutorService pool = Executors.newFixedThreadPool(50);
 
     private final List<Map<String, Object>> devices = new CopyOnWriteArrayList<>();
     private volatile boolean scanning;
 
-    private static final String COLLECTION = "discovered-devices";
-    private static final int VECTOR_SIZE = 1024;
     private String subnet; // 启动时自动探测，如 "192.168.31"
 
     public DeviceDiscoveryService(@Qualifier("qdrantWebClient") WebClient qdrant,
                                    HomeAssistantClient haClient,
-                                   @org.springframework.beans.factory.annotation.Value("${homeassistant.url:http://localhost:8123}") String haUrl) {
+                                   EmbeddingService embeddingService,
+                                   SystemEnvironmentService environmentService,
+                                   @org.springframework.beans.factory.annotation.Value("${homeassistant.url:http://localhost:8123}") String haUrl,
+                                   @org.springframework.beans.factory.annotation.Value("${qdrant.vector-size:768}") int vectorSize) {
         this.qdrant = qdrant;
         this.haClient = haClient;
+        this.embeddingService = embeddingService;
         this.haUrl = haUrl;
+        this.collectionName = environmentService.collectionName("discovered-devices");
+        this.vectorSize = vectorSize;
         initQdrantCollection();
     }
 
     private void initQdrantCollection() {
         try {
             qdrant.put()
-                    .uri("/collections/" + COLLECTION)
+                    .uri("/collections/" + collectionName)
                     .header("Content-Type", "application/json")
-                    .bodyValue("{\"vectors\":{\"size\":" + VECTOR_SIZE + ",\"distance\":\"Cosine\"}}")
+                    .bodyValue("{\"vectors\":{\"size\":" + vectorSize + ",\"distance\":\"Cosine\"}}")
                     .retrieve().toBodilessEntity().block();
         } catch (Exception ignored) {}
     }
@@ -117,6 +126,9 @@ public class DeviceDiscoveryService {
         // 4. 对比 HA 已注册
         markRegistered();
 
+        // 每次扫描都写入带真实语义向量的历史记录，供后续检索和去重使用。
+        saveToQdrant();
+
         log.info("🔍 扫描完成: {} 个设备 ({}ms)", devices.size(), System.currentTimeMillis() - t0);
         scanning = false;
         return devices;
@@ -125,6 +137,35 @@ public class DeviceDiscoveryService {
     /** AI 工具调用：获取已发现设备 */
     public List<Map<String, Object>> getDevices() {
         return new ArrayList<>(devices);
+    }
+
+    /** 从环境隔离的 Qdrant 设备库中按语义检索。 */
+    @SuppressWarnings("unchecked")
+    public List<Map<String, Object>> searchSimilarDevices(String query, int limit) {
+        if (query == null || query.isBlank()) return List.of();
+        try {
+            List<Float> vector = embeddingService.embed(query);
+            Map<String, Object> request = new LinkedHashMap<>();
+            request.put("vector", vector);
+            request.put("limit", Math.max(1, Math.min(limit, 50)));
+            request.put("with_payload", true);
+            String response = qdrant.post()
+                    .uri("/collections/" + collectionName + "/points/search")
+                    .header("Content-Type", "application/json")
+                    .bodyValue(mapper.writeValueAsString(request))
+                    .retrieve().bodyToMono(String.class).block();
+            if (response == null) return List.of();
+
+            List<Map<String, Object>> result = new ArrayList<>();
+            for (JsonNode point : mapper.readTree(response).path("result")) {
+                Map<String, Object> payload = mapper.convertValue(point.path("payload"), Map.class);
+                if (payload != null && !payload.isEmpty()) result.add(payload);
+            }
+            return result;
+        } catch (Exception e) {
+            log.warn("设备语义搜索失败: {}", e.getMessage());
+            return List.of();
+        }
     }
 
     /** AI 工具调用：注册到 HA */
@@ -274,16 +315,31 @@ public class DeviceDiscoveryService {
 
     private void saveToQdrant() {
         try {
+            List<Map<String, Object>> points = new ArrayList<>();
+            for (Map<String, Object> device : devices) {
+                try {
+                    List<Float> vector = embeddingService.embed(buildDeviceText(device));
+                    if (vector == null || vector.isEmpty()) {
+                        log.warn("跳过未生成向量的设备: {}", device.get("ip"));
+                        continue;
+                    }
+                    Map<String, Object> point = new LinkedHashMap<>();
+                    String idSeed = String.join("|", String.valueOf(device.get("ip")),
+                            String.valueOf(device.get("type")), String.valueOf(device.get("port")));
+                    point.put("id", UUID.nameUUIDFromBytes(idSeed.getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString());
+                    point.put("vector", vector);
+                    point.put("payload", device);
+                    points.add(point);
+                } catch (Exception e) {
+                    // 不得用零向量污染语义库；单个设备失败不影响其它设备持久化。
+                    log.warn("设备 {} 向量化失败，已跳过: {}", device.get("ip"), e.getMessage());
+                }
+            }
+            if (points.isEmpty()) return;
             var payload = new LinkedHashMap<String, Object>();
-            payload.put("points", devices.stream().map(d -> {
-                var p = new LinkedHashMap<String, Object>();
-                p.put("id", UUID.nameUUIDFromBytes(d.get("ip").toString().getBytes()).toString());
-                p.put("vector", dummyVector());
-                p.put("payload", d);
-                return p;
-            }).toList());
+            payload.put("points", points);
             qdrant.put()
-                    .uri("/collections/" + COLLECTION + "/points?wait=true")
+                    .uri("/collections/" + collectionName + "/points?wait=true")
                     .header("Content-Type", "application/json")
                     .bodyValue(mapper.writeValueAsString(payload))
                     .retrieve().toBodilessEntity().block();
@@ -294,7 +350,7 @@ public class DeviceDiscoveryService {
     private void loadFromQdrant() {
         try {
             String resp = qdrant.post()
-                    .uri("/collections/" + COLLECTION + "/points/scroll")
+                    .uri("/collections/" + collectionName + "/points/scroll")
                     .header("Content-Type", "application/json")
                     .bodyValue("{\"limit\":100,\"with_payload\":true}")
                     .retrieve().bodyToMono(String.class).block();
@@ -346,17 +402,16 @@ public class DeviceDiscoveryService {
     }
 
     private String getToken() {
-        try {
-            var f = haClient.getClass().getDeclaredField("accessToken");
-            f.setAccessible(true);
-            return (String) f.get(haClient);
-        } catch (Exception e) { return ""; }
+        return haClient.getAccessToken();
     }
 
-    private List<Float> dummyVector() {
-        List<Float> v = new ArrayList<>(VECTOR_SIZE);
-        for (int i = 0; i < VECTOR_SIZE; i++) v.add(0f);
-        return v;
+    private String buildDeviceText(Map<String, Object> device) {
+        return String.join(" ",
+                "设备", String.valueOf(device.getOrDefault("name", "")),
+                "类型", String.valueOf(device.getOrDefault("type", "")),
+                "型号", String.valueOf(device.getOrDefault("model", "")),
+                "主机", String.valueOf(device.getOrDefault("hostname", "")),
+                "地址", String.valueOf(device.getOrDefault("ip", "")));
     }
 
     // ========== 杂项 ==========

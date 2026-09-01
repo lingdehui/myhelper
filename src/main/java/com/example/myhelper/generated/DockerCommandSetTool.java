@@ -6,6 +6,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * Docker 常用命令的受控封装；负责把容器操作意图映射为可反馈的执行结果。
+ */
 @Component
 @GeneratedTool
 public class DockerCommandSetTool {

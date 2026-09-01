@@ -4,6 +4,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * 脚本执行的兼容工具入口；调用方应在执行前完成脚本内容与目标环境的安全校验。
+ */
 @Component
 public class ScriptExecutor {
 

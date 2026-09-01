@@ -17,6 +17,9 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * 联网检索工具：将查询提交给搜索服务，并把结果整理为可被后续步骤消费的摘要。
+ */
 @Component
 @GeneratedTool
 public class InternetSearchTool {

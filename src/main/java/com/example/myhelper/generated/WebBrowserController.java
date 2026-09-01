@@ -6,6 +6,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * 浏览器控制的兼容工具入口，负责把高层浏览请求转成浏览器动作。
+ */
 @Component
 @GeneratedTool
 public class WebBrowserController {

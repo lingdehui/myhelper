@@ -9,6 +9,9 @@ import org.springframework.stereotype.Component;
 import java.io.File;
 import java.io.IOException;
 
+/**
+ * 文件压缩与解压工具。它处理明确给定的路径，不负责推断或扩展用户的文件范围。
+ */
 @Component
 @GeneratedTool
 public class FileCompressionTool {

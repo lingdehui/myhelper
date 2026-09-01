@@ -6,6 +6,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * Docker 安装问题的说明工具，向调用方提供平台相关的后续操作建议。
+ */
 @Component
 @GeneratedTool
 public class DockerInstallationGuide {

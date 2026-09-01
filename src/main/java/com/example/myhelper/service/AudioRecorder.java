@@ -6,9 +6,18 @@ import org.slf4j.LoggerFactory;
 import javax.sound.sampled.*;
 import java.io.ByteArrayOutputStream;
 
-public class AudioRecorder {
+/**
+ * 一次性麦克风录音工具，供控制台 {@code voice} 命令使用。
+ *
+ * <p>它会在设备支持的采样率中优先选择 16 kHz，并将小端 16-bit PCM 转成识别器使用的浮点采样。</p>
+ */
+public final class AudioRecorder {
 
     private static final Logger log = LoggerFactory.getLogger(AudioRecorder.class);
+
+    private AudioRecorder() {
+        // 静态工具类不应被实例化。
+    }
 
     /**
      * 录音结果：包含采样数据和实际使用的采样率
@@ -35,6 +44,7 @@ public class AudioRecorder {
         throw new Exception("麦克风不支持任何常用采样率 (16/44.1/48/22.05/11.025/8 kHz)");
     }
 
+    /** 在指定时长内采集单声道音频，并返回真实使用的采样率。 */
     public static AudioData record(int seconds) throws Exception {
         int sampleRate = detectSampleRate();
         AudioFormat format = new AudioFormat(sampleRate, 16, 1, true, false);

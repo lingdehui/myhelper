@@ -7,6 +7,9 @@ import org.springframework.stereotype.Component;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 
+/**
+ * 浏览器相关操作的兼容入口，保留为旧工具调用的适配层。
+ */
 @Component
 public class BrowserTool {
 

@@ -11,23 +11,32 @@ import org.springframework.stereotype.Service;
 
 import javax.sound.sampled.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 
+/**
+ * 语音交互的事件协调器。
+ *
+ * <p>它消费录音线程投递的完整语句，管理空闲/语音对话状态、声纹注册和追问补充，
+ * 并将最终用户输入交给 {@link TurnProcessor}。录音与原生模型调用始终留在其他线程，
+ * 以避免事件循环阻塞音频采样。</p>
+ */
 @Service
 public class SpeechEventLoop {
 
     private static final Logger log = LoggerFactory.getLogger(SpeechEventLoop.class);
 
+    /** 空闲时只等待唤醒词；对话模式下将完整语句作为用户输入处理。 */
     public enum Mode { IDLE, VOICE_DIALOG }
 
-    // ========== 注入的配置 / 共享状态（无 this. 前缀） ==========
+    // 配置与跨线程共享状态。
     private final MyHelperProperties props;
     private final LinkedBlockingQueue<String> speechQueue;
     private volatile ToolCallback[] allTools;
     private final ExecutorService aiExecutor;
 
-    // ========== 注入的服务（带 this. 前缀） ==========
+    // 事件循环依赖的领域服务。
     private final ModelRouter modelRouter;
     private final TurnProcessor turnProcessor;
     private final DialogStateMachine dialogStateMachine;
@@ -36,7 +45,7 @@ public class SpeechEventLoop {
     private final VadService vadService;
     private final SkillConfig skillConfig;
 
-    // ========== 实例状态 ==========
+    // 当前语音会话状态。
     private volatile Mode mode = Mode.IDLE;
     private volatile String currentSpeaker = null;
     private volatile String lastUserInput = "";
@@ -46,6 +55,46 @@ public class SpeechEventLoop {
     private volatile boolean enrollmentHinted = false;
     private volatile boolean followUpHintGiven = false;
     private volatile boolean lastWasFuzzyListening = false;
+
+    /**
+     * 声纹注册由录音线程收集真实音频、由事件线程播报进度。两条线程不能直接互相调用
+     * TTS：录音线程持有 JNI 门锁时调用 TTS 会造成互等。
+     */
+    private final Object enrollmentLock = new Object();
+    private final Queue<EnrollmentUpdate> enrollmentUpdates = new ConcurrentLinkedQueue<>();
+    private volatile EnrollmentSession enrollmentSession;
+
+    private static final List<String> ENROLLMENT_PROMPTS = List.of(
+            "你好，我是桌面上的人工智能助手，很高兴为你服务",
+            "今天天气真好，我想出去散步，看看公园里的花开了没有",
+            "请帮我打开微信，给张三发一条消息，说今晚七点开会"
+    );
+
+    private static final class EnrollmentSession {
+        private final String speakerName;
+        private final int requiredSegments;
+        private int capturedSegments;
+
+        private EnrollmentSession(String speakerName, int requiredSegments) {
+            this.speakerName = speakerName;
+            this.requiredSegments = requiredSegments;
+        }
+    }
+
+    private record EnrollmentUpdate(int capturedSegments, int requiredSegments,
+                                    boolean retry, Boolean completed) {
+        static EnrollmentUpdate progress(int capturedSegments, int requiredSegments) {
+            return new EnrollmentUpdate(capturedSegments, requiredSegments, false, null);
+        }
+
+        static EnrollmentUpdate retry(int capturedSegments, int requiredSegments) {
+            return new EnrollmentUpdate(capturedSegments, requiredSegments, true, null);
+        }
+
+        static EnrollmentUpdate completed(int capturedSegments, int requiredSegments, boolean success) {
+            return new EnrollmentUpdate(capturedSegments, requiredSegments, false, success);
+        }
+    }
 
     public SpeechEventLoop(MyHelperProperties props,
                            LinkedBlockingQueue<String> speechQueue,
@@ -113,6 +162,48 @@ public class SpeechEventLoop {
         this.allTools = tools;
     }
 
+    /** 是否正在采集声纹注册语音（供录音线程在播放引导语时抑制扬声器回声）。 */
+    public boolean isEnrollmentActive() {
+        return enrollmentSession != null;
+    }
+
+    /**
+     * 由录音线程提交一段真实的 VAD 音频。返回 true 表示该段已经被注册流程消费，
+     * 调用方不应再将其送入 ASR/对话队列。
+     */
+    public boolean captureEnrollmentSegment(float[] audioSamples) {
+        if (audioSamples == null || audioSamples.length == 0) return false;
+
+        synchronized (enrollmentLock) {
+            EnrollmentSession session = enrollmentSession;
+            if (session == null) return false;
+
+            // 避免把咳嗽或 VAD 短片段写进声纹模板；引导句均远长于这个长度。
+            int minimumSamples = Math.max(props.voice().sampleRate() * 3 / 4,
+                    props.voice().minSpeechDurationMs() * props.voice().sampleRate() / 1000);
+            if (audioSamples.length < minimumSamples) {
+                enrollmentUpdates.offer(EnrollmentUpdate.retry(session.capturedSegments, session.requiredSegments));
+                return true;
+            }
+
+            voiceprintService.addEnrollmentSegment(session.speakerName, audioSamples);
+            session.capturedSegments++;
+
+            if (session.capturedSegments < session.requiredSegments) {
+                enrollmentUpdates.offer(EnrollmentUpdate.progress(
+                        session.capturedSegments, session.requiredSegments));
+                return true;
+            }
+
+            boolean success = voiceprintService.finishEnrollment(session.speakerName, props.voice().sampleRate());
+            enrollmentSession = null;
+            if (success) currentSpeaker = session.speakerName;
+            enrollmentUpdates.offer(EnrollmentUpdate.completed(
+                    session.capturedSegments, session.requiredSegments, success));
+            return true;
+        }
+    }
+
     // ========== 事件循环 ==========
 
     private void runEventLoop() {
@@ -130,7 +221,10 @@ public class SpeechEventLoop {
 
         while (!Thread.currentThread().isInterrupted()) {
             try {
+                // 先处理录音线程提交的注册进度，再等待下一句 ASR 文本。
+                drainEnrollmentUpdates();
                 String text = speechQueue.poll(props.voice().eventPollIntervalMs(), java.util.concurrent.TimeUnit.MILLISECONDS);
+                drainEnrollmentUpdates();
                 DialogStateMachine.State state = dialogStateMachine.getState();
 
                 // 有语音输入 → 标记交互时间
@@ -483,39 +577,51 @@ public class SpeechEventLoop {
             return;
         }
 
-        String name = "user_" + System.currentTimeMillis() % 10000;
-        voiceprintService.startEnrollment(name);
+        int requiredSegments = Math.min(
+                Math.max(1, props.voiceprint().maxEnrollmentSegments()), ENROLLMENT_PROMPTS.size());
+        synchronized (enrollmentLock) {
+            if (enrollmentSession != null) {
+                ttsService.speakAsync("正在注册声纹，请先完成当前的朗读");
+                return;
+            }
 
-        // 语音提示用户该说什么
-        String[] prompts = {
-                "你好，我是桌面上的人工智能助手，很高兴为你服务",
-                "今天天气真好，我想出去散步，看看公园里的花开了没有",
-                "请帮我打开微信，给张三发一条消息，说今晚七点开会"
-        };
+            String name = "user_" + System.currentTimeMillis() % 10000;
+            voiceprintService.startEnrollment(name);
+            enrollmentSession = new EnrollmentSession(name, requiredSegments);
+        }
 
-        log.info("\n👤 开始注册声纹，共 3 段语音");
-        ttsService.speakAsync("开始注册声纹，第一句请跟我读");
+        log.info("\n👤 开始注册声纹，共 {} 段真实语音", requiredSegments);
+        promptEnrollmentSegment(1, requiredSegments);
+    }
 
-        try (Scanner scanner = new Scanner(System.in)) {
-            for (int i = 0; i < 3; i++) {
-                log.info("  📢 请说第 {}/3 段: {}", i + 1, prompts[i]);
-                ttsService.speakAsync(prompts[i]);
-                log.info("  说完后按回车继续...");
-                scanner.nextLine();
-                log.info("  ✅ 已收集第 {}/3 段", i + 1);
-                // 实际注册中应该用真实音频，这里用占位符
-                // voiceprintService.addEnrollmentSegment(name, audioSamples);
+    /** 在事件线程播放采集进度，避免与录音线程的 JNI 工作互锁。 */
+    private void drainEnrollmentUpdates() {
+        EnrollmentUpdate update;
+        while ((update = enrollmentUpdates.poll()) != null) {
+            if (update.completed() != null) {
+                if (update.completed()) {
+                    log.info("✅ 声纹注册成功，已保存 {} 段真实语音", update.capturedSegments());
+                    ttsService.speakAsync("声纹注册成功");
+                } else {
+                    log.info("❌ 声纹注册失败");
+                    ttsService.speakAsync("声纹注册失败，请稍后重新注册");
+                }
+            } else if (update.retry()) {
+                int current = update.capturedSegments() + 1;
+                log.info("⚠️ 第 {}/{} 段语音过短，请重读", current, update.requiredSegments());
+                ttsService.speakAsync("这段语音太短，请重新读一遍");
+                promptEnrollmentSegment(current, update.requiredSegments());
+            } else {
+                log.info("✅ 已采集第 {}/{} 段", update.capturedSegments(), update.requiredSegments());
+                promptEnrollmentSegment(update.capturedSegments() + 1, update.requiredSegments());
             }
         }
+    }
 
-        boolean success = voiceprintService.finishEnrollment(name, props.voice().sampleRate());
-        if (success) {
-            log.info("✅ 声纹注册成功: {}", name);
-            ttsService.speakAsync("声纹注册成功");
-        } else {
-            log.info("❌ 声纹注册失败");
-            ttsService.speakAsync("声纹注册失败");
-        }
+    private void promptEnrollmentSegment(int segmentNumber, int requiredSegments) {
+        String prompt = ENROLLMENT_PROMPTS.get(segmentNumber - 1);
+        log.info("  📢 请说第 {}/{} 段: {}", segmentNumber, requiredSegments, prompt);
+        ttsService.speakAsync("请朗读第 " + segmentNumber + " 段。" + prompt);
     }
 
     // ========== 提示音 ==========

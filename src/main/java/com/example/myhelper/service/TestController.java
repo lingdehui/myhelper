@@ -7,6 +7,9 @@ import org.springframework.web.bind.annotation.RestController;
 import javax.sound.sampled.*;
 import java.io.ByteArrayOutputStream;
 
+/**
+ * 本地 ASR 冒烟测试端点。它只读取随模型附带的固定音频，用于验证模型与音频格式是否可用。
+ */
 @RestController
 public class TestController {
 
@@ -16,6 +19,9 @@ public class TestController {
         this.localASR = localASR;
     }
 
+    /**
+     * 将 16 kHz、单声道、16-bit 的测试音频转成浮点采样后交给在线识别器。
+     */
     @GetMapping("/test/asr/file")
     public String testFile() {
         try {

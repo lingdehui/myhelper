@@ -9,6 +9,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+/**
+ * 目录删除工具。其接口承载破坏性操作，调用前必须由上层完成目标范围确认。
+ */
 @Component
 @GeneratedTool
 public class DirectoryDeleter {

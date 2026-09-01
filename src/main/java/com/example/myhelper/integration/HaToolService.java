@@ -1,5 +1,8 @@
 package com.example.myhelper.integration;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -21,11 +24,13 @@ public class HaToolService {
 
     private final HomeAssistantClient haClient;
     private final DeviceDiscoveryService discovery;
+    private final ObjectMapper objectMapper;
 
     public HaToolService(HomeAssistantClient haClient,
                          DeviceDiscoveryService discovery) {
         this.haClient = haClient;
         this.discovery = discovery;
+        this.objectMapper = new ObjectMapper();
     }
 
     // ========== 设备查询工具 ==========
@@ -104,6 +109,47 @@ public class HaToolService {
         return sb.toString().trim();
     }
 
+    @Tool(description = "通用 Home Assistant 设备控制。service 可写 domain.service（如 light.turn_on）或仅服务名（如 turn_on，会从实体ID推断领域）；paramsJson 为可选 JSON 对象。")
+    public String controlDevice(
+            @ToolParam(description = "设备实体ID，如 light.living_room") String entityId,
+            @ToolParam(description = "服务名，如 light.turn_on、climate.set_temperature 或 turn_on") String service,
+            @ToolParam(description = "可选 JSON 参数对象，例如 {\"brightness\":180}；没有参数传 {}") String paramsJson) {
+        if (entityId == null || !entityId.contains(".")) return "设备实体ID无效：应为 domain.object 格式。";
+        if (service == null || service.isBlank()) return "服务名不能为空。";
+
+        String domain = entityId.substring(0, entityId.indexOf('.')).trim();
+        String serviceName = service.trim();
+        int dot = serviceName.indexOf('.');
+        if (dot >= 0) {
+            domain = serviceName.substring(0, dot).trim();
+            serviceName = serviceName.substring(dot + 1).trim();
+        }
+        if (domain.isBlank() || serviceName.isBlank()) return "服务名无效：请使用 domain.service 或服务名。";
+
+        try {
+            Map<String, Object> params = parseServiceParams(paramsJson);
+            params.remove("entity_id");
+            boolean success = haClient.callService(domain, serviceName, entityId, params);
+            return success ? "✅ 已调用 " + domain + "." + serviceName + " 控制 " + entityId
+                    : "❌ 调用失败，请检查实体ID、服务名和 Home Assistant 连接状态。";
+        } catch (IllegalArgumentException e) {
+            return "参数无效：" + e.getMessage();
+        }
+    }
+
+    private Map<String, Object> parseServiceParams(String paramsJson) {
+        if (paramsJson == null || paramsJson.isBlank() || "{}".equals(paramsJson.trim())) {
+            return new java.util.LinkedHashMap<>();
+        }
+        try {
+            JsonNode node = objectMapper.readTree(paramsJson);
+            if (node == null || !node.isObject()) throw new IllegalArgumentException("paramsJson 必须是 JSON 对象。");
+            return objectMapper.convertValue(node, new TypeReference<java.util.LinkedHashMap<String, Object>>() {});
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new IllegalArgumentException("paramsJson 不是合法 JSON 对象。");
+        }
+    }
+
     // ========== 灯光控制工具 ==========
 
     /** 打开指定的灯 */
@@ -120,6 +166,13 @@ public class HaToolService {
             @ToolParam(description = "灯的实体ID，如 light.living_room") String entityId) {
         boolean success = haClient.turnOffLight(entityId);
         return success ? "✅ 已关闭 " + entityId : "❌ 操作失败";
+    }
+
+    @Tool(description = "切换指定灯的开关状态；当前开则关、当前关则开。")
+    public String toggleLight(
+            @ToolParam(description = "灯的实体ID，如 light.living_room") String entityId) {
+        boolean success = haClient.toggleLight(entityId);
+        return success ? "✅ 已切换 " + entityId + " 的开关状态" : "❌ 操作失败";
     }
 
     /** 设置灯的亮度 */
@@ -235,5 +288,20 @@ public class HaToolService {
         for (var d : registered) sb.append("✅ ").append(d.get("name")).append(" (").append(d.get("ip")).append(")\n");
         for (var d : failed) sb.append("❌ ").append(d.get("name")).append(" (").append(d.get("ip")).append(")\n");
         return sb.toString().trim();
+    }
+
+    @Tool(description = "按自然语言语义搜索已持久化的局域网发现设备，例如“3D打印机”“客厅投屏设备”。请先扫描网络以建立设备库。")
+    public String searchDiscoveredDevices(
+            @ToolParam(description = "设备类型、名称或用途关键词") String query) {
+        List<Map<String, Object>> matches = discovery.searchSimilarDevices(query, 10);
+        if (matches.isEmpty()) return "未找到相关的已发现设备。可先调用 scanNetworkDevices 重新扫描。";
+        StringBuilder result = new StringBuilder("语义搜索结果（").append(matches.size()).append(" 个）：\n");
+        for (Map<String, Object> device : matches) {
+            result.append("- ").append(device.getOrDefault("name", "未命名设备"))
+                    .append(" [").append(device.getOrDefault("type", "unknown")).append("] ")
+                    .append(device.getOrDefault("ip", "未知地址")).append(':')
+                    .append(device.getOrDefault("port", "")).append('\n');
+        }
+        return result.toString().trim();
     }
 }

@@ -10,6 +10,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 
+/**
+ * 文本生成工具集，为不同写作与改写场景提供明确、可组合的生成入口。
+ */
 @Component
 @GeneratedTool
 public class TextGenerationTool {

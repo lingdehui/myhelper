@@ -14,6 +14,12 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+/**
+ * Sherpa-ONNX 本地语音识别适配器。
+ *
+ * <p>在线识别器用于低延迟唤醒词检测，离线识别器用于语音对话的高精度转写；模型资源被提取到
+ * 临时目录，并在启动前清理异常退出遗留目录。</p>
+ */
 @Service
 public class LocalASR {
 
@@ -21,12 +27,13 @@ public class LocalASR {
 
     private static final int SAMPLE_RATE = 16000;
 
-    // 流式识别（唤醒词用，低延迟，zipformer 模型）
+    /** 流式识别：服务唤醒词检测，优先保证低延迟。 */
     private OnlineRecognizer onlineRecognizer;
 
-    // 离线识别（对话用，高精度，Paraformer 模型）
+    /** 离线识别：服务完整对话转写，优先保证准确性。 */
     private OfflineRecognizer offlineRecognizer;
 
+    /** 初始化两套模型；任一模型失败时由其可用性检查决定相应链路是否降级。 */
     @PostConstruct
     public void init() throws Exception {
         initOnline();

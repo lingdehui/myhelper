@@ -36,7 +36,7 @@ public class DialogStateMachine {
         INTERRUPTED
     }
 
-    @Value("${myhelper.dialogue.silence-timeout-ms:5000}")
+    @Value("${myhelper.voice.silence-timeout-ms:${myhelper.dialogue.silence-timeout-ms:5000}}")
     private int silenceTimeoutMs;
 
     private volatile State currentState = State.IDLE;

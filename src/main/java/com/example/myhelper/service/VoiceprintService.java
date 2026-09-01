@@ -11,7 +11,10 @@ import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -35,10 +38,18 @@ public class VoiceprintService {
     @Value("${sherpa.speaker.threshold:0.6}")
     private float similarityThreshold;
 
+    @Value("${sherpa.speaker.store-path:data/voiceprints.json}")
+    private String voiceprintStorePath;
+
     private SpeakerEmbeddingExtractor extractor;
     private SpeakerEmbeddingManager manager;
     private boolean initialized = false;
     private final Map<String, List<float[]>> pendingEnrollments = new ConcurrentHashMap<>();
+    private final Map<String, List<float[]>> registeredEmbeddings = new ConcurrentHashMap<>();
+    private final Object managerLock = new Object();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public record VoiceprintStore(Map<String, List<float[]>> speakers) {}
 
     @PostConstruct
     public void init() {
@@ -59,6 +70,7 @@ public class VoiceprintService {
             manager = new SpeakerEmbeddingManager(extractor.getDim());
 
             initialized = true;
+            loadRegisteredSpeakers();
             log.info("🎙️ 声纹识别已就绪（维度={}，阈值={}）", extractor.getDim(), similarityThreshold);
         } catch (Exception e) {
             log.error("⚠️ 声纹识别初始化失败: {}", e.getMessage());
@@ -112,7 +124,14 @@ public class VoiceprintService {
         float[] embedding = extractEmbedding(audioSamples, sampleRate);
         if (embedding == null) return false;
 
-        return manager.add(name, embedding);
+        synchronized (managerLock) {
+            boolean added = manager.add(name, embedding);
+            if (added) {
+                registeredEmbeddings.put(name, List.of(Arrays.copyOf(embedding, embedding.length)));
+                persistRegisteredSpeakers();
+            }
+            return added;
+        }
     }
 
     /**
@@ -127,7 +146,16 @@ public class VoiceprintService {
                 .toArray(float[][]::new);
 
         if (embeddings.length == 0) return false;
-        return manager.add(name, embeddings);
+        synchronized (managerLock) {
+            boolean added = manager.add(name, embeddings);
+            if (added) {
+                registeredEmbeddings.put(name, Arrays.stream(embeddings)
+                        .map(embedding -> Arrays.copyOf(embedding, embedding.length))
+                        .toList());
+                persistRegisteredSpeakers();
+            }
+            return added;
+        }
     }
 
     /**
@@ -139,7 +167,9 @@ public class VoiceprintService {
         float[] embedding = extractEmbedding(audioSamples, sampleRate);
         if (embedding == null) return false;
 
-        return manager.verify(name, embedding, similarityThreshold);
+        synchronized (managerLock) {
+            return manager.verify(name, embedding, similarityThreshold);
+        }
     }
 
     /**
@@ -151,7 +181,9 @@ public class VoiceprintService {
         float[] embedding = extractEmbedding(audioSamples, sampleRate);
         if (embedding == null) return null;
 
-        return manager.search(embedding, similarityThreshold);
+        synchronized (managerLock) {
+            return manager.search(embedding, similarityThreshold);
+        }
     }
 
     /**
@@ -159,7 +191,9 @@ public class VoiceprintService {
      */
     public String[] listSpeakers() {
         if (!initialized) return new String[0];
-        return manager.getAllSpeakerNames();
+        synchronized (managerLock) {
+            return manager.getAllSpeakerNames();
+        }
     }
 
     /**
@@ -167,7 +201,14 @@ public class VoiceprintService {
      */
     public boolean removeSpeaker(String name) {
         if (!initialized) return false;
-        return manager.remove(name);
+        synchronized (managerLock) {
+            boolean removed = manager.remove(name);
+            if (removed) {
+                registeredEmbeddings.remove(name);
+                persistRegisteredSpeakers();
+            }
+            return removed;
+        }
     }
 
     /**
@@ -209,5 +250,52 @@ public class VoiceprintService {
      */
     public float getThreshold() {
         return similarityThreshold;
+    }
+
+    /** 将可复用的 embedding 持久化，保证重启后仍能恢复声纹注册。 */
+    private void persistRegisteredSpeakers() {
+        try {
+            Path target = Path.of(voiceprintStorePath).toAbsolutePath();
+            Files.createDirectories(target.getParent());
+            Path temp = target.resolveSibling(target.getFileName() + ".tmp");
+            objectMapper.writeValue(temp.toFile(), new VoiceprintStore(new TreeMap<>(registeredEmbeddings)));
+            try {
+                Files.move(temp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+                Files.move(temp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (Exception e) {
+            log.warn("⚠️ 保存声纹模板失败: {}", e.getMessage());
+        }
+    }
+
+    /** 启动时恢复已保存的 embedding，和文档定义的跨重启声纹识别保持一致。 */
+    private void loadRegisteredSpeakers() {
+        try {
+            Path source = Path.of(voiceprintStorePath).toAbsolutePath();
+            if (!Files.isRegularFile(source)) return;
+
+            VoiceprintStore store = objectMapper.readValue(source.toFile(), VoiceprintStore.class);
+            if (store == null || store.speakers() == null) return;
+            int restored = 0;
+            synchronized (managerLock) {
+                for (Map.Entry<String, List<float[]>> entry : store.speakers().entrySet()) {
+                    List<float[]> embeddings = entry.getValue();
+                    if (entry.getKey().isBlank() || embeddings == null || embeddings.isEmpty()) continue;
+                    float[][] values = embeddings.stream()
+                            .filter(Objects::nonNull)
+                            .toArray(float[][]::new);
+                    if (values.length > 0 && manager.add(entry.getKey(), values)) {
+                        registeredEmbeddings.put(entry.getKey(), Arrays.stream(values)
+                                .map(value -> Arrays.copyOf(value, value.length)).toList());
+                        restored++;
+                    }
+                }
+            }
+            log.info("🎙️ 已恢复 {} 个声纹模板", restored);
+        } catch (Exception e) {
+            log.warn("⚠️ 读取声纹模板失败: {}", e.getMessage());
+        }
     }
 }

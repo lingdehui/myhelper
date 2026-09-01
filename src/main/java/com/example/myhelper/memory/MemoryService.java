@@ -89,9 +89,9 @@ public class MemoryService {
 
         StringBuilder sb = new StringBuilder("相关历史记忆:\n");
         for (VectorMemoryService.SearchResult r : results) {
-            sb.append("- ").append(r.text()).append("\n");
+            sb.append("- ").append(truncate(r.text(), 500)).append("\n");
         }
-        return sb.toString();
+        return truncate(sb.toString(), 1_500);
     }
 
     // ========== 内部方法 ==========
@@ -104,5 +104,10 @@ public class MemoryService {
     private String summarize(String text) {
         if (text == null) return "";
         return text.length() > 50 ? text.substring(0, 50) + "..." : text;
+    }
+
+    private String truncate(String text, int maxLength) {
+        if (text == null || text.length() <= maxLength) return text == null ? "" : text;
+        return text.substring(0, maxLength) + "…";
     }
 }

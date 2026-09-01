@@ -5,6 +5,8 @@ myhelper:
     enabled: false
 
   exploration:
+    # 兼容单独开启探索；未设置时由上方 autonomous.enabled 统一控制。
+    enabled: false
     exploration-model: model2       # model1=本地qwen3:30b(搞不定请教云端), model2=全程云端DeepSeek, 不配置=默认本地
     idle-threshold-minutes: 30       # 空闲阈值：用户半小时没动电脑才开启探索
     max-duration-minutes: 15         # 单次探索最长耗时

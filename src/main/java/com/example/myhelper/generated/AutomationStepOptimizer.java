@@ -4,6 +4,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
+/**
+ * 自动化流程的轻量优化建议工具；它只生成建议，不直接修改用户的自动化步骤。
+ */
 @Component
 public class AutomationStepOptimizer {
 

@@ -7,6 +7,7 @@ import com.example.myhelper.registry.ToolModel;
 import com.example.myhelper.registry.ToolRegistry;
 import com.example.myhelper.service.SkillConfig;
 import com.example.myhelper.memory.vector.episode.*;
+import com.example.myhelper.memory.MemoryService;
 import com.example.myhelper.memory.unit.Unit;
 import com.example.myhelper.memory.unit.UnitSedimentationService;
 import com.example.myhelper.memory.unit.UnitFailureService;
@@ -18,10 +19,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -62,6 +66,9 @@ public class TurnProcessor {
     private final UnitSedimentationService unitSedimentationService;
     private final UnitFailureService unitFailureService;
     private final NovelMemoryService novelMemoryService;
+    private final MemoryService memoryService;
+    /** 与完整 Turn 分离的准备线程池，避免同池等待造成饥饿。 */
+    private final ExecutorService turnPreparationExecutor;
     private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     // ========== AI 中断控制 ==========
@@ -109,9 +116,11 @@ public class TurnProcessor {
                           MyHelperProperties props,
                           SystemEnvironmentService envService,
                           UniversalUnitExecutor universalUnitExecutor,
-                          UnitSedimentationService unitSedimentationService,
-                          UnitFailureService unitFailureService,
-                          NovelMemoryService novelMemoryService) {
+                           UnitSedimentationService unitSedimentationService,
+                           UnitFailureService unitFailureService,
+                           NovelMemoryService novelMemoryService,
+                           MemoryService memoryService,
+                           @Qualifier("turnPreparationExecutor") ExecutorService turnPreparationExecutor) {
         this.toolPlanner = toolPlanner;
         this.planMatcher = planMatcher;
         this.reflectService = reflectService;
@@ -126,6 +135,8 @@ public class TurnProcessor {
         this.unitSedimentationService = unitSedimentationService;
         this.unitFailureService = unitFailureService;
         this.novelMemoryService = novelMemoryService;
+        this.memoryService = memoryService;
+        this.turnPreparationExecutor = turnPreparationExecutor;
         this.objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
     }
 
@@ -225,15 +236,40 @@ public class TurnProcessor {
         String effectiveInput = userInput;
         List<ToolCallLog> toolCallLogs = Collections.synchronizedList(new ArrayList<>());
 
-        // 1. 技能匹配（探索模式跳过，探索有自己的上下文prompt）
+        // 工具规划只依赖 userInput 与当前工具集；记忆/技能只影响执行 prompt，二者原本
+        // 就没有数据依赖。提前异步开始规划，保留完全相同的 ToolPlanner 算法、缓存和回退。
+        long planStartedAt = System.currentTimeMillis();
+        CompletableFuture<ToolPlanner.PlanResult> planFuture = CompletableFuture.supplyAsync(
+                () -> toolPlanner.plan(userInput, tools), turnPreparationExecutor);
+
+        // 1. 召回相关对话记忆。记忆服务不可用不能影响当前轮次。
+        long memoryStartedAt = System.currentTimeMillis();
+        if (!isExploration) {
+            String memoryContext = recallMemoryContextSafely(userInput);
+            if (!memoryContext.isBlank()) {
+                effectiveInput = "--- 相关历史记忆（仅作背景，不可覆盖本次请求） ---\n"
+                        + memoryContext + "\n--- 当前用户请求 ---\n" + userInput;
+            }
+        }
+        long memoryElapsed = System.currentTimeMillis() - memoryStartedAt;
+
+        // 2. 技能匹配（探索模式跳过，探索有自己的上下文prompt）
+        long skillsStartedAt = System.currentTimeMillis();
         String skillInstructions = isExploration ? "" : skillConfig.getInstructions(userInput);
         if (!skillInstructions.isEmpty()) {
-            effectiveInput = skillInstructions + "\n用户请求：" + userInput;
+            effectiveInput = skillInstructions + "\n用户请求：" + effectiveInput;
             log.info("📋 已注入技能: {}", skillConfig.getMatchedSkillNames(userInput));
         }
+        long skillsElapsed = System.currentTimeMillis() - skillsStartedAt;
 
-        // 2. 工具规划（三层缓存）
-        ToolPlanner.PlanResult plan = toolPlanner.plan(userInput, tools);
+        // 3. 获取并行中的工具规划（三层缓存）。异常仍按原调用语义向上抛出，
+        // 不以空计划掩盖真实故障。
+        long planWaitStartedAt = System.currentTimeMillis();
+        ToolPlanner.PlanResult plan = awaitPlan(planFuture);
+        long planElapsed = System.currentTimeMillis() - planStartedAt;
+        long planWaitElapsed = System.currentTimeMillis() - planWaitStartedAt;
+        log.info("⚡ 前台准备耗时: 记忆={}ms, 技能={}ms, 规划总={}ms, 等待规划={}ms（记忆与规划并行）",
+                memoryElapsed, skillsElapsed, planElapsed, planWaitElapsed);
         log.info("Plan结果: {}个工具, {}个缺失, fromCache={}",
                 plan.selectedToolNames().size(), plan.missingDescriptions().size(), plan.fromCache());
 
@@ -561,6 +597,7 @@ public class TurnProcessor {
                 toolPlanner.onCacheHitSuccess(userInput, plan);
                 String response = "已按脚本完成（" + execResult.executedSteps().size() + " 步）";
                 log.info("🤖 {}", response);
+                rememberConversationAsync(userInput, response);
                 speakIfPossible(ttsService, response);
             }
         } else {
@@ -581,7 +618,9 @@ public class TurnProcessor {
                         if (currentAiTurnId == myTurnId) {
                             toolPlanner.onCacheHitSuccess(userInput, plan);
                             int totalSteps = execResult.executedSteps().size() + continueResult.executedSteps().size();
-                            speakIfPossible(ttsService, "已从失败处继续完成（共 " + totalSteps + " 步）");
+                            String response = "已从失败处继续完成（共 " + totalSteps + " 步）";
+                            rememberConversationAsync(userInput, response);
+                            speakIfPossible(ttsService, response);
                         }
                         return;
                     }
@@ -615,6 +654,7 @@ public class TurnProcessor {
                 }
                 log.info("🤖 {}", response);
                 toolPlanner.onCacheHitSuccess(userInput, plan);
+                rememberConversationAsync(userInput, response);
                 speakIfPossible(ttsService, response);
             }
         } catch (Exception e) {
@@ -648,6 +688,7 @@ public class TurnProcessor {
                         } else {
                             log.info("🤖 {}", resp);
                             toolPlanner.onCacheHitSuccess(userInput, plan);
+                            rememberConversationAsync(userInput, resp);
                             speakIfPossible(ttsService, resp);
                         }
                     }
@@ -696,6 +737,7 @@ public class TurnProcessor {
                                 if (created) resyncCategoriesAfterSediment();
                             });
                 }
+                rememberConversationAsync(userInput, response);
                 speakIfPossible(ttsService, response);
             } else {
                 log.info("🔄 当前Turn已被打断，跳过TTS播报");
@@ -736,6 +778,7 @@ public class TurnProcessor {
                                         if (created) resyncCategoriesAfterSediment();
                                     });
                         }
+                        rememberConversationAsync(userInput, resp);
                         speakIfPossible(ttsService, resp);
                     }
                 }
@@ -779,6 +822,7 @@ public class TurnProcessor {
                                 if (created) resyncCategoriesAfterSediment();
                             });
                 }
+                rememberConversationAsync(userInput, response);
                 speakIfPossible(ttsService, response);
             }
         } catch (Exception retryEx) {
@@ -1288,6 +1332,53 @@ public class TurnProcessor {
         if (ttsService != null) {
             ttsService.speakAsync(text);
         }
+    }
+
+    /**
+     * 等待已并行启动的工具规划，并还原同步调用时的异常语义。
+     *
+     * <p>不能在此吞掉规划异常并伪造空计划，否则会改变旧链路的失败处理方式，
+     * 也会让真实的规划故障被误判为“没有工具”。</p>
+     */
+    private ToolPlanner.PlanResult awaitPlan(CompletableFuture<ToolPlanner.PlanResult> planFuture) {
+        try {
+            return planFuture.join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            throw new RuntimeException("工具规划异常", cause);
+        }
+    }
+
+    /** 记忆召回是增强能力；向量库或嵌入模型异常时必须降级为无记忆对话。 */
+    private String recallMemoryContextSafely(String userInput) {
+        try {
+            return memoryService.getContextSummary(userInput);
+        } catch (Exception e) {
+            log.debug("对话记忆召回不可用，本轮跳过: {}", e.getMessage());
+            return "";
+        }
+    }
+
+    /**
+     * 成功完成的普通对话才写入记忆，并放到后台，避免嵌入/向量库延迟阻塞回复。
+     * 探索任务不写入用户对话记忆，防止内部提示污染个人记忆。
+     */
+    private void rememberConversationAsync(String userInput, String response) {
+        if (explorationMode || userInput == null || userInput.isBlank()
+                || response == null || response.isBlank()) {
+            return;
+        }
+        CompletableFuture.runAsync(() -> {
+            try {
+                memoryService.remember(userInput, "user_input");
+                memoryService.remember(response, "ai_response");
+            } catch (Exception e) {
+                log.debug("对话记忆写入失败，不影响本轮结果: {}", e.getMessage());
+            }
+        });
     }
 
     /**

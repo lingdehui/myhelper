@@ -11,6 +11,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 
+/**
+ * 临时目录生命周期工具，用于创建、列举和清理任务级临时工作区。
+ */
 @Component
 @GeneratedTool
 public class TempDirectoryManager {

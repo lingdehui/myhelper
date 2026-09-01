@@ -9,6 +9,9 @@ import org.springframework.stereotype.Component;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 
+/**
+ * 系统命令执行工具。命令具备外部副作用，因此上层必须提供明确且已确认的命令内容。
+ */
 @Component
 @GeneratedTool
 public class SystemCommandExecutor {

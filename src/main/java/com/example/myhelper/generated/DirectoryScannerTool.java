@@ -13,6 +13,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
+/**
+ * 目录扫描工具，将文件系统结构转换为供助手理解的文本摘要。
+ */
 @Component
 @GeneratedTool
 public class DirectoryScannerTool {

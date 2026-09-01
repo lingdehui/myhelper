@@ -11,12 +11,16 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
+/**
+ * Windows 下载与 winget 安装的基础工具。网络传输、安装和搜索分别保持独立，便于调用方选择副作用范围。
+ */
 @Component
 public class DownloadManager {
 
     private static final Logger log = LoggerFactory.getLogger(DownloadManager.class);
 
-    @Tool(description = "从指定 URL 下载文件到本地，支持断点续传和进度显示")
+    /** 下载完整文件并记录可观测的进度；当前实现不保存断点状态。 */
+    @Tool(description = "从指定 URL 下载完整文件到本地，并在日志中显示进度")
     public String downloadFile(String url, String savePath) {
         try {
             URL fileUrl = new URL(url);
@@ -50,7 +54,8 @@ public class DownloadManager {
         }
     }
 
-    @Tool(description = "使用 winget 安装软件，支持搜索和静默安装")
+    /** 通过 winget 静默安装指定软件包。 */
+    @Tool(description = "使用 winget 静默安装指定软件包")
     public String installSoftware(String softwareId) {
         try {
             ProcessBuilder pb = new ProcessBuilder(
@@ -64,12 +69,21 @@ public class DownloadManager {
         }
     }
 
+    /** 搜索 winget 软件包；结果应由专用安装工具进一步解析。 */
     @Tool(description = "搜索 winget 软件包")
     public String searchSoftware(String keyword) {
         try {
-            Process process = new ProcessBuilder("winget", "search", keyword).start();
-            // 读取输出...
-            return "搜索结果...";
+            ProcessBuilder builder = new ProcessBuilder("winget", "search", keyword);
+            builder.redirectErrorStream(true);
+            Process process = builder.start();
+            String output;
+            try (InputStream stream = process.getInputStream()) {
+                output = new String(stream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            }
+            int exitCode = process.waitFor();
+            return exitCode == 0
+                    ? "搜索结果：\n" + output
+                    : "搜索失败，退出码: " + exitCode + "\n" + output;
         } catch (Exception e) {
             return "搜索失败: " + e.getMessage();
         }

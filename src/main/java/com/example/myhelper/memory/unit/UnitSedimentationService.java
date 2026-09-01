@@ -137,6 +137,7 @@ public class UnitSedimentationService {
                 1,
                 0,
                 Unit.calcStability(1, 0),
+                0.0,
                 List.of(),
                 List.of(),
                 Unit.UnitStatus.ACTIVE);
@@ -163,6 +164,7 @@ public class UnitSedimentationService {
                 id, UnitKind.TOOL, toolName, toolName, null,
                 List.of(), Map.of(), Map.of(), toolName,
                 false, List.of(), 0, 0, 0.0,
+                0.0,
                 List.of(), List.of(), Unit.UnitStatus.ACTIVE);
         unitStore.save(tool);
         return id;

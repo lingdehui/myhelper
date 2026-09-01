@@ -13,6 +13,13 @@ import java.io.ByteArrayOutputStream;
 import java.util.*;
 import java.util.concurrent.LinkedBlockingQueue;
 
+/**
+ * 常驻录音与语音片段采集服务。
+ *
+ * <p>录音线程先处理 TTS 回声与 JNI 互斥，再按 VAD（优先）或能量阈值（回退）切分语音；
+ * 有效片段会完成声纹识别、ASR 转写和断句，最后投递给语音事件循环。该类只采集与转换，
+ * 不在录音线程中执行用户任务。</p>
+ */
 @Service
 public class BackgroundAudioService {
 
@@ -29,7 +36,8 @@ public class BackgroundAudioService {
     private final SpeechEventLoop speechEventLoop;
     private final NativeJniGate jniGate;
 
-    private volatile String currentSpeaker = null;
+    /** 最近一次有效语音片段的识别结果；供日志和对话上下文共同使用。 */
+    private volatile String currentSpeaker;
 
     public BackgroundAudioService(MyHelperProperties props,
                                   LocalASR localASR,
@@ -53,16 +61,21 @@ public class BackgroundAudioService {
         this.jniGate = jniGate;
     }
 
+    /** 返回最近识别到的说话人；未识别或无声纹库时为 {@code null}。 */
     public String getCurrentSpeaker() {
         return currentSpeaker;
     }
 
+    /** 启动守护录音线程。线程不阻止 JVM 正常退出。 */
     public void start() {
         Thread recorderThread = new Thread(this::runRecordingLoop, "bg-recorder");
         recorderThread.setDaemon(true);
         recorderThread.start();
     }
 
+    /**
+     * 录音主循环。循环内必须先拿到 JNI 门锁，避免 ASR/VAD 与 TTS 同时调用原生库造成死锁。
+     */
     private void runRecordingLoop() {
         TargetDataLine line = null;
         try {
@@ -78,9 +91,11 @@ public class BackgroundAudioService {
             long silenceStart = 0, speechStart = 0;
             boolean isSpeaking = false;
             final boolean useVad = vadService.isAvailable();
+            // 保留约 200 ms 尾音，防止 VAD 分段切在音节中间而丢失结尾。
             float[] trailBuf = new float[props.voice().sampleRate() / 5];
             int trailPos = 0;
             long ttsEchoUntil = 0;
+            boolean wasTtsPlaying = false;
 
             OnlineStream idleStream = null;
             long idleStreamCreated = 0;
@@ -103,13 +118,20 @@ public class BackgroundAudioService {
                     continue;
                 }
                 try {
-                    if (ttsService.isPlaying()) {
-                        ttsEchoUntil = System.currentTimeMillis() + props.voice().ttsEchoDrainMs();
+                    boolean ttsPlaying = ttsService.isPlaying();
+                    if (ttsPlaying && speechEventLoop.isEnrollmentActive()) {
+                        // 注册引导语会被麦克风回收；播放期间只暂停注册采样，不影响普通对话的打断链路。
+                        wasTtsPlaying = true;
                         if (useVad) vadService.clear();
                         else { isSpeaking = false; energyBuf.reset(); silenceStart = 0; }
                         wasSpeaking = false;
                         continue;
                     }
+                    if (wasTtsPlaying && !ttsPlaying) {
+                        // 播放结束后短暂丢弃扬声器尾音；播放期间仍保持录音，支持自然打断。
+                        ttsEchoUntil = System.currentTimeMillis() + props.voice().ttsEchoDrainMs();
+                    }
+                    wasTtsPlaying = ttsPlaying;
                     if (System.currentTimeMillis() < ttsEchoUntil) {
                         if (useVad) vadService.clear();
                         trailPos = 0;
@@ -125,7 +147,7 @@ public class BackgroundAudioService {
                     trailPos = (trailPos + 1) % trailBuf.length;
                 }
 
-                // Wake word detection (IDLE mode)
+                // 空闲模式仅做唤醒词流式检测；进入对话后立即释放流，避免两条识别链并行占用模型。
                 Object currentMode = speechEventLoop.getMode().name();
                 if ("IDLE".equals(String.valueOf(currentMode)) && useVad) {
                     if (idleStream == null) {
@@ -161,11 +183,11 @@ public class BackgroundAudioService {
                                 withTrail[speech.length + j] = trailBuf[(trailPos + j) % trailBuf.length];
                             }
 
-                            String speaker = null;
-                            if (voiceprintService.isAvailable() && voiceprintService.listSpeakers().length > 0) {
-                                speaker = voiceprintService.search(withTrail, props.voice().sampleRate());
-                                currentSpeaker = speaker;
+                            if (speechEventLoop.captureEnrollmentSegment(withTrail)) {
+                                continue;
                             }
+
+                            identifySpeaker(withTrail);
 
                             String text;
                             if ("VOICE_DIALOG".equals(String.valueOf(currentMode)) && localASR.isOfflineAvailable()) {
@@ -217,11 +239,14 @@ public class BackgroundAudioService {
                                 if (System.currentTimeMillis() - speechStart > props.voice().minSpeechDurationMs()) {
                                     float[] energySamples = pcmToFloat(energyBuf.toByteArray());
 
-                                    String speaker = null;
-                                    if (voiceprintService.isAvailable() && voiceprintService.listSpeakers().length > 0) {
-                                        speaker = voiceprintService.search(energySamples, props.voice().sampleRate());
-                                        currentSpeaker = speaker;
+                                    if (speechEventLoop.captureEnrollmentSegment(energySamples)) {
+                                        isSpeaking = false;
+                                        silenceStart = 0;
+                                        energyBuf.reset();
+                                        continue;
                                     }
+
+                                    identifySpeaker(energySamples);
 
                                     String text;
                                     if ("VOICE_DIALOG".equals(String.valueOf(currentMode)) && localASR.isOfflineAvailable()) {
@@ -265,6 +290,7 @@ public class BackgroundAudioService {
         }
     }
 
+    /** 播放短提示音；失败只记录日志，不能中断语音采集。 */
     private void playBeep(int freqHz, int durationMs) {
         try {
             float sampleRate = 8000;
@@ -286,12 +312,24 @@ public class BackgroundAudioService {
         }
     }
 
+    /** VAD 不可用时计算 RMS 能量，作为是否有人声的回退判定。 */
     private float calcEnergyFallback(float[] samples) {
         double sum = 0;
         for (float s : samples) sum += s * s;
         return (float) Math.sqrt(sum / samples.length);
     }
 
+    /** 录音线程与事件循环始终共享同一次声纹识别结果。 */
+    private void identifySpeaker(float[] audioSamples) {
+        String speaker = null;
+        if (voiceprintService.isAvailable() && voiceprintService.listSpeakers().length > 0) {
+            speaker = voiceprintService.search(audioSamples, props.voice().sampleRate());
+        }
+        currentSpeaker = speaker;
+        speechEventLoop.setCurrentSpeaker(speaker);
+    }
+
+    /** 将小端 16-bit PCM 转为 ASR/VAD 所需的 [-1, 1] 浮点采样。 */
     private float[] pcmToFloat(byte[] pcm) {
         return pcmToFloat(pcm, pcm.length);
     }

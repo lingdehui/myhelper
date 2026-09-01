@@ -10,6 +10,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
+/**
+ * 文件内容读取工具，为规划器提供受控的本地文本访问能力。
+ */
 @Component
 @GeneratedTool
 public class FileReadTool {

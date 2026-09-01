@@ -43,6 +43,7 @@ public class UnitStore {
     private final WebClient qdrant;
     private final EmbeddingService embeddingService;
     private final SystemEnvironmentService envService;
+    private final ExperienceQualityService experienceQualityService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${qdrant.unit-registry-collection:unit-registry}")
@@ -63,12 +64,14 @@ public class UnitStore {
                      UnitConverter converter,
                      WebClient qdrantWebClient,
                      EmbeddingService embeddingService,
-                     SystemEnvironmentService envService) {
+                     SystemEnvironmentService envService,
+                     ExperienceQualityService experienceQualityService) {
         this.unitRepository = unitRepository;
         this.converter = converter;
         this.qdrant = qdrantWebClient;
         this.embeddingService = embeddingService;
         this.envService = envService;
+        this.experienceQualityService = experienceQualityService;
     }
 
     @PostConstruct
@@ -113,12 +116,27 @@ public class UnitStore {
 
     /** 保存 UnitNode（Neo4j 主存储 + Qdrant 检索入口）。 */
     public UnitNode saveNode(UnitNode node) {
+        refreshExperienceMetrics(node, true);
         // 1. 先写 Neo4j（主存储，结构完整性）
         UnitNode saved = unitRepository.save(node);
 
         // 2. 再写 Qdrant（检索入口，最终一致性，失败重试不回滚）
         indexToQdrant(saved, writeRetry);
         return saved;
+    }
+
+    /** 保存一次经验状态变更（不重建 Qdrant 向量索引）。 */
+    public UnitNode saveExperienceUpdate(UnitNode node) {
+        refreshExperienceMetrics(node, true);
+        return unitRepository.save(node);
+    }
+
+    private void refreshExperienceMetrics(UnitNode node, boolean touchUpdatedAt) {
+        long now = System.currentTimeMillis();
+        if (node.getCreatedAt() == null) node.setCreatedAt(now);
+        if (touchUpdatedAt) node.setUpdatedAt(now);
+        node.setStability(Unit.calcStability(node.getSuccessCount(), node.getFailureCount()));
+        node.setQualityScore(experienceQualityService.assess(node).score());
     }
 
     /** 按 unitId 删除（Neo4j + Qdrant）。MCP_TOOL 不可删，调用方负责把关。 */
@@ -178,7 +196,10 @@ public class UnitStore {
     // ========================================================================
 
     public Optional<Unit> findById(String unitId) {
-        return unitRepository.findByUnitId(unitId).map(converter::toUnit);
+        return unitRepository.findByUnitId(unitId).map(node -> {
+            node.setQualityScore(experienceQualityService.assess(node).score());
+            return converter.toUnit(node);
+        });
     }
 
     /** 统计 ACTIVE 状态的 Unit 数量（探索优化阈值用，替代旧 Episode.countActiveEpisodes）。 */
@@ -293,8 +314,11 @@ public class UnitStore {
             node.setSuccessCount(success);
             node.setFailureCount(failure);
             node.setStability(Unit.calcStability(success, failure));
-            // §7.2 条件3：successCount≥5 且 stability>0.9 时，若满足其它条件则升级为可脚本化
-            if (success >= 5 && node.getStability() > 0.9 && !node.isScriptable()) {
+            refreshExperienceMetrics(node, true);
+            // 脚本化不仅要求成功率，也要求有足够验证样本和经验质量。
+            if (success >= 5 && node.getStability() > 0.9
+                    && node.getQualityScore() >= experienceQualityService.scriptableScore()
+                    && !node.isScriptable()) {
                 tryUpgradeScriptable(node);
             }
             unitRepository.save(node);
@@ -336,7 +360,7 @@ public class UnitStore {
             List<String> notes = parseListString(node.getNotesJson());
             if (!notes.contains(note)) notes.add(note);
             node.setNotesJson(toJson(notes));
-            unitRepository.save(node);
+            saveExperienceUpdate(node);
         });
     }
 
@@ -371,7 +395,7 @@ public class UnitStore {
                     declareType == ExplorationRecord.DeclareType.OPTIMIZE ? result : null,
                     System.currentTimeMillis()));
             node.setExplorationRecordsJson(toJson(records));
-            unitRepository.save(node);
+            saveExperienceUpdate(node);
         });
     }
 
@@ -405,7 +429,11 @@ public class UnitStore {
             List<Unit> results = new ArrayList<>();
             for (Map<String, Object> point : points) {
                 String unitId = String.valueOf(point.get("id"));
-                unitRepository.findByUnitId(unitId).map(converter::toUnit).ifPresent(results::add);
+                unitRepository.findByUnitId(unitId).ifPresent(node -> {
+                    // 兼容历史数据：即使尚未跑过每日刷新，也在读路径实时计算质量。
+                    node.setQualityScore(experienceQualityService.assess(node).score());
+                    results.add(converter.toUnit(node));
+                });
             }
             log.info("🔍 Unit 语义检索 '{}' → {} 个结果", query, results.size());
             return results;

@@ -44,6 +44,7 @@ public class UnitConverter {
         node.setSuccessCount(unit.successCount());
         node.setFailureCount(unit.failureCount());
         node.setStability(Unit.calcStability(unit.successCount(), unit.failureCount()));
+        node.setQualityScore(unit.qualityScore());
         node.setFailureCausesJson(toJson(unit.failureCauses()));
         node.setExplorationRecordsJson(toJson(unit.explorationRecords()));
         node.setStatus(unit.status() == null ? Unit.UnitStatus.ACTIVE.name() : unit.status().name());
@@ -72,6 +73,7 @@ public class UnitConverter {
                 success,
                 failure,
                 Unit.calcStability(success, failure),
+                node.getQualityScore(),
                 parseListString(node.getFailureCausesJson()),
                 parseExplorationRecords(node.getExplorationRecordsJson()),
                 status);

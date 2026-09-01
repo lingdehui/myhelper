@@ -1,5 +1,6 @@
 package com.example.myhelper.exploration;
 
+import com.example.myhelper.memory.unit.ExperienceQualityService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.annotation.Tool;
@@ -16,11 +17,14 @@ public class ExplorationTool {
 
     private final AutonomousExplorationService explorationService;
     private final MemoryMaintenanceService maintenanceService;
+    private final ExperienceQualityService experienceQualityService;
 
     public ExplorationTool(AutonomousExplorationService explorationService,
-                            MemoryMaintenanceService maintenanceService) {
+                            MemoryMaintenanceService maintenanceService,
+                            ExperienceQualityService experienceQualityService) {
         this.explorationService = explorationService;
         this.maintenanceService = maintenanceService;
+        this.experienceQualityService = experienceQualityService;
     }
 
     /**
@@ -54,6 +58,14 @@ public class ExplorationTool {
                 usage * 100,
                 maintenanceService.getThreshold() * 100,
                 maintenanceService.getTarget() * 100);
+    }
+
+    @Tool(description = "查看已沉淀执行经验的质量概况，包括可复用经验数量、平均质量分和复用门槛。")
+    public String getExperienceQualityStatus() {
+        ExperienceQualityService.QualitySummary summary = experienceQualityService.summarize();
+        return String.format("经验质量：总计 %d 条，活跃 %d 条，可复用 %d 条；平均质量分 %.2f，复用门槛 %.2f。",
+                summary.total(), summary.active(), summary.reusable(),
+                summary.averageScore(), summary.minReuseScore());
     }
 
     @Tool(description = "将指定 Unit 标记为永久保护，防止被凌晨记忆清理任务自动删除。参数 unitId 为 Unit 的 UUID。")
