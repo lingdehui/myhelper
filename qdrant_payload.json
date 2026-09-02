@@ -1,0 +1,372 @@
+﻿[
+    {
+        "toolId":  "MCP:robot-mcp:findPixelColor",
+        "name":  "findPixelColor",
+        "description":  "Get the color of the pixel at the specified screen coordinates. Returns the color as a hex string like #RRGGBB.\nä¸­ææè¿°: è·åæå®åæ åç´ é¢è²",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:dumpWindowTree",
+        "name":  "dumpWindowTree",
+        "description":  "Dump the full UI Automation control tree of the first visible window whose title contains the given substring. Each line shows the element\u0027s control type, name, AutomationId, ValuePattern value (if supported), enabled state, and bounding rectangle {x,y,width,height}. Indentation reflects nesting depth. Use this to understand an application\u0027s UI structure before interacting with it.\nä¸­ææè¿°: å¯¼åºçªå£UIæ§ä»¶æ ",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:captureRegion",
+        "name":  "captureRegion",
+        "description":  "Capture a region of the screen and return it as an image.\nä¸­ææè¿°: æè·å±å¹æå®åºåå¾å",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:getWindowBounds",
+        "name":  "getWindowBounds",
+        "description":  "Get the screen bounds (x, y, width, height) of the first visible window whose title contains the given substring.\nä¸­ææè¿°: è·åçªå£å±å¹è¾¹ç",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:maximizeWindow",
+        "name":  "maximizeWindow",
+        "description":  "Maximize the first visible window whose title contains the given substring.\nä¸­ææè¿°: æå¤§åå¹é\u0085æ é¢ççªå£",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "status":  "ACTIVE",
+        "description":  "test",
+        "name":  "captureScreen",
+        "type":  "MCP"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:listInteractiveElements",
+        "name":  "listInteractiveElements",
+        "description":  "List all interactive UI elements â buttons, edits, checkboxes, combo boxes, menu items, list items, radio buttons, tab items, spinners, hyperlinks, and tree items â in the first visible window whose title contains the given substring. Each line shows the element\u0027s control type, name, AutomationId, current value (if applicable), enabled state, and bounding rectangle {x,y,width,height}. Less verbose than dumpWindowTree; use this to discover what the model can act on.\nä¸­ææè¿°: ååºå¯äº¤äºUIå\u0085ç´ ",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:findElement",
+        "name":  "findElement",
+        "description":  "Find the first UI element matching the given locator in the target window and return its full state: control type, name, AutomationId, value, enabled state, and bounding rectangle. Locator: AutomationId (e.g. \u0027btn_ok\u0027), Name (e.g. \u0027OK\u0027), or ControlType:Name (e.g. \u0027button:OK\u0027) to disambiguate duplicates.\nä¸­ææè¿°: æ¥æ¾å¹é\u0085çUIå\u0085ç´ ",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:mouseScroll",
+        "name":  "mouseScroll",
+        "description":  "Scroll the mouse wheel at the specified coordinates. Positive amount scrolls down, negative scrolls up.\nä¸­ææè¿°: å¨æå®åæ æ»å¨é¼ æ æ»è½®",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:listWindows",
+        "name":  "listWindows",
+        "description":  "List all visible top-level windows and their titles.\nä¸­ææè¿°: ååºå¯è§é¡¶å±çªå£æ é¢",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:rightClick",
+        "name":  "rightClick",
+        "description":  "Right-click at the specified screen coordinates.\nä¸­ææè¿°: å¨æå®åæ å³é®ç¹å»",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "GENERATED:planStep:planStep_d42e9a01-ed34-4ec2-867e-360f57d2eebc",
+        "name":  "planStep_d42e9a01-ed34-4ec2-867e-360f57d2eebc",
+        "description":  "å­¦ä¹ æªå±ï¼ä½¿ç¨ captureScreen/captureRegion/waitForScreenStable â éªè¯æä½æåãå\u0085± 15 æ­¥ï¼å\u0085é¨æé¡ºåºæ§è¡ï¼ 1) listMonitors 2) captureScreen 3) listWindows 4) listMonitors 5) getMousePosition 6) waitForScreenStable 7) captureRegion 8) listMonitors 9) captureScreen 10) captureRegion 11) getMousePosition 12) waitForScreenStable 13) ocrRegion 14) captureRegion 15) waitForScreenStable",
+        "type":  "GENERATED",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:minimizeWindow",
+        "name":  "minimizeWindow",
+        "description":  "Minimize the first visible window whose title contains the given substring.\nä¸­ææè¿°: æå°åå¹é\u0085æ é¢ççªå£",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:middleClick",
+        "name":  "middleClick",
+        "description":  "Middle-click at the specified screen coordinates. Useful for opening links in a new tab or closing tabs.\nä¸­ææè¿°: å¨æå®åæ ä¸­é®ç¹å»",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "GENERATED:planStep:planStep_20a08cd1-69fb-462a-87d9-8df8b6ebf6a3",
+        "name":  "planStep_20a08cd1-69fb-462a-87d9-8df8b6ebf6a3",
+        "description":  "å­¦ä¹ ä½¿ç¨ captureScreen/captureRegion/waitForScreenStable å®æå\u0085¨å±æªå¾ãåºåæªå¾ä¸å±å¹ç¨³å®ç­å¾\u0085ï¼å¹¶éªè¯æªå¾æä»¶çææ­£ç¡®ããå\u0085± 2 æ­¥ï¼å\u0085é¨æé¡ºåºæ§è¡ï¼ 1) captureRegion 2) waitForScreenStable",
+        "type":  "GENERATED",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:captureMonitor",
+        "name":  "captureMonitor",
+        "description":  "Capture a specific monitor by index and return it as an image. Use listMonitors to get available indices.\nä¸­ææè¿°: æç´¢å¼æè·æå®æ¾ç¤ºå¨",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:collapseElement",
+        "name":  "collapseElement",
+        "description":  "Collapse a tree item, combo box, or other expandable element in the target window. Uses UIA ExpandCollapsePattern. Locator: AutomationId, Name, or ControlType:Name.\nä¸­ææè¿°: æå UIå¯å±å¼å\u0085ç´ ",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:restoreWindow",
+        "name":  "restoreWindow",
+        "description":  "Restore (un-minimize/un-maximize) the first visible window whose title contains the given substring.\nä¸­ææè¿°: è¿åå¹é\u0085æ é¢ççªå£",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:leftClick",
+        "name":  "leftClick",
+        "description":  "Left-click at the specified screen coordinates.\nä¸­ææè¿°: å¨æå®åæ å·¦é®ç¹å»",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:ocrRegion",
+        "name":  "ocrRegion",
+        "description":  "Run OCR on a region of the screen and return the recognized text.\nä¸­ææè¿°: è¯å«å±å¹åºåæå­",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:waitForPixelColor",
+        "name":  "waitForPixelColor",
+        "description":  "Wait until the pixel at (x, y) matches the target hex color (e.g. #FF0000 or FF0000), or until timeoutMs elapses. Returns the outcome and the final pixel color.\nä¸­ææè¿°: ç­å¾\u0085åç´ é¢è²å¹é\u0085",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:listMonitors",
+        "name":  "listMonitors",
+        "description":  "List all connected monitors with their index, resolution, and position.\nä¸­ææè¿°: ååºæææ¾ç¤ºå¨ä¿¡æ¯",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:typeTextViaClipboard",
+        "name":  "typeTextViaClipboard",
+        "description":  "Type text by placing it on the clipboard and pasting with CTRL+V. Much faster than typeText for long strings and supports Unicode and special characters. Overwrites the current clipboard contents.\nä¸­ææè¿°: éè¿åªè´´æ¿ç²è´´è¾å\u0085¥ææ¬",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:captureWindow",
+        "name":  "captureWindow",
+        "description":  "Capture a specific window by title and return it as an image. Matches the first visible window whose title contains the given substring (case-insensitive). Restores the window first if it is minimized.\nä¸­ææè¿°: ææ é¢æè·çªå£å¾å",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:mouseMove",
+        "name":  "mouseMove",
+        "description":  "Move the mouse cursor to the specified screen coordinates.\nä¸­ææè¿°: ç§»å¨é¼ æ å°æå®åæ ",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:pressKeyCombination",
+        "name":  "pressKeyCombination",
+        "description":  "Press a key combination such as CTRL+C or CTRL+SHIFT+T. Pass each key separated by \u0027+\u0027. Keys are pressed in order and released in reverse order. Modifier names: CTRL, ALT, SHIFT, WIN.\nä¸­ææè¿°: æä¸ç»åå¿«æ·é®",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:getElementAtPoint",
+        "name":  "getElementAtPoint",
+        "description":  "Return the UI Automation element at the given screen coordinates. Shows the element\u0027s control type, name, AutomationId, value, enabled state, and bounding rectangle. Useful for identifying what element a screenshot region corresponds to without relying on OCR.\nä¸­ææè¿°: è·ååæ å¤UIå\u0085ç´ ",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:ocrMonitor",
+        "name":  "ocrMonitor",
+        "description":  "Run OCR on a specific monitor by index and return the recognized text. Use listMonitors to get available indices.\nä¸­ææè¿°: è¯å«æå®æ¾ç¤ºå¨æå­",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:waitForScreenChange",
+        "name":  "waitForScreenChange",
+        "description":  "Wait up to timeoutMs milliseconds for any pixel change within the region (x, y, width, height). Polls every 100ms. Returns when a change is detected or the timeout elapses.\nä¸­ææè¿°: ç­å¾\u0085å±å¹åºååå",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:getTextContent",
+        "name":  "getTextContent",
+        "description":  "Read the full text content of a UI element via UIA TextPattern. Works with documents, rich text editors, terminals, log viewers, and other text containers that expose more content than the simple value property. Locator: AutomationId, Name, or ControlType:Name. If the locator is empty, reads the entire window\u0027s text content.\nä¸­ææè¿°: è¯»åUIå\u0085ç´ å\u0085¨æå\u0085å®¹",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:scrollUntilPixelColor",
+        "name":  "scrollUntilPixelColor",
+        "description":  "Scroll at (scrollX, scrollY) until the pixel at (watchX, watchY) matches the target hex color, or until timeoutMs elapses. Scrolls by \u0027scrollAmount\u0027 units per step (positive = down, negative = up), waits \u0027stepDelayMs\u0027 milliseconds between steps to let content load. Returns the outcome and number of scroll steps taken.\nä¸­ææè¿°: æ»å¨ç´å°åç´ å¹é\u0085é¢è²",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:setClipboard",
+        "name":  "setClipboard",
+        "description":  "Set the system clipboard to the given text.\nä¸­ææè¿°: è®¾ç½®ç³»ç»åªè´´æ¿ææ¬",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:pressKey",
+        "name":  "pressKey",
+        "description":  "Press a single named key. Supported names: ENTER, TAB, SPACE, BACKSPACE, DELETE, ESCAPE, UP, DOWN, LEFT, RIGHT, HOME, END, PAGE_UP, PAGE_DOWN, INSERT, PRINT_SCREEN, CAPS_LOCK, NUM_LOCK, F1âF12, CTRL, ALT, SHIFT, WIN.\nä¸­ææè¿°: æä¸åä¸ªå½åæé®",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "GENERATED:planStep:planStep_227d643f-96e3-48dd-803e-76cab211e419",
+        "name":  "planStep_227d643f-96e3-48dd-803e-76cab211e419",
+        "description":  "å­¦ä¹ ä½¿ç¨OCRå·¥å\u0085·è¯å«å±å¹/çªå£æå­ï¼å¹¶éªè¯è¯å«ç»ææ­£ç¡®ããå\u0085± 11 æ­¥ï¼å\u0085é¨æé¡ºåºæ§è¡ï¼ 1) listWindows 2) listMonitors 3) getActiveWindowTitle 4) getMousePosition 5) ocrWindow 6) ocrMonitor 7) findTextOnScreen 8) findTextOnScreen 9) mouseMove 10) sleep 11) getMousePosition",
+        "type":  "GENERATED",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:focusWindow",
+        "name":  "focusWindow",
+        "description":  "Bring the first visible window whose title contains the given substring to the foreground. Returns the full title of the focused window, or an error message if not found.\nä¸­ææè¿°: èç¦å¹é\u0085æ é¢ççªå£",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:typeText",
+        "name":  "typeText",
+        "description":  "Type a string as keyboard input. Handles uppercase letters and common special characters on a US keyboard layout.\nä¸­ææè¿°: ä»¥é®çè¾å\u0085¥æ¹å¼æå­",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:sleep",
+        "name":  "sleep",
+        "description":  "Pause for the specified number of milliseconds. Maximum 30000ms (30 seconds).\nä¸­ææè¿°: æåæå®æ¯«ç§æ°",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:captureScreen",
+        "name":  "captureScreen",
+        "description":  "Capture the full virtual desktop (all monitors) and return it as an image.\nä¸­ææè¿°: æè·æ´ä¸ªèææ¡é¢å¾å",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:getMousePosition",
+        "name":  "getMousePosition",
+        "description":  "Get the current mouse cursor position on screen.\nä¸­ææè¿°: è·åé¼ æ å½åä½ç½®",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:isElementPresent",
+        "name":  "isElementPresent",
+        "description":  "Return true if a UI element matching the given locator exists in the target window, false otherwise. Faster than findElement when you only need to know whether an element is present (e.g. to check if a dialog is open or a button has appeared). Locator: AutomationId, Name, or ControlType:Name.\nä¸­ææè¿°: å¤æ­UIå\u0085ç´ æ¯å¦å­å¨",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:getFocusedElement",
+        "name":  "getFocusedElement",
+        "description":  "Return the name, control type, AutomationId, value, and bounding rectangle of the UI element that currently holds keyboard focus, regardless of which window it belongs to.\nä¸­ææè¿°: è·åç¦ç¹UIå\u0085ç´ ä¿¡æ¯",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:findPixelInRegion",
+        "name":  "findPixelInRegion",
+        "description":  "Scan a screen region for the first pixel matching the given hex color (e.g. #FF0000 or FF0000). Scans left-to-right, top-to-bottom. Returns the absolute screen coordinates of the first match.\nä¸­ææè¿°: å¨åºåä¸­æ¥æ¾æå®é¢è²åç´ ",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:getActiveWindowTitle",
+        "name":  "getActiveWindowTitle",
+        "description":  "Get the title of the currently active (foreground) window.\nä¸­ææè¿°: è·åå½åæ´»å¨çªå£æ é¢",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:mouseDrag",
+        "name":  "mouseDrag",
+        "description":  "Drag from (x1, y1) to (x2, y2) holding the left mouse button. Moves in smooth steps.\nä¸­ææè¿°: æä½å·¦é®ä»èµ·ç¹æå°ç»ç¹",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:doubleClick",
+        "name":  "doubleClick",
+        "description":  "Double-click at the specified screen coordinates.\nä¸­ææè¿°: å¨æå®åæ åå»",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:waitForElement",
+        "name":  "waitForElement",
+        "description":  "Poll until a UI element matching the given locator appears in the target window, or until timeoutMs elapses. Returns the element\u0027s full state when found, or a timeout message. Use this after triggering an action that opens a dialog or loads new content, instead of guessing with sleep(). Locator: AutomationId, Name, or ControlType:Name.\nä¸­ææè¿°: ç­å¾\u0085UIå\u0085ç´ åºç°",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "GENERATED:planStep:planStep_64239f61-832b-4241-bf12-9ca9720ae095",
+        "name":  "planStep_64239f61-832b-4241-bf12-9ca9720ae095",
+        "description":  "å­¦ä¹ ä½¿ç¨ captureScreen/captureRegion/waitForScreenStable å®æå\u0085¨å±æªå¾ãåºåæªå¾ä¸å±å¹ç¨³å®ç­å¾\u0085ï¼å¹¶éªè¯æªå¾æä»¶çææ­£ç¡®ããå\u0085± 1 æ­¥ï¼å\u0085é¨æé¡ºåºæ§è¡ï¼ 1) captureScreen",
+        "type":  "GENERATED",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:ocrWindow",
+        "name":  "ocrWindow",
+        "description":  "Run OCR on a window matching the given title substring and return the recognized text. Matches the first visible window whose title contains the given substring (case-insensitive).\nä¸­ææè¿°: è¯å«å¹é\u0085çªå£æå­",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:getClipboard",
+        "name":  "getClipboard",
+        "description":  "Get the current text content of the system clipboard.\nä¸­ææè¿°: è·ååªè´´æ¿ææ¬å\u0085å®¹",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:expandElement",
+        "name":  "expandElement",
+        "description":  "Expand a tree item, combo box, or other collapsible element in the target window. Uses UIA ExpandCollapsePattern â more reliable than clicking the expand arrow by coordinate. Locator: AutomationId, Name, or ControlType:Name.\nä¸­ææè¿°: å±å¼UIå¯æå å\u0085ç´ ",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "GENERATED:planStep:planStep_cafa0056-87a6-4e80-8f80-1c3fd3262de8",
+        "name":  "planStep_cafa0056-87a6-4e80-8f80-1c3fd3262de8",
+        "description":  "å­¦ä¹ ä½¿ç¨ captureScreen/captureRegion/waitForScreenStable å®æå\u0085¨å±æªå¾ãåºåæªå¾ä¸å±å¹ç¨³å®ç­å¾\u0085ï¼å¹¶éªè¯æªå¾æä»¶çææ­£ç¡®ããå\u0085± 1 æ­¥ï¼å\u0085é¨æé¡ºåºæ§è¡ï¼ 1) captureRegion",
+        "type":  "GENERATED",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:waitForScreenStable",
+        "name":  "waitForScreenStable",
+        "description":  "Wait up to timeoutMs milliseconds for the region (x, y, width, height) to stop changing. Polls every 100ms and returns once two consecutive captures are identical, indicating the UI has settled. Returns a timeout message if the region keeps changing.\nä¸­ææè¿°: ç­å¾\u0085å±å¹åºåéæ­¢",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    },
+    {
+        "toolId":  "MCP:robot-mcp:ocrScreen",
+        "name":  "ocrScreen",
+        "description":  "Run OCR on the full virtual desktop (all monitors) and return the recognized text.\nä¸­ææè¿°: è¯å«å\u0085¨å±å¹æå­",
+        "type":  "MCP",
+        "status":  "ACTIVE"
+    }
+]
