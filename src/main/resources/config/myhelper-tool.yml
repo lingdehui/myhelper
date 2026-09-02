@@ -1,0 +1,48 @@
+# ===== 工具规划 =====
+myhelper:
+  tool-planner:
+    max-cache-size: 500
+    failure-threshold: 3
+    force-category-sync: false
+    max-category-rounds: 3
+    routing:
+      # 默认由索引翻目录、模型一次做最终决策；候选不明确时保留多轮浏览兜底。
+      enabled: true
+      category-top-k: 3
+      category-min-score: 0.45
+      direct-tool-top-k: 12
+      direct-tool-min-score: 0.45
+      min-candidate-tools: 2
+      max-candidate-tools: 32
+    fallback-tools:
+      - sleep
+      - listWindows
+      - getActiveWindowTitle
+      - getMousePosition
+      - focusWindow
+      - leftClick
+      - doubleClick
+      - rightClick
+      - typeText
+      - typeTextViaClipboard
+      - pressKey
+      - pressKeyCombination
+      - mouseMove
+      - mouseScroll
+      - clickTextOnScreen
+      - findTextOnScreen
+    always-append-tools:
+      - searchTool
+
+  # ===== 配置级元自我优化 =====
+  # 自动扫描 config-root 下的全部 YAML 叶子参数；只有安全数值参数才允许建立实验副本。
+  # 运行中能找到数值 @Value 消费者的参数会热应用；其余参数保留实验副本，重启后再人工验证。
+  meta-optimizer:
+    enabled: true
+    interval-ms: 3600000          # 每小时检查一次；样本不足时只观察，不调参
+    initial-delay-ms: 300000      # 启动 5 分钟后开始，避免冷启动噪声
+    min-planning-samples: 50
+    min-wake-samples: 20
+    state-path: data/meta-optimizer/state.json
+    config-root: src/main/resources
+    experiment-dir: data/meta-optimizer/experiments

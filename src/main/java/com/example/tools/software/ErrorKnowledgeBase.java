@@ -6,10 +6,15 @@ import org.springframework.stereotype.Component;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * 常见软件安装错误的本地知识库。
+ *
+ * <p>优先给出确定的离线解决方案；未命中时明确交给联网检索，而不伪造诊断结论。</p>
+ */
 @Component
 public class ErrorKnowledgeBase {
 
-    // 错误关键词 → 解决方案
+    /** 错误关键词到面向用户的解决方案；键值均使用小写进行包含匹配。 */
     private static final Map<String, String> ERROR_SOLUTIONS = new HashMap<>();
 
     static {
@@ -60,6 +65,7 @@ public class ErrorKnowledgeBase {
      * 根据错误信息查询已知解决方案。
      * 如果命中已知错误，返回具体解决方案；否则建议联网搜索。
      */
+    /** 查找本地已知错误的修复建议；未命中则建议使用网络搜索。 */
     @Tool(description = """
             根据错误信息查询已知的解决方案。
             支持 winget 常见错误、权限问题、网络问题等。

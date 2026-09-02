@@ -9,9 +9,13 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 
+/**
+ * 基础文件系统工具。所有操作只使用调用方明确传入的路径，不推测或扩大目标范围。
+ */
 @Component
 public class FileOperations {
 
+    /** 创建目录；返回值区分“已存在”和“创建失败”，便于上层给出正确提示。 */
     @Tool(description = "在指定路径创建文件夹")
     public String createFolder(String path) {
         try {
@@ -26,6 +30,7 @@ public class FileOperations {
         }
     }
 
+    /** 列出单层目录内容，不递归扫描，防止无意间产生大量输出。 */
     @Tool(description = "列出指定目录下的所有文件和文件夹")
     public String listDirectory(String path) {
         try {
@@ -46,6 +51,7 @@ public class FileOperations {
         }
     }
 
+    /** 移动或重命名路径；同名目标会被替换，因此调用前必须确认覆盖意图。 */
     @Tool(description = "移动或重命名文件/文件夹")
     public String moveFile(String source, String target) {
         try {

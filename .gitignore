@@ -32,6 +32,7 @@ out/
 /dist/
 /nbdist/
 /.nb-gradle/
+/novels/
 
 ### VS Code ###
 .vscode/
@@ -44,3 +45,23 @@ target/
 *.log
 *.tar.bz2
 
+# Local runtime and private data
+/data/private/
+/data/diagnostics/
+/data/meta-optimizer/
+/data/novel-materials/
+/novels/
+/fanqie/out/
+/optimization/
+
+# Downloaded archives and native runtime copies
+/*.tgz
+/*.dll
+
+# Diagnostic output
+/scripts/diagnostics/output/
+
+# Local binary dependencies and AI models (installed separately)
+/lib/
+/models/
+/src/main/resources/models/

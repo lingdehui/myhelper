@@ -1,0 +1,13 @@
+# ===== 语义匹配 =====
+myhelper:
+  semantic:
+    related-ratio-threshold: 0.3
+    voice-tone-filter-regex: "[嗯啊哦呢吧吗的了一]"
+
+  # ===== 经验质量评分 =====
+  experience-quality:
+    min-reuse-score: 0.55           # 低于此分数的 PLAN_STEP 不复用，转为重新规划
+    direct-execution-score: 0.80    # ContextUnit 条件满足时直接执行的经验质量
+    evidence-target: 8              # 达到该成功/失败样本数后，样本量维度满分
+    freshness-half-life-days: 90    # 最后验证后每 90 天新鲜度减半
+    refresh-cron: "0 30 3 * * ?"   # 每日刷新旧经验的质量分

@@ -8,9 +8,13 @@ import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * winget 命令的执行封装。统一合并标准输出与错误输出，让调用方能得到可诊断的安装结果。
+ */
 @Component
 public class SoftwareInstaller {
 
+    /** 执行轻量版本查询，作为所有安装动作的前置检查。 */
     @Tool(description = "检查 winget 包管理器是否可用")
     public String checkWingetAvailable() {
         try {
@@ -26,6 +30,7 @@ public class SoftwareInstaller {
         }
     }
 
+    /** 搜索候选包并保留原始命令输出，便于用户选择精确包 ID。 */
     @Tool(description = "搜索 winget 软件包，返回包名、版本和描述。关键词可以是模糊描述，如 'code editor'")
     public String searchSoftware(String keyword) {
         try {
@@ -58,6 +63,7 @@ public class SoftwareInstaller {
         }
     }
 
+    /** 仅接受精确 winget ID，避免模糊关键词导致安装到错误软件。 */
     @Tool(description = "安装指定软件，需要精确的 winget ID（如 'Microsoft.VisualStudioCode'）")
     public String installSoftware(String softwareId) {
         // 先检查 winget 是否可用

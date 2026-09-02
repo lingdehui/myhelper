@@ -1,0 +1,18 @@
+# ===== 对话关键词 + 执行校验 =====
+myhelper:
+  dialog:
+    exit-keywords: ["退出", "再见", "结束对话"]
+    interrupt-keywords: ["停", "打断", "取消"]
+    confirm-keywords: ["好的", "可以", "行", "对", "是", "嗯"]
+    reject-keywords: ["不用", "不需要", "取消", "不对"]
+    supplement-keywords: ["补充", "还要", "还有", "追加", "另外"]
+    # SpeechAssembler 多段语音拼接去抖窗口（ms）
+    debounce-window-ms: 200
+    # AI 回复后的跟随对话窗口（ms），无需重新唤醒即可继续说话
+    follow-up-window-ms: 5000
+    # 跟随窗口开始前的静音等待（ms）
+    follow-up-silence-hint-ms: 1500
+
+  execution:
+    failure-markers: ["❌", "失败", "不存在", "错误", "error", "Error"]
+    ai-failure-keywords: ["无法", "不能", "没有"]

@@ -1,0 +1,41 @@
+# ===== 自主探索引擎配置 =====
+myhelper:
+  # 后台自主任务总开关（同时控制：自主探索 + 规则归纳 + 记忆维护）
+  autonomous:
+    enabled: false
+
+  exploration:
+    # 兼容单独开启探索；未设置时由上方 autonomous.enabled 统一控制。
+    enabled: false
+    exploration-model: model2       # model1=本地qwen3:30b(搞不定请教云端), model2=全程云端DeepSeek, 不配置=默认本地
+    idle-threshold-minutes: 30       # 空闲阈值：用户半小时没动电脑才开启探索
+    max-duration-minutes: 15         # 单次探索最长耗时
+    blackout-hours: []               # 留空=全天可探索
+    base-url: http://localhost:11435/v1      # 模型1: 本地 Ollama（AutoDL RTX3090 SSH隧道）
+    model: qwen3:30b
+    allowed-domains:                 # 浏览器白名单域名
+      - docs.spring.io
+      - developer.mozilla.org
+      - github.com
+      - stackoverflow.com
+
+  # ===== 记忆维护 =====
+  memory-maintenance:
+    cron: 0 0 4 * * ?            # 凌晨4点执行
+    threshold: 0.7                # 触发清理的占用率
+    target: 0.5                   # 清理后目标占用率
+    weights:                         # 价值评分权重
+      recency: 0.3
+      usage: 0.3
+      user-produced: 0.25
+      dependency: 0.15
+    retention-rules:                 # 按来源设置保留天数
+      user-task: 365
+      autonomous-exploration: 90
+      failure-pattern: 180
+      default: 90                    # 未匹配来源的默认保留天数
+
+  # ===== 世界模型维护 =====
+  context-maintenance:
+    cron: 0 30 4 * * ?              # Unit 维护后半小时执行
+    observation-retention-days: 30  # 过期快照保留期；STATE 不按此规则删除

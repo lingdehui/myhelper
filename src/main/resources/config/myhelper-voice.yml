@@ -1,0 +1,27 @@
+# ===== 语音交互 =====
+myhelper:
+  voice:
+    wake-word: "那个谁"
+    sample-rate: 16000
+    energy-threshold: 0.02
+    min-speech-duration-ms: 400
+    max-speech-duration-ms: 10000
+    silence-timeout-ms: 1200
+    tts-echo-drain-ms: 300
+    event-poll-interval-ms: 50
+    wake-word-max-edit-distance: 2  # 元优化器可在 0~3 范围内小步试调；不修改 VAD/声纹安全阈值
+    beep:
+      frequency: 800
+      amplitude: 80
+
+  # --- Silero VAD ---
+  vad:
+    threshold: 0.5
+    min-silence-duration: 0.8
+    min-speech-duration: 0.25
+    max-speech-duration: 8.0
+    window-size: 512
+
+  # --- 声纹 ---
+  voiceprint:
+    max-enrollment-segments: 3

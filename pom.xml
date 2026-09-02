@@ -11,9 +11,9 @@
     </parent>
 
     <groupId>com.example</groupId>
-    <artifactId>desktop-brain</artifactId>
+    <artifactId>myhelper</artifactId>
     <version>1.0.0</version>
-    <name>desktop-brain</name>
+    <name>myhelper</name>
     <description>AI Desktop Assistant - Brain</description>
 
     <properties>
@@ -27,6 +27,12 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Bean Validation (@NotNull, @NotEmpty 等) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
         <!-- Spring AI MCP Client -->
@@ -76,6 +82,19 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
+
+        <!-- ===== Neo4j 知识图谱 ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-neo4j</artifactId>
+        </dependency>
+
+        <!-- ===== Qdrant 向量数据库（REST API） ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+
     </dependencies>
 
     <repositories>
@@ -111,6 +130,7 @@
                     <compilerArgs>
                         <arg>--release</arg>
                         <arg>${java.version}</arg>
+                        <arg>-parameters</arg>
                     </compilerArgs>
                 </configuration>
             </plugin>

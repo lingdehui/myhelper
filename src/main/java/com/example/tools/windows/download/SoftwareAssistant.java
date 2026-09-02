@@ -4,6 +4,9 @@ import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.stereotype.Component;
 
 @Component
+/**
+ * 面向自然语言软件需求的入口，协调软件目录推荐与安装工具。
+ */
 public class SoftwareAssistant {
 
     private final SoftwareCatalog catalog;

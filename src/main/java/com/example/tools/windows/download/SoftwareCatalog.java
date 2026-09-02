@@ -7,6 +7,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 内置软件目录与关键词推荐规则。目录只提供候选项，实际安装仍由 winget 工具负责。
+ */
 @Component
 public class SoftwareCatalog {
 

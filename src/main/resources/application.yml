@@ -1,6 +1,16 @@
 server:
   port: 8082
 spring:
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: false
+  config:
+    import:
+      - classpath:config/myhelper-voice.yml
+      - classpath:config/myhelper-dialog.yml
+      - classpath:config/myhelper-tool.yml
+      - classpath:config/myhelper-semantic.yml
+      - classpath:config/myhelper-exploration.yml
   ai:
     mcp:
       client:
@@ -8,16 +18,64 @@ spring:
           connections:
             robot-mcp:
               url: http://127.0.0.1:8081/mcp
-              request-timeout: 30s  # 单次工具调用最长等30秒
+              request-timeout: 30s
     openai:
-      api-key: sk-5f0c105555904aec8c86953f3a91a528
+      api-key: sk-f2fcd2a4bdb44f02a410c3f030d6fb8b
       base-url: https://api.deepseek.com
-      chat:
-        options:
-          model: deepseek-v4-pro
+  # ===== Neo4j 知识图谱 =====
+  neo4j:
+    uri: bolt://localhost:7687
+    authentication:
+      username: neo4j
+      password: ll425972
+
+# ===== Qdrant 向量数据库 =====
+qdrant:
+  host: localhost
+  port: 6333
+  collection: desktop-memory
+  episodes-collection: episodes      # Episode 经验学习集合（ExpeL/MUSE）
+  vector-size: 1024
+  episode:                            # Episode 检索/淘汰参数
+    similarity-threshold: 0.65        # 向量相似度阈值（bge-m3 中文检索）
+    stability-threshold: 0.6          # 稳定度阈值（success/(success+fail) >= 0.6 才复用）
+    failure-threshold: 3              # 连续失败达此阈值自动归档
+    top-k: 3                          # 向量检索返回数量
+
+# ===== 双模型配置 =====
+myhelper:
+  normal-model: model2                # model1=本地Ollama优先(搞不定请教云端), model2=全程云端DeepSeek
+  deepseek:                           # 模型 2: DeepSeek API（远程）
+    base-url: https://api.deepseek.com
+    api-key: sk-99fb97b7689b4817a9f9a3c2b722637b
+    model: deepseek-v4-flash
+  exploration:
+    exploration-model: model2         # model1=本地, model2=云端
+
+# ===== Home Assistant 智能家居 =====
+homeassistant:
+  url: http://localhost:8123
+  # 安装后在 HA 后台创建长期访问令牌，替换下面的值
+  access-token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIyOWY2MWFlNzFjN2I0NzE5YjMzYzJlZTE5OWY0OGM4NiIsImlhdCI6MTc4NjAyNTYxOCwiZXhwIjoyMTAxMzg1NjE4fQ.zumI0Hb19lCEPq_AR8bfezM8TgdEoenTH7B8d6sqp5o
+
+# ===== Ollama 嵌入模型 =====
+embedding:
+  model: bge-m3
+  cache-size: 256              # 相同文本嵌入复用；设为 0 可关闭并恢复逐次请求
+
+# ===== 小说写作质量门禁 =====
+novel:
+  quality:
+    min-score: 82             # 自动续写低于此分数不提交；严重逻辑/剧透问题始终不放行
+    max-revisions: 2          # 单章最多两次定向修订，避免无限循环和失控消耗
+  verify:
+    enabled: true              # 手动保存章节后的补充批量检查开关
+    batch-threshold: 6         # 手动连续保存时的跨章抽查阈值；自动续写不依赖它
+    batch-gap-minutes: 15      # 两次手动保存间隔超过15分钟视为新一批次
 
 logging:
   level:
     org.springframework.ai.mcp: WARN
     io.modelcontextprotocol: WARN
     org.springframework.web: WARN
+    org.neo4j: WARN

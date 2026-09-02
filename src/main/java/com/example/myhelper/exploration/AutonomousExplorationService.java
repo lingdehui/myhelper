@@ -1,0 +1,685 @@
+package com.example.myhelper.exploration;
+
+import jakarta.annotation.PreDestroy;
+import com.example.myhelper.common.PromptLoader;
+import com.example.myhelper.config.MyHelperProperties;
+import com.example.myhelper.config.SystemEnvironmentService;
+import com.example.myhelper.memory.unit.FailureCause;
+import com.example.myhelper.memory.unit.UnitFailureService;
+import com.example.myhelper.memory.unit.UnitStore;
+import com.example.myhelper.memory.vector.category.ToolCategoryService;
+import com.example.myhelper.service.TurnProcessor;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.example.myhelper.config.ModelRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.tool.ToolCallback;
+import org.springframework.ai.tool.ToolCallbackProvider;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * 自主探索服务：空闲时收集上下文 → LLM 决策 → 提交后台执行。
+ */
+@Service
+public class AutonomousExplorationService {
+
+    private static final Logger log = LoggerFactory.getLogger(AutonomousExplorationService.class);
+
+    private final IdleDetectionService idleDetection;
+    private final UnitStore unitStore;
+    private final UnitFailureService unitFailureService;
+    private final TurnProcessor turnProcessor;
+    private final PromptLoader promptLoader;
+    private final MyHelperProperties props;
+    private final ObjectMapper objectMapper;
+
+    private final ModelRouter modelRouter;
+    private final ToolCategoryService categoryService;
+    private volatile ToolCallback[] tools;  // volatile: 启动后由 MyHelperApplication 设置完整列表
+    private final SystemEnvironmentService envService;
+
+    /**
+     * 会话状态和执行器双重保证串行：锁避免提交竞态，单线程执行器避免抢占屏幕/浏览器。
+     * 超时只请求中断，不会在旧会话退出前放行新的会话。
+     */
+    private final ReentrantLock exploreLock = new ReentrantLock();
+    private final ExecutorService explorationExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "myhelper-exploration");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private volatile boolean sessionActive;
+    private volatile boolean timeoutCancellationRequested;
+    private volatile Future<?> activeSession;
+    private volatile long exploreStartTime = 0;
+
+    /** 动态基础能力映射：工具名+描述 → 能力分组（setAllTools 时自动构建，随工具变化而更新） */
+    private record CapabilityDef(String name, List<String> toolNames, String taskHint) {}
+
+    /** 探索摘要：每轮学习压缩成单行，避免注入完整学习记录（上下文膨胀治理核心） */
+    private record ExplorationSummary(String goal, String tools, String result, String lesson) {
+        String toText() {
+            return String.format("[%s] | 工具:%s | 结果:%s | 教训:%s", goal, tools, result, lesson);
+        }
+    }
+
+    private volatile Map<String, CapabilityDef> dynamicCapabilities = Map.of();
+
+    /** 探索摘要环形缓冲：压缩每轮学习结果，最多保留 5 条 */
+    private final Deque<ExplorationSummary> summaries = new ArrayDeque<>();
+    private static final int SUMMARY_BUFFER_MAX = 5;
+
+    /** 黑名单阈值：同一目标 FAILED 次数 ≥ 此值才拉黑 */
+    private static final int BLACKLIST_THRESHOLD = 2;
+
+    /** Token 守卫：探索决策上下文估算值超过此上限则放弃本轮（止血，防止撞 1M 上限） */
+    private static final int MAX_CONTEXT_TOKENS = 800_000;
+
+    public AutonomousExplorationService(IdleDetectionService idleDetection,
+                                         UnitStore unitStore,
+                                         UnitFailureService unitFailureService,
+                                         TurnProcessor turnProcessor,
+                                         PromptLoader promptLoader,
+                                         MyHelperProperties props,
+                                         ModelRouter modelRouter,
+                                         ToolCategoryService categoryService,
+                                         SystemEnvironmentService envService) {
+        this.idleDetection = idleDetection;
+        this.unitStore = unitStore;
+        this.unitFailureService = unitFailureService;
+        this.turnProcessor = turnProcessor;
+        this.promptLoader = promptLoader;
+        this.props = props;
+        this.objectMapper = new ObjectMapper();
+        this.modelRouter = modelRouter;
+        this.categoryService = categoryService;
+        this.tools = new ToolCallback[0];  // 占位，启动后 setAllTools() 会填充
+        this.envService = envService;
+    }
+
+    /** 由 MyHelperApplication 在启动后调用，传入完整工具列表（含生成工具） */
+    public void setAllTools(ToolCallback[] allTools) {
+        this.tools = allTools;
+        this.dynamicCapabilities = buildDynamicCapabilities(allTools);
+        log.info("🔧 探索服务已接收 {} 个工具, 检测到 {} 项基础能力", allTools.length, dynamicCapabilities.size());
+    }
+
+    /**
+     * 定时巡检：每 1 分钟尝试触发一次探索会话；运行中的会话不会并发。
+     * 与手动触发（ExplorationTool）共享同一入口。
+     */
+    @Scheduled(fixedDelayString = "${myhelper.exploration.check-interval-ms:60000}",
+               initialDelayString = "${myhelper.exploration.initial-delay-ms:60000}")
+    public void scheduledExplore() {
+        // 串行执行：同一时间只能有一个探索会话（操作屏幕/浏览器不能并发）
+        tryExplore();
+    }
+
+    /**
+     * 检查并触发探索（由定时任务或外部调用）。
+     * 异步执行，不阻塞调用方。
+     */
+    public void tryExplore() {
+        // 空闲检查：用户半小时没动电脑才开启探索
+        if (!idleDetection.shouldExplore()) return;
+        doExplore();
+    }
+
+    /** 手动/强制触发探索，跳过空闲和免打扰检查。 */
+    public void forceExplore() {
+        doExplore();
+    }
+
+    private void doExplore() {
+        requestTimedOutSessionCancellation();
+        if (sessionActive || !exploreLock.tryLock()) {
+            log.info("⏭️ 上一个探索会话仍在运行（屏幕/浏览器被占用），跳过本次");
+            return;
+        }
+        try {
+            // tryLock 到这里前会话可能已经开始或结束，需再次确认。
+            if (sessionActive) {
+                log.info("⏭️ 上一个探索会话仍在运行（屏幕/浏览器被占用），跳过本次");
+                return;
+            }
+            sessionActive = true;
+            timeoutCancellationRequested = false;
+            exploreStartTime = System.currentTimeMillis();
+            activeSession = explorationExecutor.submit(this::runExploreSession);
+        } finally {
+            exploreLock.unlock();
+        }
+    }
+
+    /** 真正的会话体始终由单线程执行器运行，绝不与另一探索会话并行。 */
+    private void runExploreSession() {
+        exploreLock.lock();
+        try {
+                log.info("🔍 开始自主探索会话...");
+
+                // 0. 拉取已有数据（供兜底判断用）
+                List<UnitStore.LearnedUnit> learnedTopics =
+                        unitStore.getRecentLearnedUnits(15);
+                List<UnitStore.AttemptedUnit> attemptedTopics =
+                        unitStore.getRecentlyAttemptedUnits(20);
+
+                // 0.5 P0-1: 构建失败目标黑名单（同一目标 FAILED ≥2次 → 跳过，但已有 ACTIVE 的不拉黑）
+                Map<String, Integer> blacklisted = buildBlacklist(attemptedTopics, learnedTopics);
+
+                // 1. 收集上下文（传入黑名单用于过滤候选）
+                String context = buildContext(learnedTopics, attemptedTopics, blacklisted);
+
+                // 1.5 Token 守卫：上下文超限立刻终止，防止再撞 1M 上限
+                if (estimateTokens(context) > MAX_CONTEXT_TOKENS) {
+                    log.warn("🛑 探索上下文超限（约 {} tokens > {}），放弃本轮", estimateTokens(context), MAX_CONTEXT_TOKENS);
+                    return;
+                }
+
+                // 2. LLM 决策
+                ExplorationDecision decision = decide(context);
+
+                // 3. 兜底：AI SKIP了但基础能力还有缺失 → 强制LEARN
+                if ((decision == null || "SKIP".equalsIgnoreCase(decision.decision()))) {
+                    List<String> missingBasics = computeMissingBasics(learnedTopics, blacklisted);
+                    if (!missingBasics.isEmpty()) {
+                        String firstMissing = missingBasics.get(0);
+                        CapabilityDef def = dynamicCapabilities.get(firstMissing);
+                        String task = def != null ? def.taskHint() : "学习" + firstMissing;
+                        log.info("🛡️ AI 想SKIP但基础能力缺失，强制LEARN: {}", firstMissing);
+                        decision = new ExplorationDecision(
+                                "LEARN",
+                                "基础能力缺失，强制学习: " + firstMissing,
+                                task,
+                                "internal_tool_probing",
+                                List.of("鼠标键盘", "文件与窗口", "浏览器与Web"),
+                                List.of("选择对应工具", "执行基础操作", "验证操作成功"),
+                                "成功掌握" + firstMissing + "的基本用法",
+                                "工具调用返回成功结果",
+                                "HIGH"
+                        );
+                    } else {
+                        log.info("⏭️ 探索跳过: {}", decision != null ? decision.reason() : "决策失败");
+                        return;
+                    }
+                }
+
+                // 3.5 P0-1: 判断目标是否在黑名单中 → 拦截
+                if (isBlacklisted(decision.learningGoal(), blacklisted)) {
+                    log.warn("⏭️ 探索目标已被黑名单拦截（已失败≥{}次）: {} → 跳过", BLACKLIST_THRESHOLD, decision.learningGoal());
+                    return;
+                }
+
+                log.info("📚 探索目标: {} (方法: {}, 分类: {}, 优先级: {})", decision.learningGoal(), decision.learningMethod(), decision.toolCategories(), decision.priority());
+
+                // 4. 将学习目标送入主流程管线（TurnProcessor），复用 Plan→Execute→Reflect→Store
+                String methodHint = switch (decision.learningMethod()) {
+                    case "internal_tool_probing" -> "【学习方法：工具探测】在临时环境中测试已有工具的参数组合，发现新用法。你可以组合调用多个工具来探索它们的边界行为。";
+                    case "web_research" -> "【学习方法：网络研究】使用浏览器工具搜索技术文档、阅读网页、提取并摘要关键信息。可以访问任意网址，优先查阅技术文档。";
+                    case "download_and_learn" -> "【学习方法：下载实操】先检查电脑是否已有该软件（防重复下载）→ 用 createLearningWorkspace 创建临时目录 → 下载安装到临时目录 → 试用并记录 → 学完调用 cleanupLearningWorkspace 删除整个临时目录。下载前后都在知识库记录软件状态！";
+                    default -> "【学习方法：自由探索】你可以自己决定用什么方式学习，使用任何可用的工具。";
+                };
+
+                // P0-2: 构建相关工具列表摘要（前30个工具名+描述，硬注入不让AI想象）
+                String relevantToolsSummary = buildRelevantToolsSummary(decision);
+
+                String learningInput = "【自主学习会话】\n" + methodHint
+                        + "\n\n" + relevantToolsSummary
+                        + "\n\n⚠️ 工具搜索提示：工具的 name 都是英文（如 leftClick、findTextOnScreen），但 searchTool 用的是向量语义搜索，中文关键词也能匹配到英文工具。调用 searchTool 时同时传入中英文两个关键词最稳妥，例如 searchTool(\"鼠标控制\", \"mouse click\") —— 系统先按中文语义搜、搜不到自动用英文兜底。规划前可先调用 listAllTools 查看全部工具名称。"
+                        + "\n\n学习目标：" + decision.learningGoal()
+                        + "\n期望成果：" + decision.expectedOutcome()
+                        + "\n成功标准：" + decision.successCriteria();
+                turnProcessor.processExploration(modelRouter, tools, learningInput);
+
+        } catch (Exception e) {
+            log.error("❌ 自主探索决策失败", e);
+        } finally {
+            sessionActive = false;
+            timeoutCancellationRequested = false;
+            activeSession = null;
+            exploreStartTime = 0;
+            exploreLock.unlock();
+        }
+    }
+
+    /** 使用配置时长请求取消；即使底层操作不响应中断，也保持会话占用以避免并发操作。 */
+    private void requestTimedOutSessionCancellation() {
+        if (!sessionActive || timeoutCancellationRequested) return;
+        long maxDurationMs = Math.max(1, props.exploration().maxDurationMinutes()) * 60_000L;
+        long elapsed = System.currentTimeMillis() - exploreStartTime;
+        if (elapsed <= maxDurationMs) return;
+
+        timeoutCancellationRequested = true;
+        Future<?> session = activeSession;
+        if (session != null) session.cancel(true);
+        log.warn("⏰ 探索会话已运行 {} 秒（上限 {} 秒），已请求取消；将在当前会话退出后再允许下一次探索。",
+                elapsed / 1_000, maxDurationMs / 1_000);
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        Future<?> session = activeSession;
+        if (session != null) session.cancel(true);
+        explorationExecutor.shutdownNow();
+    }
+
+    /** 估算文本 token 数（粗略：字符数 / 3，用于上下文止血守卫） */
+    private int estimateTokens(String text) {
+        return text == null || text.isBlank() ? 0 : text.length() / 3;
+    }
+
+    /** 加入一条探索摘要（新摘要放最前，超出上限移除最旧） */
+    private void addSummary(ExplorationSummary summary) {
+        summaries.addFirst(summary);
+        while (summaries.size() > SUMMARY_BUFFER_MAX) summaries.removeLast();
+    }
+
+    /** 取最近 n 条探索摘要（最新在前） */
+    private List<ExplorationSummary> getRecentSummaries(int n) {
+        return summaries.stream().limit(n).toList();
+    }
+
+    /** 从持久化近期已学单元重建摘要缓冲（重启后仍保留记忆，learnedTopics 已按时间倒序） */
+    private void syncSummaries(List<UnitStore.LearnedUnit> learnedTopics) {
+        summaries.clear();
+        if (learnedTopics == null) return;
+        List<ExplorationSummary> built = new ArrayList<>();
+        for (UnitStore.LearnedUnit t : learnedTopics) {
+            built.add(new ExplorationSummary(
+                    t.goal(),
+                    t.toolNames() != null ? String.join(",", t.toolNames()) : "",
+                    "成功",
+                    t.lesson() != null ? t.lesson() : ""));
+            if (built.size() >= SUMMARY_BUFFER_MAX) break;
+        }
+        // built 是 newest-first，addSummary 用 addFirst，倒序加入保证最新在前
+        for (int i = built.size() - 1; i >= 0; i--) {
+            addSummary(built.get(i));
+        }
+    }
+
+    /** 构建上下文 prompt（瘦身版：只注入精简摘要、Top2 失败、缺失能力，不注入全量工具清单） */
+    private String buildContext(List<UnitStore.LearnedUnit> learnedTopics,
+                                 List<UnitStore.AttemptedUnit> attemptedTopics,
+                                 Map<String, Integer> blacklisted) {
+        // 失败模式：只注入最近 Top 2（相关性由 AI 自行判断）
+        List<FailureCause> failures = unitFailureService.getRecentFailureCauses(2);
+        StringBuilder failureText = new StringBuilder("无");
+        if (failures != null && !failures.isEmpty()) {
+            failureText.setLength(0);
+            failures.forEach(f -> failureText.append("- [").append(f.category()).append("] ")
+                    .append(f.reason()).append("\n"));
+        }
+
+        // 近期已学：先同步摘要缓冲，再只注入最近 3 条单行摘要（压缩器输出）
+        syncSummaries(learnedTopics);
+        StringBuilder learnedText = new StringBuilder("暂无");
+        List<ExplorationSummary> recentSummaries = getRecentSummaries(3);
+        if (!recentSummaries.isEmpty()) {
+            learnedText.setLength(0);
+            recentSummaries.forEach(s -> learnedText.append("- ").append(s.toText()).append("\n"));
+        }
+
+        // 近期尝试过的主题（包括失败的，让AI避免原地打转）
+        // P0-1: 标注黑名单目标
+        StringBuilder attemptedText = new StringBuilder("暂无");
+        if (attemptedTopics != null && !attemptedTopics.isEmpty()) {
+            attemptedText.setLength(0);
+            for (UnitStore.AttemptedUnit t : attemptedTopics) {
+                String marker = isBlacklisted(t.goal(), blacklisted) ? " ⛔已黑名单" : "";
+                attemptedText.append("- [").append(t.status()).append("] ").append(t.goal()).append(marker).append("\n");
+            }
+        }
+
+        // 缺失基础能力（只注入缺失项，替代完整难度分级清单）
+        String capabilityInventory = buildCapabilityInventory(learnedTopics, blacklisted);
+
+        // 知识库数量（从 Qdrant 实时查询 ACTIVE 总数）
+        int knowledgeCount = unitStore.countActiveUnits();
+
+        String template = promptLoader.getAutonomousExploration();
+        return template
+                .replace("{os_info}", envService.getOsInfo())
+                .replace("{unresolved_failures}", failureText.toString())
+                .replace("{recently_learned}", learnedText.toString())
+                .replace("{capability_inventory}", capabilityInventory)
+                .replace("{recently_attempted}", attemptedText.toString())
+                .replace("{unsolved_questions}", "暂无记录")
+                .replace("{tool_list_with_usage}", "（未预注入，需要时用 searchTool / listAllTools 查询）")
+                .replace("{knowledge_count}", String.valueOf(knowledgeCount));
+    }
+
+    // ========== 能力清单：难度分级（动态，基于实际工具） ==========
+
+    /** 能力检测规则：工具名/描述匹配 → 基础能力名称。只定义分类逻辑，不写死具体工具。 */
+    private static final java.util.LinkedHashMap<String, String> CAPABILITY_RULES = new java.util.LinkedHashMap<>();
+    static {
+        // 工具名或描述中包含这些关键词 → 归类到对应基础能力
+        CAPABILITY_RULES.put("截屏",        "screenshot|capture.*screen|截图|截屏|screen.*capture|snapshot");
+        CAPABILITY_RULES.put("滚动页面",    "scroll|page.*down|page.*up|翻页|往下翻|往上翻");
+        CAPABILITY_RULES.put("OCR识别文字",  "ocr|findText|readText|文字识别|光学字符|find.*text.*screen");
+        CAPABILITY_RULES.put("读文件",       "read.*file|readFile|读文件|^read_|getFileContent|cat");
+        CAPABILITY_RULES.put("写文件",       "write.*file|writeFile|写文件|^write_|save.*file|echo");
+        CAPABILITY_RULES.put("鼠标点击",     "click|leftClick|rightClick|doubleClick|点击|鼠标.*击");
+        CAPABILITY_RULES.put("键盘输入",     "type|keyboard|按键|press.*key|输入文字|keyPress");
+        CAPABILITY_RULES.put("打开网页",     "browser|navigate|chromium|打开.*网页|open.*url|goto");
+        CAPABILITY_RULES.put("移动鼠标",     "mouse.*move|moveMouse|移动鼠标|move.*cursor|moveTo");
+    }
+
+    /** 扫描所有工具，自动归类到基础能力分组 → 生成 CapabilityDef */
+    private Map<String, CapabilityDef> buildDynamicCapabilities(ToolCallback[] allTools) {
+        Map<String, List<String>> groups = new LinkedHashMap<>();
+        Map<String, String> firstDescriptions = new LinkedHashMap<>();
+
+        for (ToolCallback tc : allTools) {
+            String name = tc.getToolDefinition().name();
+            String desc = tc.getToolDefinition().description();
+            String combined = (name + " " + (desc != null ? desc : "")).toLowerCase();
+
+            for (var entry : CAPABILITY_RULES.entrySet()) {
+                if (combined.matches(".*(" + entry.getValue() + ").*")) {
+                    groups.computeIfAbsent(entry.getKey(), k -> new ArrayList<>()).add(name);
+                    firstDescriptions.putIfAbsent(entry.getKey(),
+                            desc != null && desc.length() > 0 ? desc : name);
+                    break; // 一个工具只归入第一个匹配的能力
+                }
+            }
+        }
+
+        Map<String, CapabilityDef> result = new LinkedHashMap<>();
+        for (var entry : groups.entrySet()) {
+            String capName = entry.getKey();
+            List<String> toolNames = entry.getValue();
+            String desc = firstDescriptions.getOrDefault(capName, "");
+            // 从工具描述截取前40字作为任务提示
+            String hint = desc.length() > 40 ? desc.substring(0, 40) + "..." : desc;
+            result.put(capName, new CapabilityDef(capName, toolNames,
+                    "学习" + capName + "：使用 " + String.join("/", toolNames.subList(0, Math.min(3, toolNames.size()))) + " → 验证操作成功"));
+        }
+        return Collections.unmodifiableMap(result);
+    }
+
+    /** 构建能力清单（瘦身版）：只注入缺失的基础能力候选 + 黑名单，不注入完整难度分级清单 */
+    private String buildCapabilityInventory(List<UnitStore.LearnedUnit> learnedTopics,
+                                             Map<String, Integer> blacklisted) {
+        List<String> missingBasics = computeMissingBasics(learnedTopics, blacklisted);
+
+        StringBuilder sb = new StringBuilder();
+
+        // P0-1: 被黑名单拦截的能力单独提示
+        if (!blacklisted.isEmpty()) {
+            sb.append("⛔ 已冻结能力（多次失败，跳过）：");
+            sb.append(String.join("、", blacklisted.keySet()));
+            sb.append("\n");
+        }
+
+        // 缺失的基础能力（附具体学习任务，AI必须从中选，黑名单已过滤）
+        if (!missingBasics.isEmpty()) {
+            sb.append("⚠️ 你必须从以下候选任务中选择一个学习（禁止SKIP！）：\n");
+            int idx = 1;
+            for (String b : missingBasics) {
+                CapabilityDef def = dynamicCapabilities.get(b);
+                String task = def != null ? def.taskHint() : "学习" + b;
+                sb.append("  候选").append(idx).append(": 【").append(b).append("】").append(task).append("\n");
+                idx++;
+            }
+            sb.append("  用 internal_tool_probing 方法，工具分类选「鼠标键盘」或「文件与窗口」或「浏览器与Web」。\n");
+        } else if (!blacklisted.isEmpty()) {
+            sb.append("⚠️ 所有基础能力已被尝试但部分被冻结。请在非冻结的已有能力基础上向难度⭐⭐扩展。\n");
+        } else {
+            sb.append("✅ 基础能力已覆盖，可以在已有基础上向难度⭐⭐扩展。\n");
+        }
+
+        return sb.toString();
+    }
+
+    /** 从 learnedTopics + 动态能力映射计算缺失的基础能力（黑名单已过滤） */
+    private List<String> computeMissingBasics(List<UnitStore.LearnedUnit> learnedTopics,
+                                                Map<String, Integer> blacklisted) {
+        if (dynamicCapabilities.isEmpty()) return List.of();
+
+        // 收集已学主题中覆盖的能力名称
+        Set<String> covered = new HashSet<>();
+        List<UnitStore.LearnedUnit> safe = learnedTopics != null ? learnedTopics : List.of();
+        for (UnitStore.LearnedUnit t : safe) {
+            String combined = (t.goal() != null ? t.goal() : "")
+                    + " " + String.join(" ", t.toolNames() != null ? t.toolNames() : List.of());
+            for (var entry : CAPABILITY_RULES.entrySet()) {
+                if (combined.toLowerCase().matches(".*(" + entry.getValue() + ").*")) {
+                    covered.add(entry.getKey());
+                }
+            }
+        }
+
+        // P0-1: 黑名单过滤 — 被黑名单拦截的能力不列入候选
+        List<String> missing = new ArrayList<>();
+        for (String capName : dynamicCapabilities.keySet()) {
+            if (covered.contains(capName)) continue;
+            // 检查该能力的 taskHint 是否匹配黑名单中的任何目标
+            CapabilityDef def = dynamicCapabilities.get(capName);
+            if (def != null && isBlacklisted(def.taskHint(), blacklisted)) {
+                log.info("⛔ 能力「{}」已被黑名单拦截（taskHint: {}），跳过", capName, def.taskHint());
+                continue;
+            }
+            if (isBlacklisted(capName, blacklisted)) {
+                log.info("⛔ 能力名「{}」已被黑名单拦截，跳过", capName);
+                continue;
+            }
+            missing.add(capName);
+        }
+        return missing;
+    }
+
+    /** 从 AI 返回的文本中提取 JSON 对象 */
+    private static String extractJson(String text) {
+        if (text == null || text.isBlank()) return null;
+        String s = text.trim();
+        // 0. 去掉可能的思考标签（如 deepseek-r1 的 <｜end▁of▁thinking｜>...）
+        s = s.replaceAll("(?s)___[^_]*___", "");
+        s = s.replaceAll("(?s)^\\s*", "");
+        s = s.trim();
+        // 1. 去掉 markdown 代码块
+        s = s.replaceAll("(?s)```[a-zA-Z]*\\s*", "```"); // normalize ```json → ```
+        if (s.startsWith("```")) {
+            s = s.substring(3);
+            int end = s.lastIndexOf("```");
+            if (end > 0) s = s.substring(0, end);
+        }
+        s = s.trim();
+        // 2. 找第一个 { 或 [ 到对应的结尾
+        int start = s.indexOf('{');
+        if (start < 0) start = s.indexOf('[');
+        if (start < 0) return null;
+        int depth = 0;
+        boolean inString = false;
+        boolean escaped = false;
+        char openChar = s.charAt(start);
+        char closeChar = openChar == '{' ? '}' : ']';
+        for (int i = start; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (inString) {
+                if (escaped) { escaped = false; continue; }
+                if (c == '\\') { escaped = true; continue; }
+                if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == openChar) depth++;
+            else if (c == closeChar) { depth--; if (depth == 0) return s.substring(start, i + 1); }
+        }
+        return null;
+    }
+
+    // ========== P0-1: 黑名单机制 ==========
+
+    /** 从最近尝试主题构建黑名单：同一目标 FAILED ≥2次 → 列入。已有 ACTIVE 经验的目标不拉黑。 */
+    private Map<String, Integer> buildBlacklist(List<UnitStore.AttemptedUnit> attemptedTopics,
+                                                 List<UnitStore.LearnedUnit> learnedTopics) {
+        Map<String, Integer> blacklisted = new LinkedHashMap<>();
+
+        // 先收集已掌握的目标（ACTIVE），这些不拉黑
+        Set<String> masteredGoals = new LinkedHashSet<>();
+        if (learnedTopics != null) {
+            for (UnitStore.LearnedUnit lt : learnedTopics) {
+                String normalized = normalizeGoal(lt.goal());
+                if (!normalized.isBlank()) masteredGoals.add(normalized);
+            }
+        }
+
+        // 统计每个目标的 FAILED 次数，只有 ≥ BLACKLIST_THRESHOLD 才真正拉黑
+        Map<String, Integer> failCounts = new LinkedHashMap<>();
+        if (attemptedTopics != null) {
+            for (UnitStore.AttemptedUnit t : attemptedTopics) {
+                if (!"FAILED".equalsIgnoreCase(t.status())) continue;
+                String key = normalizeGoal(t.goal());
+                if (key.isBlank()) continue;
+
+                // 已有 ACTIVE 成功经验 → 不拉黑
+                if (masteredGoals.contains(key)) {
+                    log.debug("🛡️ 不拉黑 '{}'（已有 ACTIVE 成功经验）", t.goal());
+                    continue;
+                }
+                failCounts.merge(key, 1, Integer::sum);
+            }
+        }
+
+        for (var entry : failCounts.entrySet()) {
+            if (entry.getValue() >= BLACKLIST_THRESHOLD) {
+                blacklisted.put(entry.getKey(), entry.getValue());
+                log.debug("⛔ 黑名单: {}（FAILED {}次）", entry.getKey(), entry.getValue());
+            }
+        }
+        return blacklisted;
+    }
+
+    /** 检查目标是否在黑名单中（模糊匹配：归一化后包含） */
+    private boolean isBlacklisted(String goal, Map<String, Integer> blacklisted) {
+        if (goal == null || goal.isBlank() || blacklisted.isEmpty()) return false;
+        String normalized = normalizeGoal(goal);
+        if (normalized.length() < 5) return false; // 太短不判断
+        // 精确匹配
+        if (blacklisted.containsKey(normalized)) return true;
+        // 模糊匹配：黑名单中的 key 是 normalized goal 的子串
+        for (String blocked : blacklisted.keySet()) {
+            if (blocked.length() < 5) continue;
+            if (normalized.contains(blocked) || blocked.contains(normalized)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 目标归一化：去标点、空白、小写 */
+    private String normalizeGoal(String goal) {
+        if (goal == null || goal.isBlank()) return "";
+        return goal.replaceAll("[\\s\\p{P}]", "").toLowerCase();
+    }
+
+    // ========== P0-2: 强制工具发现 ==========
+
+    /** 构建与决策目标相关的工具摘要（按选中分类查工具，不发全量） */
+    private String buildRelevantToolsSummary(ExplorationDecision decision) {
+        List<String> relevantCategories = decision.toolCategories();
+        if (relevantCategories == null || relevantCategories.isEmpty()) {
+            return "（未指定分类，需要时用 searchTool / listAllTools 查询工具）";
+        }
+
+        // 工具名 → 描述 映射（只在需要时取描述，避免全量注入）
+        Map<String, String> descMap = new LinkedHashMap<>();
+        if (tools != null) {
+            for (ToolCallback tc : tools) {
+                String d = tc.getToolDefinition().description();
+                descMap.put(tc.getToolDefinition().name(), d != null ? d : "");
+            }
+        }
+
+        StringBuilder sb = new StringBuilder("📋 相关分类工具清单（必须使用已有工具，禁止调用不存在的工具名）：\n");
+        int total = 0;
+        for (String catName : relevantCategories) {
+            Optional<ToolCategoryService.CategorySummary> cat = categoryService.findByName(catName);
+            if (cat.isEmpty()) continue;
+            List<String> catTools = cat.get().toolNames();
+            if (catTools == null || catTools.isEmpty()) continue;
+
+            sb.append("  【").append(cat.get().name()).append("】\n");
+            for (String t : catTools) {
+                String desc = descMap.getOrDefault(t, "");
+                String shortDesc = desc.length() > 80 ? desc.substring(0, 80) + "..." : desc;
+                sb.append("    - ").append(t);
+                if (!shortDesc.isBlank()) sb.append(" — ").append(shortDesc);
+                sb.append("\n");
+                total++;
+            }
+        }
+
+        if (total == 0) {
+            return "（所选分类下未找到工具，需要时用 searchTool / listAllTools 查询）";
+        }
+        return sb.toString();
+    }
+
+    /** 获取探索用 ChatClient — 统一走 ModelRouter */
+    private ChatClient explorationClient() {
+        return modelRouter.chat(ModelRouter.Mode.EXPLORATION);
+    }
+
+    /** 调用模型做探索决策 */
+    private ExplorationDecision decide(String context) {
+        try {
+            String response = explorationClient().prompt()
+                    .user(context)
+                    .call()
+                    .content();
+
+            if (response == null || response.isBlank()) {
+                log.warn("⏭️ 探索决策: AI 返回空响应");
+                return null;
+            }
+
+            String json = extractJson(response);
+            if (json == null) {
+                log.warn("⏭️ 探索决策: 无法提取 JSON（前 200 字符）: {}", response.substring(0, Math.min(200, response.length())));
+                return null;
+            }
+
+            Map<String, Object> map = objectMapper.readValue(json,
+                    new TypeReference<Map<String, Object>>() {});
+
+            String decision = String.valueOf(map.getOrDefault("decision", "SKIP"));
+            if ("SKIP".equalsIgnoreCase(decision)) {
+                String reason = String.valueOf(map.getOrDefault("reason", ""));
+                return new ExplorationDecision("SKIP", reason, null, null, null, null, null, null, "LOW");
+            }
+
+            @SuppressWarnings("unchecked")
+            List<String> steps = (List<String>) map.get("steps");
+            @SuppressWarnings("unchecked")
+            List<String> toolCategories = (List<String>) map.get("toolCategories");
+            String learningMethod = String.valueOf(map.getOrDefault("learningMethod", "other"));
+
+            return new ExplorationDecision(
+                    "LEARN",
+                    String.valueOf(map.getOrDefault("reason", "")),
+                    String.valueOf(map.getOrDefault("learningGoal", "")),
+                    learningMethod,
+                    toolCategories != null ? toolCategories : List.of(),
+                    steps != null ? steps : List.of(),
+                    String.valueOf(map.getOrDefault("expectedOutcome", "")),
+                    String.valueOf(map.getOrDefault("successCriteria", "")),
+                    String.valueOf(map.getOrDefault("priority", "MEDIUM"))
+            );
+
+        } catch (Exception e) {
+            log.error("❌ 探索决策失败: {}", e.getMessage());
+            return null;
+        }
+    }
+}
