@@ -24,11 +24,19 @@ spring:
 
 # ===== Qdrant 向量数据库 =====
 qdrant:
+  # REST 连接协议；远程服务可改为 https。
+  scheme: http
   host: localhost
   port: 6333
   collection: desktop-memory
   episodes-collection: episodes      # Episode 经验学习集合（ExpeL/MUSE）
   vector-size: 768
+  # 初始化时按配置检查现有集合，不覆盖不匹配的集合。
+  distance: Cosine
+  # 连接及单次请求的等待上限。
+  request-timeout: 30s
+  # 本地无认证时为空，部署时从环境变量提供。
+  api-key: ${QDRANT_API_KEY:}
   episode:                            # Episode 检索/淘汰参数
     similarity-threshold: 0.65        # 向量相似度阈值（nomic-embed-text 中文短句推荐 0.65）
     stability-threshold: 0.6          # 稳定度阈值（success/(success+fail) >= 0.6 才复用）
