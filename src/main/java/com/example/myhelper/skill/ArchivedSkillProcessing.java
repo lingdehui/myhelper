@@ -50,7 +50,7 @@ public final class ArchivedSkillProcessing implements RunArchivePort.Listener {
         if (run == null) {
             throw new IllegalStateException("收到提交信号但找不到工具执行归档 " + ref);
         }
-        if (run.internalValidation() || !run.graphComplete()) {
+        if (run.internalValidation() || !run.graphComplete() || !run.evidenceComplete()) {
             return;
         }
         recorder.record(run);

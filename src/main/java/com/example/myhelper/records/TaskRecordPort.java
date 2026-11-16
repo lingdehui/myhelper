@@ -8,7 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * 外部任务记录与恢复事项模块的合同；StoredTaskRecords 提供统一存储的生产实现。
+ * 外部任务记录与恢复事项模块的合同，由宿主提供权威仓储实现。
  * 原任务、事件、进度、问题状态、版本及恢复领取的权威数据由实现方管理。
  * 循环只发送事实并读取结论，不从失败码推断回滚，也不自行关闭待处理问题。
  */
@@ -61,7 +61,7 @@ public interface TaskRecordPort {
      */
     void endRun(RunClaim claim, ExecutionEvent event);
 
-    /** 完整收尾提交；生产实现须在同一事务中保存归档、结束事件、释放领取和固化待办。 */
+    /** 同一事务保存归档和结束事件、释放领取。图和证据均完整的用户运行才可进入固化待办。 */
     default void endRun(RunClaim claim, RunFinalization finalization) {
         // 兼容旧端口；只有覆盖本重载的实现才提供图归档保证。
         endRun(claim, finalization.event());
@@ -72,16 +72,24 @@ public interface TaskRecordPort {
             ExecutionEvent event,
             /** 图未创建或读取失败时为空，不伪造空成功图。 */
             com.example.myhelper.orchestration.ExecutionTraceStore.Snapshot graph,
-            /** 执行图已封闭完整，且逐阶段事实均无未确认写入时才为 true。 */
+            /** 执行图已封闭且结构完整时为 true。 */
             boolean graphComplete,
-            /** 执行图或逐阶段事实记录的缺口。 */
-            List<String> gaps) {
+            /** 执行图结构或快照的缺口。 */
+            List<String> gaps,
+            /** 未取得写入确认的逐阶段事实。 */
+            List<String> evidenceGaps) {
+        public RunFinalization(ExecutionEvent event, com.example.myhelper.orchestration.ExecutionTraceStore.Snapshot graph,
+                               boolean graphComplete, List<String> gaps) {
+            this(event, graph, graphComplete, gaps, List.of());
+        }
+
         public RunFinalization {
             Objects.requireNonNull(event);
             if (event.kind() != EventKind.RUN_ENDED) {
                 throw new IllegalArgumentException("最终提交必须包含 RUN_ENDED");
             }
             gaps = List.copyOf(gaps);
+            evidenceGaps = List.copyOf(evidenceGaps);
             if (graph != null) {
                 graph = new com.example.myhelper.orchestration.ExecutionTraceStore.Snapshot(
                         Map.copyOf(graph.nodes()), List.copyOf(graph.edges()), List.copyOf(graph.events()), graph.closed());
@@ -108,6 +116,11 @@ public interface TaskRecordPort {
                     }
                 }
             }
+        }
+
+        /** 本次运行没有已知写入未确认的事实。 */
+        public boolean evidenceComplete() {
+            return evidenceGaps.isEmpty();
         }
     }
 

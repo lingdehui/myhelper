@@ -26,7 +26,7 @@ public final class ArchivedToolParameterRecorder {
     }
 
     public void record(ArchivedRun run) {
-        if (run.internalValidation() || !run.graphComplete()) {
+        if (run.internalValidation() || !run.graphComplete() || !run.evidenceComplete()) {
             return;
         }
         Map<String, ToolRef> bindings = new LinkedHashMap<>();

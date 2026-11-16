@@ -90,7 +90,7 @@ public final class CapabilityLookup implements CapabilitySearchPort {
     // 先获取新候选，再做业务合同匹配；缓存只用于加载内容。
     private Match search(Query query) {
         // 每次都查询仓储，避免缓存未命中遮蔽新发布能力。
-        List<Candidate> candidates = new ArrayList<>(repository.search(query));
+        List<Candidate> candidates = new ArrayList<>(List.copyOf(repository.search(query)));
         // 按仓储候选顺序检查适用性，不直接按描述执行。
         var remaining = candidates.iterator();
         while (remaining.hasNext()) {

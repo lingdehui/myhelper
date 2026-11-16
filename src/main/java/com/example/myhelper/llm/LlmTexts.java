@@ -320,9 +320,6 @@ public final class LlmTexts {
     /** 执行或协议反馈：不能为空。 */
     public static final String REQUIRED_TEXT_SUFFIX = " 不能为空";
 
-    /** 执行或协议反馈：固化版本不可读取:。 */
-    public static final String CAPABILITY_UNREADABLE_PREFIX = "固化版本不可读取: ";
-
     /** 执行或协议反馈：不能用另一修订冒充请求版本。 */
     public static final String CAPABILITY_REVISION_MISMATCH = "不能用另一修订冒充请求版本";
 

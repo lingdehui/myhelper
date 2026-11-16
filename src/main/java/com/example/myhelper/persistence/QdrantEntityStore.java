@@ -22,6 +22,9 @@ import java.util.UUID;
 
 /** Qdrant REST 适配器；无名向量用于检索，payload 保存完整实体与引用。 */
 public final class QdrantEntityStore extends SnapshotParticipant {
+    /** 明确拒绝接收写入的 HTTP 状态，未知或超时状态需要核对。 */
+    private static final Set<Integer> REJECTED_WRITE_STATUSES = Set.of(400, 401, 403, 404, 405, 413, 415, 422, 429);
+
     /** Spring 或调用方管理的共享 HTTP 客户端。 */
     private final HttpClient client;
     /** 根据配置中的地址和集合名形成的 REST 路径。 */
@@ -372,8 +375,8 @@ public final class QdrantEntityStore extends SnapshotParticipant {
             throw failure;
         }
         int status = response.statusCode();
-        // 客户端请求被明确拒绝时，保留普通失败；HTTP 408 仍无法确认动作结果。
-        if (status / 100 == 4 && status != 408) {
+        // 只把有明确拒绝含义的响应当作普通失败。超时、中断和不熟悉的状态仍需核对。
+        if (REJECTED_WRITE_STATUSES.contains(status)) {
             throw new IllegalStateException("Qdrant HTTP " + status);
         }
         JsonNode result;

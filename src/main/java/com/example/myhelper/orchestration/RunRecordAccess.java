@@ -195,11 +195,11 @@ final class RunRecordAccess {
         }
         if (enabled()) {
             if (pendingEnd == null) {
-                List<String> gaps = new ArrayList<>(archiveGaps(graph, knownGaps));
-                gaps.addAll(unconfirmedEvents);
+                List<String> gaps = archiveGaps(graph, knownGaps);
                 pendingEnd = new TaskRecordPort.RunFinalization(
                         event(rootRunId, rootRunId, rootRunId, 0, EventKind.RUN_ENDED,
-                                Map.of("outcome", outcome.asMap())), graph, gaps.isEmpty(), gaps);
+                                Map.of("outcome", outcome.asMap())), graph, gaps.isEmpty(), gaps,
+                        List.copyOf(unconfirmedEvents));
             }
             // 正常返回才认为提交确认；异常时保留 pendingEnd，不能先结束领取或发唤醒。
             for (int attempt = 1; attempt <= FINALIZATION_ATTEMPTS; attempt++) {
@@ -212,7 +212,7 @@ final class RunRecordAccess {
             }
         }
         ended = true;
-        if (enabled() && pendingEnd.graphComplete() && !internalValidation) {
+        if (enabled() && pendingEnd.graphComplete() && pendingEnd.evidenceComplete() && !internalValidation) {
             try {
                 port.wakeConsolidation(claim);
             } catch (RuntimeException failure) {

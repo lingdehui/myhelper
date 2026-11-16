@@ -10,7 +10,7 @@ import java.util.Optional;
 public interface RunArchivePort {
     Optional<ArchivedRun> readArchive(ArchiveRef ref);
 
-    /** 发现尚未确认消费的完整用户运行；不是领取或分页快照，不含内部验证运行。 */
+    /** 发现图和证据均完整且尚未确认消费的用户运行。 */
     List<ArchiveRef> pendingConsolidations(int limit);
 
     /** 消费方完成幂等处理后确认；与技能发布跨实体，不声称恰好一次。 */
@@ -41,14 +41,22 @@ public interface RunArchivePort {
             TaskRecordPort.ExecutionEvent endEvent,
             /** 固定执行图；启动前失败允许为空。 */
             ExecutionTraceStore.Snapshot graph,
-            /** 记录完整性，不表示业务成功或审核通过。 */
+            /** 执行图结构完整性。 */
             boolean graphComplete,
-            /** 不完整原因，禁止将缺图运行投入固化待办。 */
+            /** 执行图结构或快照的缺口。 */
             List<String> gaps,
             /** 本运行的全部执行事实与验收证据，包括结束事件。 */
             List<TaskRecordPort.ExecutionEvent> events,
             /** 应用入口标识的内部验证来源，不能由普通 arguments 推定。 */
-            boolean internalValidation) {
+            boolean internalValidation,
+            /** 未取得写入确认的逐阶段事实，供归档核对。 */
+            List<String> evidenceGaps) {
+        public ArchivedRun(ArchiveRef ref, int schemaVersion, TaskRecordPort.ExecutionEvent endEvent,
+                           ExecutionTraceStore.Snapshot graph, boolean graphComplete, List<String> gaps,
+                           List<TaskRecordPort.ExecutionEvent> events, boolean internalValidation) {
+            this(ref, schemaVersion, endEvent, graph, graphComplete, gaps, events, internalValidation, List.of());
+        }
+
         public ArchivedRun {
             Objects.requireNonNull(ref);
             Objects.requireNonNull(endEvent);
@@ -57,9 +65,10 @@ public interface RunArchivePort {
                 throw new IllegalArgumentException("归档版本或运行身份不匹配");
             }
             TaskRecordPort.RunFinalization checked =
-                    new TaskRecordPort.RunFinalization(endEvent, graph, graphComplete, gaps);
+                    new TaskRecordPort.RunFinalization(endEvent, graph, graphComplete, gaps, evidenceGaps);
             graph = checked.graph();
             gaps = checked.gaps();
+            evidenceGaps = checked.evidenceGaps();
             events = List.copyOf(events);
             boolean ended = false;
             for (TaskRecordPort.ExecutionEvent event : events) {
@@ -69,6 +78,10 @@ public interface RunArchivePort {
                 if (event.equals(endEvent)) { ended = true; }
             }
             if (!ended) { throw new IllegalArgumentException("归档缺少结束事件"); }
+        }
+
+        public boolean evidenceComplete() {
+            return evidenceGaps.isEmpty();
         }
     }
 }

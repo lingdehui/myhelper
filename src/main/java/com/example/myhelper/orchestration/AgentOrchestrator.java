@@ -349,7 +349,7 @@ public final class AgentOrchestrator {
         control.recordLocalStop();
         // 这次运行的停止不覆盖已发生的产物；新版目标不能被旧 SUCCESS 宣告完成。
         try {
-            control.check();
+            control.checkForSettlement();
             if (completed.status() == Status.SUCCESS
                     && !control.records.complete(control.completionRevision.get(), completed)) {
                 completed = new Outcome(Status.WAITING, completed.value(), LlmTexts.TASK_CONTROL_WAIT);
@@ -1925,7 +1925,20 @@ public final class AgentOrchestrator {
         // 复用与工具上下文相同的取消/超时判断。
         private void check() {
             InstructionStop latest = instructionStop.get();
-            TaskInstructionPort.Directive directive = latest == null ? records.directive() : latest.directive();
+            checkDirective(latest == null ? records.directive() : latest.directive());
+        }
+
+        // 结束状态以外部最新指令为准，派发路径仍可用本地停止信号直接拒绝。
+        private void checkForSettlement() {
+            TaskInstructionPort.Directive authoritative = records.directive();
+            InstructionStop latest = instructionStop.get();
+            if (authoritative == TaskInstructionPort.Directive.PROCEED && latest != null) {
+                authoritative = latest.directive();
+            }
+            checkDirective(authoritative);
+        }
+
+        private void checkDirective(TaskInstructionPort.Directive directive) {
             switch (directive) {
                 case PROCEED -> {
                     if (stop.get() != null || Instant.now().isAfter(deadline)) {

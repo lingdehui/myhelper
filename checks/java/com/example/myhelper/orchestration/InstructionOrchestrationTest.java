@@ -87,11 +87,11 @@ class InstructionOrchestrationTest {
     void replayedPauseCannotReplaceNewerCancellation() throws Exception {
         RecordingTaskRecords records = new RecordingTaskRecords();
         records.enableInstructions();
-        BlockingPlanner planner = new BlockingPlanner(complete("旧目标完成"));
-        try (Harness harness = new Harness(records, planner, new CountingAction())) {
+        BlockingWrite actions = new BlockingWrite();
+        try (Harness harness = new Harness(records, new ReplanningPlanner(), actions)) {
             AgentOrchestrator.Handle handle = harness.submit();
             try {
-                awaitLatch(planner.entered);
+                awaitLatch(actions.entered);
                 Command pause = command(handle, Kind.PAUSE, "暂停");
                 var pauseReceipt = harness.orchestrator.instruct(pause);
                 Command cancel = new Command(handle.taskId(), "cancel-after-pause",
@@ -99,11 +99,38 @@ class InstructionOrchestrationTest {
                 harness.orchestrator.instruct(cancel);
                 assertEquals(pauseReceipt, harness.orchestrator.instruct(pause));
             } finally {
+                actions.release.countDown();
+            }
+            assertEquals(AgentOrchestrator.Status.CANCELLED, handle.settled().get(10, TimeUnit.SECONDS).status());
+            assertEquals(AgentOrchestrator.Status.CANCELLED, result(handle).status());
+            int taskNodes = 0;
+            for (var node : records.finalization(handle.rootRunId()).graph().nodes().values()) {
+                if (node.kind() == ExecutionTraceStore.NodeKind.TASK) {
+                    assertEquals(ExecutionTraceStore.NodeStatus.CANCELLED, node.status());
+                    taskNodes++;
+                }
+            }
+            assertEquals(1, taskNodes);
+            assertNull(records.activeClaim(handle.taskId()));
+        }
+    }
+
+    @Test
+    void settlementChecksNewerExternalCancellationDespiteCachedPause() throws Exception {
+        RecordingTaskRecords records = new RecordingTaskRecords();
+        RecordingTaskInstructions instructions = records.enableInstructions();
+        BlockingPlanner planner = new BlockingPlanner(complete("旧目标完成"));
+        try (Harness harness = new Harness(records, planner, new CountingAction())) {
+            AgentOrchestrator.Handle handle = harness.submit();
+            try {
+                awaitLatch(planner.entered);
+                var pause = harness.orchestrator.instruct(command(handle, Kind.PAUSE, "暂停"));
+                instructions.accept(new Command(handle.taskId(), "external-cancel", pause.revision(), Kind.CANCEL, "取消"));
+            } finally {
                 planner.release.countDown();
             }
             assertEquals(AgentOrchestrator.Status.CANCELLED, handle.settled().get(10, TimeUnit.SECONDS).status());
             assertEquals(AgentOrchestrator.Status.CANCELLED, result(handle).status());
-            assertNull(records.activeClaim(handle.taskId()));
         }
     }
 

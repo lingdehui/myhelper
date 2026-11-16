@@ -118,9 +118,11 @@ class CapabilityLookupTest {
         var secondIndex = published("a", "另一个索引描述", 1, "PUBLISHED");
         var currentFirst = published("z", "权威描述", 1, "PUBLISHED");
         var currentSecond = published("a", "权威描述二", 1, "PUBLISHED");
+        AtomicInteger batches = new AtomicInteger();
         var graph = new SearchParticipant() {
             @Override
             public Map<String, WorldEntity> readBatch(List<String> ids) {
+                batches.incrementAndGet();
                 assertEquals(List.of("stale", "revoked", "missing", "z", "a"), ids);
                 return Map.of("stale", published("stale", "新", 2, "PUBLISHED"),
                         "revoked", published("revoked", "已停用", 1, "DISABLED"),
@@ -142,6 +144,7 @@ class CapabilityLookupTest {
                     public Embedding apply(String text) { return new Embedding("example", "v1", List.of(0.0, 1.0)); }
                 });
         var found = adapter.search(new CapabilityLookup.Query("r", 0, "$entry", "goal", Map.of()));
+        assertEquals(1, batches.get());
         assertEquals(2, found.size());
         assertEquals("z", found.getFirst().ref().id());
         assertEquals("权威描述", found.getFirst().description());

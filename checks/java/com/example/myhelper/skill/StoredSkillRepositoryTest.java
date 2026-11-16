@@ -138,6 +138,29 @@ class StoredSkillRepositoryTest {
         assertNotNull(f.repo.publishApproved(candidate));
     }
 
+    @Test void unconfirmedWriteKeepsFrozenPublicationAndRejectsOrdinaryRetryAfterRestart() {
+        Fixture f = new Fixture();
+        Candidate candidate = f.repo.saveCandidateIfAbsent(candidate("unconfirmed"));
+        f.repo.saveReview(candidate, approved());
+        f.index.loseNextWriteResponse = true;
+        DualWriteStore.WriteFailure failure = assertThrows(DualWriteStore.WriteFailure.class, new Executable() {
+            @Override public void execute() { f.repo.publishApproved(candidate); }
+        });
+        assertFalse(failure.rollbackCompleted());
+        WorldEntity state = f.graph.entities.get(StoredSkillRepository.candidateId(candidate.evidence().source()));
+        assertEquals("PUBLISHING", state.data().get("publicationStatus"));
+        assertEquals(failure.operationId(), state.data().get("publicationStorageOperationId"));
+        assertNotNull(state.data().get("publicationJson"));
+        StoredSkillRepository restarted = new StoredSkillRepository(f.store, NEO4J, QDRANT,
+                new Function<Candidate, Embedding>() {
+                    @Override public Embedding apply(Candidate c) { throw new AssertionError("must reuse frozen vector"); }
+                });
+        assertThrows(IllegalStateException.class, new Executable() {
+            @Override public void execute() { restarted.publishApproved(candidate); }
+        });
+        assertTrue(f.index.entities.isEmpty());
+    }
+
     @Test void embeddingFailureDoesNotFreezeOrPublishCandidate() {
         Fixture f = new Fixture();
         Candidate candidate = f.repo.saveCandidateIfAbsent(candidate("embedding"));
@@ -206,6 +229,8 @@ class StoredSkillRepositoryTest {
         final Map<String, WorldEntity> entities = new LinkedHashMap<>();
         final EntityJson json = new EntityJson();
         boolean failNextSave;
+        /** 模拟服务端已写入但客户端丢失响应。 */
+        boolean loseNextWriteResponse;
         com.example.myhelper.persistence.StorageQuery.VectorRequest lastSearch;
         @Override public Optional<WorldEntity> read(String id) { return Optional.ofNullable(entities.get(id)); }
         @Override public List<com.example.myhelper.persistence.StorageQuery.Hit> search(
@@ -224,6 +249,10 @@ class StoredSkillRepositoryTest {
         }
         @Override protected void save(List<WorldEntity> values) {
             for (WorldEntity value : values) { entities.put(value.id(), json.entity(json.encode(value))); }
+            if (loseNextWriteResponse) {
+                loseNextWriteResponse = false;
+                throw new java.io.UncheckedIOException(new java.io.IOException("response lost"));
+            }
             if (failNextSave) { failNextSave = false; throw new IllegalStateException("partial remote failure"); }
         }
         @Override protected void remove(String id) { entities.remove(id); }

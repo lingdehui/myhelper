@@ -106,9 +106,11 @@ class TraceAndCompletionBoundaryTest {
             TaskRecordPort.RunFinalization finalization = records.finalization(handle.rootRunId());
             assertNotNull(finalization);
             assertTrue(finalization.graph().closed());
-            assertFalse(finalization.graphComplete());
-            assertEquals(1, finalization.gaps().size());
-            assertTrue(finalization.gaps().getFirst().contains(missing.name()));
+            assertTrue(finalization.graphComplete());
+            assertTrue(finalization.gaps().isEmpty());
+            assertFalse(finalization.evidenceComplete());
+            assertEquals(1, finalization.evidenceGaps().size());
+            assertTrue(finalization.evidenceGaps().getFirst().contains(missing.name()));
             assertFalse(records.consolidationWoken(handle.rootRunId()));
         }
     }
