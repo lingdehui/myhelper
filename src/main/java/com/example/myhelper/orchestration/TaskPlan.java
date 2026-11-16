@@ -16,9 +16,16 @@ public record TaskPlan(
         /** 本次规划的总体目标，用于规划后检索整条固化。 */
         String goal,
         /** 步骤及其明确依赖；数组顺序不隐含业务依赖。 */
-        List<Step> steps) {
+        List<Step> steps,
+        /** 可选控制分支声明；为空时仅从结构明确的 DAG 推导，不把交叉数据依赖猜成汇合。 */
+        PlanBranches.Routing routing) {
     /** 参数来源保留字：读取当前任务输入，而不是某个前驱步骤。 */
     public static final String TASK_INPUT_SOURCE = "$input";
+
+    /** 保留原有计划构造方式；普通线性和明确的分叉/汇合不需要手写分支声明。 */
+    public TaskPlan(String goal, List<Step> steps) {
+        this(goal, steps, null);
+    }
 
     // 在接收计划时完成整体校验，任何动作都尚未开始。
     public TaskPlan {

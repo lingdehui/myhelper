@@ -10,6 +10,7 @@ import java.net.http.HttpClient;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import static com.example.myhelper.persistence.DualWriteStore.Database.QDRANT;
 
 /** 通过本地 HTTP 服务验证实际 Qdrant 客户端的请求协议与失败补偿。 */
@@ -18,6 +19,7 @@ public final class QdrantEntityStoreCheck {
         EntityJson json = new EntityJson();
         Map<String, String> points = new HashMap<>();
         AtomicBoolean failAfterWrite = new AtomicBoolean();
+        AtomicReference<WriteReply> nextWriteReply = new AtomicReference<>(WriteReply.COMPLETED);
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/collections/test", new HttpHandler() {
             @Override
@@ -31,9 +33,19 @@ public final class QdrantEntityStoreCheck {
                         result = Map.of("config", Map.of("params", Map.of("vectors", Map.of("size", 2, "distance", "Cosine"))));
                     } else if (exchange.getRequestMethod().equals("PUT")) {
                         if (!exchange.getRequestURI().getQuery().contains("wait=true")) throw new AssertionError();
-                        for (var point : body.path("points")) points.put(point.path("id").asText(), point.toString());
-                        if (failAfterWrite.getAndSet(false)) status = 500;
-                        result = Map.of("status", "completed");
+                        WriteReply reply = nextWriteReply.getAndSet(WriteReply.COMPLETED);
+                        if (reply != WriteReply.REJECTED) {
+                            for (var point : body.path("points")) points.put(point.path("id").asText(), point.toString());
+                        }
+                        if (reply == WriteReply.MALFORMED) {
+                            byte[] response = "{".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                            exchange.sendResponseHeaders(200, response.length);
+                            exchange.getResponseBody().write(response);
+                            return;
+                        }
+                        if (failAfterWrite.getAndSet(false) || reply == WriteReply.SERVER_ERROR) status = 500;
+                        if (reply == WriteReply.REJECTED) status = 400;
+                        result = Map.of("status", reply == WriteReply.ACKNOWLEDGED ? "acknowledged" : "completed");
                     } else if (path.endsWith("/delete")) {
                         for (var id : body.path("points")) points.remove(id.asText());
                         result = Map.of("status", "completed");
@@ -82,6 +94,14 @@ public final class QdrantEntityStoreCheck {
             update.prepare(); failAfterWrite.set(true);
             try { update.commit(); throw new AssertionError("应失败"); } catch (IllegalStateException expected) { update.rollback(); }
             if (!vector.read("a").orElseThrow().equals(first)) throw new AssertionError("失败后恢复旧值");
+            // 投影必须和被恢复的完整实体在同一个 upsert 中恢复。
+            List<String> revisionTerms = new ArrayList<>();
+            for (var term : json.parse(points.get(QdrantEntityStore.pointId("a"))).path("payload").path("query_terms")) {
+                revisionTerms.add(term.asText());
+            }
+            if (!revisionTerms.contains("[\"/revision\",\"number\",\"1\"]") || revisionTerms.contains("[\"/revision\",\"number\",\"2\"]")) {
+                throw new AssertionError("补偿必须同步恢复查询投影");
+            }
             var clear = vector.open("clear", List.of(entity(2, false)));
             clear.prepare(); clear.commit();
             if (!vector.read("a").orElseThrow().equals(entity(2, false))) throw new AssertionError("清除向量仍须保留正文和引用");
@@ -94,9 +114,24 @@ public final class QdrantEntityStoreCheck {
             addVector.prepare(); failAfterWrite.set(true);
             try { addVector.commit(); throw new AssertionError("应失败"); } catch (IllegalStateException expected) { addVector.rollback(); }
             if (!vector.read("a").orElseThrow().equals(payloadOnly)) throw new AssertionError("应恢复无向量快照");
-            System.out.println("Qdrant HTTP checks passed: explicit source/target, full references, payload-only insert/update, partial failure compensation, no expansion");
+            for (WriteReply reply : List.of(WriteReply.ACKNOWLEDGED, WriteReply.MALFORMED, WriteReply.SERVER_ERROR, WriteReply.REJECTED)) {
+                nextWriteReply.set(reply);
+                try {
+                    store.write(QDRANT, entity(4, true));
+                    throw new AssertionError("只有完成回执才能提交成功");
+                } catch (DualWriteStore.WriteFailure failure) {
+                    if (failure.rollbackCompleted() != (reply == WriteReply.REJECTED) || failure.getSuppressed().length != 0) {
+                        throw new AssertionError("补偿完成回执不能消除原操作结果未知: " + reply, failure);
+                    }
+                }
+                if (!vector.read("a").orElseThrow().equals(payloadOnly)) throw new AssertionError("仍应尽力恢复写前状态");
+            }
+            System.out.println("Qdrant HTTP checks passed: explicit source/target, full references, payload-only insert/update, partial failure compensation, uncertain acknowledgements, no expansion");
         } finally { server.stop(0); }
     }
+
+    private enum WriteReply { COMPLETED, ACKNOWLEDGED, MALFORMED, SERVER_ERROR, REJECTED }
+
     /** 供两个适配器的字段往返检查复用同一完整实体。 */
     static WorldEntity entity(long revision, boolean vector) {
         Map<String, Object> nested = new LinkedHashMap<>();

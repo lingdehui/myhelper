@@ -68,3 +68,11 @@ Neo4j 的事务接口继续使用驱动托管回调，不把事务体挪到回�
 - AgentOrchestrator 的 executeModelPlan、capability 仍有多层匿名回调；async 中仍有多层三元表达式。后续整理应使用有名称的方法和清晰分支，保持异步执行及现有 switch，不能只追求零 Lambda。
 
 本次仅复核并更新记录，上述收尾项尚未修改。详细验证见[接续文档](重写架构与进度.md)。
+
+## 7. 检查代码统一放在 checks（2026-11-11 用户确认）
+
+所有测试、替身、检查 main、检查脚本及快照统一放在根目录 `checks`。当前有效源码位于 `checks/java`，检查资源在 `checks/resources`，运行器在 `checks/tools`；临时检查、编译产物和日志在 `checks/build`，历史资料在 `checks/archive`。不重新创建 `src/test`，不把检查资料混入生产目录或继续散落在 target。历史归档不参与当前代码规范扫描或编译。
+
+检查必须显式运行，不接入根工程默认 Maven 流程；当前入口为 [checks/run.ps1](../checks/run.ps1)，配置与扩展方式见 [checks 说明](../checks/README.md)。它使用指定的既有 JDK 25 和依赖，每次新建编译输出目录，避免旧 class 掩盖源文件遗漏。所有任务窗口继续工作前都须遵守这项目录规则。
+
+“单次主流程”和“循环可并发调用主流程”窗口已确认：AgentCaller.call 只负责一次调用，AgentOrchestrator.submit 是任务组件入口；检查 Harness 不是应用启动，正式启动/装配仍未实现。本次资料迁移不改变上述边界，也不实施前节尚未完成的业务可读性收尾。

@@ -59,3 +59,11 @@ logging:
     io.modelcontextprotocol: WARN
     org.springframework.web: WARN
     org.neo4j: WARN
+
+# 循环主流程：门限仅决定固化工具是否跳过模型，不替代发布状态、门禁和验收。
+myhelper:
+  orchestration:
+    # 普通技能和可信原子工具的估计成功率都必须严格超过此值。
+    direct-tool-reliability-threshold: 0.85
+    # 普通固化技能需要的实际累计成功次数，可信原子工具免此项。
+    direct-tool-minimum-successes: 5

@@ -1,5 +1,7 @@
 package com.example.myhelper.orchestration;
 
+import com.example.myhelper.records.ExecutionTracePort;
+
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -8,7 +10,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /** 有界内存执行图；所有更新串行化，消费者只取得不可变快照。尚不支持跨重启恢复。 */
-public final class ExecutionTraceStore {
+public final class ExecutionTraceStore implements ExecutionTracePort {
     /** 节点创建事件的稳定名称，供事件消费者读取。 */
     private static final String NODE_CREATED_EVENT = "CREATED";
 
@@ -155,6 +157,12 @@ public final class ExecutionTraceStore {
         TASK,
         /** 一次模型调用。 */
         MODEL,
+        /** 模型会话生命周期异常，不计为实际模型请求。 */
+        MODEL_SESSION,
+        /** 从独立记录模块查询本轮进度与待处理事项。 */
+        RECORD_QUERY,
+        /** 模型提出恢复结论，由外部模块审核及更新状态。 */
+        RECOVERY_REVIEW,
         /** 一次固化候选检索。 */
         SEARCH,
         /** 计划中的逻辑步骤。 */
@@ -191,6 +199,8 @@ public final class ExecutionTraceStore {
         FAILED,
         /** 效果未知，需要核对。 */
         UNKNOWN,
+        /** 已记录待办，等待模型、外部审核或其他接续条件。 */
+        WAITING,
         /** 已请求取消。 */
         CANCELLED,
         /** 需要用户补充信息。 */

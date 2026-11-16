@@ -2,11 +2,13 @@ package com.example.myhelper.orchestration;
 
 import com.example.myhelper.agent.AgentCaller;
 import com.example.myhelper.llm.LlmTexts;
+import com.example.myhelper.llm.ModelAdapter;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.tool.ToolCallback;
@@ -40,15 +42,26 @@ public final class AgentCallerPlanner implements AgentOrchestrator.Planner {
     }
 
     @Override
+    // 规划协议始终使用 submit_plan/finish_task，与是否开放普通业务工具无关。
+    public Set<ModelAdapter.Requirement> requirements() {
+        // 把协议要求交给外层会话建立流程，使根和所有候选分支均支持工具调用。
+        return Set.of(ModelAdapter.Requirement.TOOL_CALLING);
+    }
+
+    @Override
     // 调用一次模型，并把它的原生工具请求解析成运行时决策。
     public AgentOrchestrator.Decision decide(AgentOrchestrator.PlanningContext context) {
         try {
+            String systemPrompt = LlmTexts.PLANNER_SYSTEM_PROMPT;
+            if (!context.instructions().instructions().isEmpty()) {
+                systemPrompt = systemPrompt + "\n" + LlmTexts.INSTRUCTION_PLANNING_PROMPT;
+            }
             // 每次组织完整的结构化反馈快照，不把未配对的工具请求塞进下一次历史。
             String input = json.writeValueAsString(Map.of(LlmTexts.PLANNING_TASK_FIELD, context, LlmTexts.AVAILABLE_TOOLS_FIELD, caller.toolDefinitions(context.toolNames())));
             // 使用 CALL_ONLY 获取工具请求；控制工具由外层解释，不由框架执行。
             var result = caller.call(new AgentCaller.Request(context.modelRef(), List.of(
                     // 说明模型的规划职责；真正的线程调度和参数取值由代码执行。
-                    new SystemMessage(LlmTexts.PLANNER_SYSTEM_PROMPT), new UserMessage(input)), List.of(SUBMIT_PLAN_TOOL, FINISH_TASK_TOOL), AgentCaller.Mode.CALL_ONLY), List.of(submit, finish));
+                    new SystemMessage(systemPrompt), new UserMessage(input)), List.of(SUBMIT_PLAN_TOOL, FINISH_TASK_TOOL), AgentCaller.Mode.CALL_ONLY), List.of(submit, finish));
             // 直接读取结构化工具调用，不从模型自然语言文本中猜测动作。
             var calls = result.response().getResult().getOutput().getToolCalls();
             // 一次决策必须只有一个控制请求，避免同轮既提交计划又结束。

@@ -19,10 +19,10 @@ import org.springframework.ai.tool.ToolCallback;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-/** 记录模型实际收到的合同，防止移动提示词时意外改动请求内容。 */
+/** 比较实际请求与已确认协议快照，防止提示词或 Schema 意外偏离。 */
 class AgentCallerPlannerTest {
     @Test
-    void requestMatchesContractCapturedBeforeTextExtraction() throws Exception {
+    void requestMatchesReviewedPlanningContract() throws Exception {
         RecordingModel model = new RecordingModel();
         AgentCaller caller = new AgentCaller(new Function<String, ChatModel>() {
             @Override
@@ -47,7 +47,7 @@ class AgentCallerPlannerTest {
         }
         actual.put("tools", definitions);
         actual.put("internalExecution", options.getInternalToolExecutionEnabled());
-        // 期望值来自重构前请求快照，不能从当前 LlmTexts 动态生成，否则无法发现文本变化。
+        // 快照包含本轮新增的分支协议；运行检查时仍从独立资源读期望值。
         try (InputStream expected = getClass().getResourceAsStream("/llm/planner-request.json")) {
             assertNotNull(expected);
             assertEquals(json.readTree(expected), json.valueToTree(actual));

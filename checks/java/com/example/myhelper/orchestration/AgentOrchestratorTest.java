@@ -2,6 +2,7 @@ package com.example.myhelper.orchestration;
 
 import com.example.myhelper.agent.AgentCaller;
 import com.example.myhelper.capability.CapabilityLookup;
+import com.example.myhelper.support.TestModelAdapter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -359,8 +360,12 @@ class AgentOrchestratorTest {
         private Harness(Repo repo, CapabilityLookup.Matcher matcher, AgentOrchestrator.Planner planner,
                         AgentOrchestrator.ActionExecutor actions, int threads) {
             workers = Executors.newFixedThreadPool(threads);
-            runtime = new AgentOrchestrator(planner, new CapabilityLookup(repo, matcher, 8, Duration.ofMinutes(1)), actions,
-                    CHECKS, traces, workers, timer, new AgentOrchestrator.Limits(5, 5, 20, 20, 30, 30, Duration.ofSeconds(10)));
+            CapabilityLookup lookup = new CapabilityLookup(repo, matcher, 8, Duration.ofMinutes(1));
+            runtime = new AgentOrchestrator(planner, lookup, com.example.myhelper.support.ReliableTools.bind(actions),
+                    CHECKS, traces, workers, timer, new AgentOrchestrator.Limits(5, 5, 20, 20, 30, 30, Duration.ofSeconds(10)),
+                    new TestModelAdapter(List.of("model")), com.example.myhelper.records.TaskRecordPort.disabled(),
+                    new com.example.myhelper.capability.CheckedCapabilityUse(lookup, CHECKS),
+                    com.example.myhelper.support.ReliableTools.gate());
         }
         private AgentOrchestrator.Handle submit() { return runtime.submit(new AgentOrchestrator.Request("用户目标", Map.of(), "model", List.of("echo"))); }
         public void close() {

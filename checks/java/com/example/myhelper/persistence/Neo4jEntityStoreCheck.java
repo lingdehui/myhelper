@@ -19,6 +19,8 @@ import org.neo4j.driver.Value;
 public final class Neo4jEntityStoreCheck {
     public static void main(String[] args) {
         Map<String, String> storedJson = new HashMap<>();
+        // 记录实际写入参数，核对失败补偿会同步恢复查询投影。
+        Map<String, Object> storedTerms = new HashMap<>();
         List<String> reads = new ArrayList<>();
         List<Map<?, ?>> references = new ArrayList<>();
         TransactionContext transaction = proxy(TransactionContext.class, new InvocationHandler() {
@@ -37,6 +39,7 @@ public final class Neo4jEntityStoreCheck {
                     }
                 } else if (query.contains("SET e.json")) {
                     storedJson.put((String) parameters.get("id"), (String) parameters.get("json"));
+                    storedTerms.put((String) parameters.get("id"), parameters.get("terms"));
                 } else if (query.contains("CREATE (e)-[:WORLD_REF")) {
                     references.add(new HashMap<>(parameters));
                 } else if (query.contains("REMOVE e.json")) {
@@ -78,6 +81,10 @@ public final class Neo4jEntityStoreCheck {
         var update = graph.open("update", List.of(QdrantEntityStoreCheck.entity(2, true)));
         update.prepare(); update.commit(); update.rollback();
         if (!graph.read("a").orElseThrow().equals(first)) throw new AssertionError("快照恢复");
+        if (!(storedTerms.get("a") instanceof List<?> terms)
+                || !terms.contains("[\"/revision\",\"number\",\"1\"]") || terms.contains("[\"/revision\",\"number\",\"2\"]")) {
+            throw new AssertionError("补偿必须同步恢复查询投影");
+        }
         for (String id : reads) {
             if (!id.equals("a")) {
                 throw new AssertionError("不应读取引用目标");

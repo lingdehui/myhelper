@@ -3,6 +3,7 @@ package com.example.myhelper.capability;
 import com.example.myhelper.llm.LlmTexts;
 
 import com.example.myhelper.orchestration.TaskPlan;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -10,7 +11,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 /** 独立的固化检索与有限内容缓存；每次 search 都调用仓储，不缓存未命中的搜索。 */
-public final class CapabilityLookup {
+public final class CapabilityLookup implements CapabilitySearchPort {
     /** 查询身份保留字：根入口目标，不是计划中的步骤 ID。 */
     public static final String ENTRY_QUERY_ID = "$entry";
     /** 查询身份保留字：当前模型计划的总体目标。 */
@@ -56,13 +57,22 @@ public final class CapabilityLookup {
         this.ttlNanos = ttl.toNanos();
     }
 
+    @Override
+    // 真实检索实现已启用；外部仓储异常仍由原调用路径上抛。
+    public boolean enabled() {
+        // 启用不表示一定有候选，也不表示每次检索都会成功。
+        return true;
+    }
+
     /** 每个根任务入口只调用一次；不由每轮规划循环重复调用。 */
+    @Override
     public Match searchAtEntry(Query query) {
         // 入口只规定调用时机；底层查询与规划后查询复用同一实现。
         return search(query);
     }
 
     /** 每次模型产生计划后都查仓储；查询来自模型的总目标与各子目标。 */
+    @Override
     public PlanMatches searchAfterPlanning(String runId, long revision, TaskPlan plan, Map<String, Object> input) {
         // 用模型给出的总体目标重新查库，保留字区分整条计划查询。
         Match whole = search(new Query(runId, revision, WHOLE_PLAN_QUERY_ID, plan.goal(), input));
@@ -80,27 +90,34 @@ public final class CapabilityLookup {
     // 先获取新候选，再做业务合同匹配；缓存只用于加载内容。
     private Match search(Query query) {
         // 每次都查询仓储，避免缓存未命中遮蔽新发布能力。
-        List<Candidate> candidates = List.copyOf(repository.search(query));
+        List<Candidate> candidates = new ArrayList<>(repository.search(query));
         // 按仓储候选顺序检查适用性，不直接按描述执行。
-        for (Candidate candidate : candidates) {
+        var remaining = candidates.iterator();
+        while (remaining.hasNext()) {
+            Candidate candidate = remaining.next();
             // 只有匹配策略明确确认合同适用，才加载固定版本定义。
             if (matcher.matches(query, candidate)) {
-                // 保留本次候选，并返回已选能力的固定内容快照。
-                return new Match(candidates, Optional.of(load(candidate.ref())));
+                Optional<Definition> definition = load(candidate.ref());
+                if (definition.isPresent()) {
+                    return new Match(List.copyOf(candidates), definition);
+                }
+                // 候选在匹配和加载之间失效，跳过并从模型可见候选中移除。
+                remaining.remove();
             }
         }
         // 未明确匹配时保留候选供后续模型参考，不伪造可执行能力。
-        return new Match(candidates, Optional.empty());
+        return new Match(List.copyOf(candidates), Optional.empty());
     }
 
     /** 执行前重新核对发布/停用状态，缓存不代表本次可执行。 */
+    @Override
     public boolean isAvailable(Ref ref) {
         // 实时检查权威发布状态；内容缓存不代表持续允许执行。
         return repository.isAvailable(ref);
     }
 
     // 加载明确命名空间、ID、revision 的能力内容。
-    private Definition load(Ref ref) {
+    private Optional<Definition> load(Ref ref) {
         // 只在操作 LRU 表时持锁，不持锁执行数据库查询。
         synchronized (cache) {
             // 读取命中项也会更新 LRU 访问次序，因此同样需要锁。
@@ -108,13 +125,13 @@ public final class CapabilityLookup {
             // 存在且尚未过期才可复用已冻结的内容。
             if (value != null && System.nanoTime() - value.loadedAt() < ttlNanos) {
                 // 返回固定版本内容；执行前资格仍由另一路检查。
-                return value.definition();
+                return Optional.of(value.definition());
             }
         }
         // 数据库访问不持有全局缓存锁，避免一个慢查询阻塞所有任务。
         Optional<Definition> loaded = repository.load(ref);
         if (loaded.isEmpty()) {
-            throw new IllegalStateException(LlmTexts.CAPABILITY_UNREADABLE_PREFIX + ref);
+            return Optional.empty();
         }
         Definition definition = loaded.get();
         // 仓储不能用当前新版本内容冒充所要求的旧版本。
@@ -133,7 +150,7 @@ public final class CapabilityLookup {
             }
         }
         // 返回已验证版本的不可变执行定义。
-        return definition;
+        return loaded;
     }
 
     /** 查看内容缓存条数；只读统计也要使用同一把缓存锁。 */
