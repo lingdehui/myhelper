@@ -4,6 +4,8 @@ import com.example.myhelper.orchestration.TaskPlan;
 import com.example.myhelper.tools.ToolDirectory.ToolRef;
 import com.example.myhelper.world.model.ExecutionStatistics;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -11,6 +13,8 @@ import java.util.OptionalDouble;
 
 /** 供循环在直接调用工具前查询已发布技能的可靠度。 */
 public final class ToolReliability {
+    /** 送入规划消息的批准范围数量上限。 */
+    private static final int MAX_PLANNING_RANGES = 8;
     /** 读取当前发布修订、参数范围及统计的权威查询。 */
     private final Lookup lookup;
 
@@ -43,11 +47,33 @@ public final class ToolReliability {
                 TaskPlan.immutableMap(Objects.requireNonNull(arguments, "arguments"))));
     }
 
+    /** 读取当前工具版本在已批准范围内的历史统计，供模型规划参考。 */
+    public List<PlanningReference> planningReferences(ToolRef ref) {
+        List<PlanningReference> references = new ArrayList<>();
+        for (var entry : lookup.planningSamples(Objects.requireNonNull(ref, "ref")).entrySet()) {
+            Sample sample = entry.getValue();
+            ExecutionStatistics statistics = sample.statistics();
+            if (statistics.successCount() == 0 && statistics.failureCount() == sample.externalFailures()) {
+                continue;
+            }
+            Assessment assessed = assess(sample).orElseThrow();
+            references.add(new PlanningReference(entry.getKey(), assessed.score(), assessed.successCount(),
+                    assessed.trustedAtomicTool()));
+            if (references.size() == MAX_PLANNING_RANGES) {
+                break;
+            }
+        }
+        return List.copyOf(references);
+    }
+
     private Optional<Assessment> assess(Optional<Sample> match) {
         if (match.isEmpty()) {
             return Optional.empty();
         }
-        Sample sample = match.get();
+        return assess(match.get());
+    }
+
+    private Optional<Assessment> assess(Sample sample) {
         ExecutionStatistics statistics = sample.statistics();
         long methodFailures = statistics.failureCount() - sample.externalFailures();
         Prior prior = sample.prior();
@@ -69,6 +95,17 @@ public final class ToolReliability {
             boolean trustedAtomicTool) {
     }
 
+    public record PlanningReference(
+            /** 历史统计适用的批准范围编号。 */
+            String rangeId,
+            /** 该范围内按现有公式计算的估计成功率。 */
+            double score,
+            /** 该范围内已确认的实际成功次数。 */
+            long successCount,
+            /** 当前实现版本已登记为可信原子工具。 */
+            boolean trustedAtomicTool) {
+    }
+
     public interface Lookup {
         /**
          * 按精确工具名及完整入参查询当前有效修订。使用最近一次已验证范围，
@@ -83,6 +120,11 @@ public final class ToolReliability {
         /** 只有支持按实际版本读取的查询才能用于编排直执。 */
         default Optional<Sample> findInVerifiedRange(ToolRef ref, Map<String, Object> arguments) {
             return Optional.empty();
+        }
+
+        /** 按批准顺序返回当前实现各范围的统计，未提供摘要的实现返回空。 */
+        default Map<String, Sample> planningSamples(ToolRef ref) {
+            return Map.of();
         }
     }
 

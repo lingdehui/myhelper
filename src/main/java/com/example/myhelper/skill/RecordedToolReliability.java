@@ -27,6 +27,29 @@ public final class RecordedToolReliability implements RegisteredToolReliabilityL
     }
 
     @Override
+    public List<VerifiedEvidence> planningEvidence(ToolRef ref) {
+        List<ToolParameterStore.ApprovedRange> approved = parameters.approvedRanges(ref);
+        Map<String, PlanningCounts> countsByRange = new LinkedHashMap<>();
+        for (var execution : parameters.planningExecutions(ref, approved)) {
+            PlanningCounts counts = countsByRange.get(execution.rangeId());
+            if (counts == null) {
+                counts = new PlanningCounts();
+                countsByRange.put(execution.rangeId(), counts);
+            }
+            counts.record(execution);
+        }
+        List<VerifiedEvidence> evidence = new ArrayList<>();
+        for (var range : approved) {
+            PlanningCounts counts = countsByRange.get(range.id());
+            if (counts != null) {
+                evidence.add(new VerifiedEvidence(ref, new ExecutionStatistics(counts.success, counts.failure, List.of()),
+                        counts.externalFailure, range.id()));
+            }
+        }
+        return List.copyOf(evidence);
+    }
+
+    @Override
     public Optional<VerifiedEvidence> findInVerifiedRange(ToolRef ref, Map<String, Object> arguments) {
         List<ToolParameterStore.ApprovedRange> approved = parameters.approvedRanges(ref);
         String requestedKey = parameters.exactRangeId(arguments);
@@ -124,6 +147,28 @@ public final class RecordedToolReliability implements RegisteredToolReliabilityL
             Map<String, Object> arguments,
             /** 权威执行与验收记录出处。 */
             String source) {
+    }
+
+    private static final class PlanningCounts {
+        /** 当前批准范围内的确认成功。 */
+        private long success;
+        /** 当前批准范围内的确认失败。 */
+        private long failure;
+        /** 已归类为环境因素的确认失败。 */
+        private long externalFailure;
+
+        private void record(ToolParameterStore.PlanningExecution execution) {
+            switch (execution.outcome()) {
+                case SUCCESS -> success++;
+                case FAILURE -> {
+                    failure++;
+                    if (execution.externalFailure()) {
+                        externalFailure++;
+                    }
+                }
+                case UNKNOWN -> { }
+            }
+        }
     }
 
     private static final class Observations {

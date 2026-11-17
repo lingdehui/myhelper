@@ -75,4 +75,4 @@ Neo4j 的事务接口继续使用驱动托管回调，不把事务体挪到回�
 
 检查必须显式运行，不接入根工程默认 Maven 流程；当前入口为 [checks/run.ps1](../checks/run.ps1)，配置与扩展方式见 [checks 说明](../checks/README.md)。它使用指定的既有 JDK 25 和依赖，每次新建编译输出目录，避免旧 class 掩盖源文件遗漏。所有任务窗口继续工作前都须遵守这项目录规则。
 
-“单次主流程”和“循环可并发调用主流程”窗口已确认：AgentCaller.call 只负责一次调用，AgentOrchestrator.submit 是任务组件入口；检查 Harness 不是应用启动，正式启动/装配仍未实现。本次资料迁移不改变上述边界，也不实施前节尚未完成的业务可读性收尾。
+`AgentCaller.call` 只负责一次调用，`AgentOrchestrator.submit` 接收新任务。命令行由 `MyHelperApplication` 启动，文字通过 `TaskEntry` 提交给编排器。检查中的 `Harness` 只用于独立检查。 [应用启动与装配](modules/deployment/21-装配部署与集成验收.md)

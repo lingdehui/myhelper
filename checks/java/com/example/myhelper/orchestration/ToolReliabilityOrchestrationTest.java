@@ -6,6 +6,7 @@ import com.example.myhelper.capability.CheckedCapabilityUse;
 import com.example.myhelper.records.TaskRecordPort;
 import com.example.myhelper.skill.ToolReliability;
 import com.example.myhelper.support.TestModelAdapter;
+import com.example.myhelper.tools.ToolDirectory.ToolRef;
 import com.example.myhelper.world.model.ExecutionStatistics;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -75,6 +76,29 @@ class ToolReliabilityOrchestrationTest {
                 assertEquals(1, actions.arguments.size());
                 assertEquals("model", actions.arguments.getFirst().get("stage"));
             }
+        }
+    }
+
+    @Test
+    void planningReceivesApprovedHistoryForTheResolvedIdentityEvenWhenCurrentArgumentsHaveNoScore() throws Exception {
+        FixedSearch search = new FixedSearch(plan("cached"));
+        Scores scores = new Scores(0);
+        scores.mode = 1;
+        scores.planningSample = new ToolReliability.Sample(new ExecutionStatistics(9, 1, List.of()), 0);
+        Actions actions = new Actions();
+        AgentOrchestrator.Planner planner = new AgentOrchestrator.Planner() {
+            @Override
+            public AgentOrchestrator.Decision decide(AgentOrchestrator.PlanningContext context) {
+                assertEquals(Map.of("echo", List.of(new ToolReliability.PlanningReference("approved", 0.9, 9, false))),
+                        context.toolReliability());
+                assertTrue(actions.arguments.isEmpty());
+                return complete();
+            }
+        };
+        try (Harness h = new Harness(search, scores, planner, actions, false)) {
+            assertEquals(AgentOrchestrator.Status.SUCCESS, h.run().status());
+            assertEquals(List.of(new ToolRef("echo", "check-tools", "1")), scores.planningRefs);
+            assertEquals(List.of(Map.of("stage", "cached")), scores.arguments);
         }
     }
 
@@ -188,10 +212,18 @@ class ToolReliabilityOrchestrationTest {
         private int mode;
         /** 记录最终参数，验证查询发生在依赖绑定之后。 */
         private final List<Map<String, Object>> arguments = new ArrayList<>();
+        /** 记录规划查分所用的执行绑定。 */
+        private final List<ToolRef> planningRefs = new ArrayList<>();
+        /** 与本次工具参数无关的已批准范围统计。 */
+        private ToolReliability.Sample planningSample;
         private Scores(long successes) { this.successes = successes; }
         @Override public Optional<ToolReliability.Sample> findInVerifiedRange(
-                com.example.myhelper.tools.ToolDirectory.ToolRef ref, Map<String, Object> args) {
+                ToolRef ref, Map<String, Object> args) {
             return findInVerifiedRange(ref.toolName(), args);
+        }
+        @Override public synchronized Map<String, ToolReliability.Sample> planningSamples(ToolRef ref) {
+            planningRefs.add(ref);
+            return planningSample == null ? Map.of() : Map.of("approved", planningSample);
         }
         @Override public synchronized Optional<ToolReliability.Sample> findInVerifiedRange(String tool, Map<String, Object> args) {
             arguments.add(args);

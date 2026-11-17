@@ -20,10 +20,7 @@ public class ModelClientConfiguration {
             @Qualifier("openAiChatModel") OpenAiChatModel configuredClient,
             ObjectProvider<ModelRoutingProvider> routingProvider,
             Environment environment) {
-        String modelRef = environment.getProperty("myhelper.llm.model-ref");
-        if (modelRef == null) {
-            modelRef = configuredClient.getDefaultOptions().getModel();
-        }
+        String modelRef = configuredModelRef(environment, configuredClient);
         boolean supportsTools = environment.getProperty("myhelper.llm.supports-tools", Boolean.class, true);
         // 沿用已配置的连接和模型选项。单次调用发生错误时交给编排层处理。
         OpenAiChatModel client = configuredClient.mutate()
@@ -37,5 +34,11 @@ public class ModelClientConfiguration {
     @Bean
     public AgentCaller agentCaller(ConfiguredModelAdapter adapter, ObjectProvider<ToolCallback> callbacks) {
         return new AgentCaller(adapter, callbacks.orderedStream().toList());
+    }
+
+    /** 应用提交任务与模型目录注册共用同一配置引用。 */
+    public static String configuredModelRef(Environment environment, OpenAiChatModel client) {
+        String modelRef = environment.getProperty("myhelper.llm.model-ref");
+        return modelRef == null ? client.getDefaultOptions().getModel() : modelRef;
     }
 }

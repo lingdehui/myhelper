@@ -8,6 +8,8 @@ import java.time.Instant;
 import com.example.myhelper.orchestration.ToolReliabilityGate;
 import com.example.myhelper.persistence.*;
 import com.example.myhelper.tools.ToolDirectory;
+import com.example.myhelper.world.model.FailureCategory;
+import com.example.myhelper.world.model.FailureCause;
 import com.example.myhelper.world.model.WorldEntity;
 import java.util.*;
 import java.util.function.Function;
@@ -137,6 +139,53 @@ class SkillPersistenceIntegrationTest {
         assertEquals(2, f.database.rows.size());
     }
 
+    @Test void planningReferencesUseApprovedVersionEvidenceAndExistingFormulaWithoutCallingModel() {
+        Fixture f = new Fixture(true);
+        f.approveRanges("range", "environment-only", "unknown-only", "empty");
+        assertTrue(f.reliability.planningReferences(f.ref).isEmpty(), "先验单独存在时不给数字");
+        Map<String, Object> arguments = Map.of("value", 1);
+        var observation = f.observation("success", f.parameters.exactRangeId(arguments),
+                ToolParameterStore.Outcome.SUCCESS, null);
+        f.parameters.record(observation);
+        f.parameters.associateApprovedRange(observation, "range");
+        f.parameters.record(f.observation("method-failure", "range", ToolParameterStore.Outcome.FAILURE, FailureCategory.PLAN));
+        f.parameters.record(f.observation("environment-failure", "range", ToolParameterStore.Outcome.FAILURE, FailureCategory.ENVIRONMENT));
+        f.parameters.record(f.observation("no-method-evidence", "environment-only", ToolParameterStore.Outcome.FAILURE, FailureCategory.ENVIRONMENT));
+        f.parameters.record(f.observation("unconfirmed", "unknown-only", ToolParameterStore.Outcome.UNKNOWN, null));
+        f.parameters.record(f.observation("unapproved", "other", ToolParameterStore.Outcome.SUCCESS, null));
+
+        var references = f.reliability.planningReferences(f.ref);
+        assertEquals(1, references.size());
+        var reference = references.getFirst();
+        assertEquals("range", reference.rangeId());
+        assertEquals(20.0 / 22.0, reference.score());
+        assertEquals(1, reference.successCount());
+        assertTrue(reference.trustedAtomicTool());
+        assertTrue(f.reliability.planningReferences(new ToolDirectory.ToolRef("echo", "instance", "stale-v0")).isEmpty());
+        assertEquals(0, f.modelCalls);
+    }
+
+    @Test void planningReferencesCapApprovedRangesAndOmitIncompleteEvidencePage() {
+        Fixture f = new Fixture(false);
+        f.approveRanges("z", "b", "a", "c", "d", "e", "f", "g", "h");
+        for (String id : List.of("a", "b", "c", "d", "e", "f", "g", "h", "z")) {
+            f.parameters.record(f.observation("success-" + id, id, ToolParameterStore.Outcome.SUCCESS, null));
+        }
+        var references = f.reliability.planningReferences(f.ref);
+        assertEquals(8, references.size());
+        assertEquals("z", references.getFirst().rangeId());
+        assertEquals("g", references.getLast().rangeId());
+        assertEquals(1, f.database.queryCount);
+
+        // 有后续页时，仍只有一次有界事实查询，不能用第一页估计。
+        f.database.nextCursor = new StorageQuery.Cursor(DualWriteStore.Database.NEO4J, "more");
+        assertTrue(f.reliability.planningReferences(f.ref).isEmpty());
+        assertEquals(2, f.database.queryCount);
+        assertEquals(200, f.database.lastRequest.limit());
+        assertNull(f.database.lastRequest.cursor());
+        assertEquals(0, f.modelCalls);
+    }
+
     private static RunArchivePort.ArchivedRun archive(String phase) {
         var key = new RunArchivePort.ArchiveRef("task", "root");
         Map<String, Object> arguments = Map.of("value", 1);
@@ -197,6 +246,14 @@ class SkillPersistenceIntegrationTest {
                     "archive/" + operation, arguments, ToolParameterStore.Outcome.SUCCESS, "actual-result", null, null);
         }
 
+        ToolParameterStore.Execution observation(String id, String range, ToolParameterStore.Outcome outcome,
+                                                  FailureCategory category) {
+            FailureCause failure = category == null ? null
+                    : new FailureCause("test-" + category, category, "test failure", null, 1, List.of());
+            return new ToolParameterStore.Execution(new ToolParameterStore.Scope(ref, range), id, "archive/" + id,
+                    Map.of("value", 1), outcome, "actual-result", null, failure);
+        }
+
         void approveRange() {
             approveRanges("range");
         }
@@ -219,6 +276,9 @@ class SkillPersistenceIntegrationTest {
         final Map<String, WorldEntity> rows = new LinkedHashMap<>();
         final EntityJson json = new EntityJson();
         boolean failWrites;
+        int queryCount;
+        StorageQuery.PageRequest lastRequest;
+        StorageQuery.Cursor nextCursor;
         @Override public Optional<WorldEntity> read(String id) { return Optional.ofNullable(rows.get(id)); }
         @Override public boolean writeConditionally(WorldEntity old, WorldEntity replacement) {
             if (failWrites) { throw new IllegalStateException("database unavailable"); }
@@ -227,6 +287,8 @@ class SkillPersistenceIntegrationTest {
             return true;
         }
         @Override public StorageQuery.Page query(StorageQuery.PageRequest request) {
+            queryCount++;
+            lastRequest = request;
             List<WorldEntity> found = new ArrayList<>();
             for (WorldEntity row : rows.values()) {
                 var node = json.parse(json.encode(row));
@@ -240,7 +302,7 @@ class SkillPersistenceIntegrationTest {
                 }
                 if (accepted) { found.add(row); }
             }
-            return new StorageQuery.Page(found, null);
+            return new StorageQuery.Page(found, nextCursor);
         }
         @Override protected void save(List<WorldEntity> values) {
             for (WorldEntity value : values) { rows.put(value.id(), json.entity(json.encode(value))); }

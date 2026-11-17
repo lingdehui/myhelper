@@ -5,16 +5,20 @@ import com.example.myhelper.persistence.DualWriteStore;
 import com.example.myhelper.persistence.StorageQuery;
 import com.example.myhelper.world.model.ContextUnitType;
 import com.example.myhelper.tools.ToolDirectory.ToolRef;
+import com.example.myhelper.world.model.FailureCategory;
 import com.example.myhelper.world.model.FailureCause;
 import com.example.myhelper.world.model.WorldEntity;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -22,6 +26,8 @@ import java.util.function.Consumer;
 public final class ToolParameterStore {
     /** Neo4j 中用于区分本模块观测的标识。 */
     private static final String OBSERVATION_KIND = "skill-tool-execution";
+    /** 每次事实查询的最大返回数量。 */
+    private static final int EVIDENCE_PAGE_SIZE = 200;
     /** 统一数据库入口。 */
     private final DualWriteStore storage;
     /** 在业务记录和实体 JSON 之间转换。 */
@@ -109,25 +115,16 @@ public final class ToolParameterStore {
     }
 
     public void forEach(ToolRef ref, List<ApprovedRange> approved, Consumer<Execution> consumer) {
-        var active = new java.util.HashSet<String>();
-        for (ApprovedRange range : approved) {
-            active.add(range.id());
-        }
-        StorageQuery.Filter filter = new StorageQuery.Filter(List.of(
-                new StorageQuery.Match("/data/kind", List.of(OBSERVATION_KIND)),
-                new StorageQuery.Match("/data/toolName", List.of(ref.toolName())),
-                new StorageQuery.Match("/data/sourceInstance", List.of(ref.sourceInstance())),
-                new StorageQuery.Match("/data/implementationVersion", List.of(ref.implementationVersion()))));
+        Set<String> active = activeRangeIds(approved);
+        StorageQuery.Filter filter = executionFilter(ref);
         StorageQuery.Cursor cursor = null;
         do {
             StorageQuery.Page page = storage.query(DualWriteStore.Database.NEO4J,
-                    new StorageQuery.PageRequest(filter, 200, cursor));
+                    new StorageQuery.PageRequest(filter, EVIDENCE_PAGE_SIZE, cursor));
             for (WorldEntity row : page.entities()) {
                 Execution execution = json.convertValue(row.data().get("execution"), Execution.class);
-                if (!ref.equals(execution.scope().tool()) || row.contextUnitType() != ContextUnitType.OBSERVATION) {
-                    throw new IllegalStateException("工具执行证据的范围或类型不一致");
-                }
-                if (row.data().get("approvedRangeId") instanceof String id && active.contains(id)) {
+                String id = effectiveRangeId(ref, execution.scope(), row, active);
+                if (!id.equals(execution.scope().rangeId())) {
                     execution = new Execution(new Scope(ref, id), execution.executionId(), execution.source(),
                             execution.arguments(), execution.outcome(), execution.result(),
                             execution.error(), execution.failureCause());
@@ -136,6 +133,76 @@ public final class ToolParameterStore {
             }
             cursor = page.nextCursor();
         } while (cursor != null);
+    }
+
+    /** 规划只读一页，证据不完整时不根据部分记录估算。 */
+    List<PlanningExecution> planningExecutions(ToolRef ref, List<ApprovedRange> approved) {
+        if (approved.isEmpty()) {
+            return List.of();
+        }
+        StorageQuery.Page page = storage.query(DualWriteStore.Database.NEO4J,
+                new StorageQuery.PageRequest(executionFilter(ref), EVIDENCE_PAGE_SIZE, null));
+        if (page.nextCursor() != null || page.entities().size() > EVIDENCE_PAGE_SIZE) {
+            return List.of();
+        }
+        Set<String> active = activeRangeIds(approved);
+        List<PlanningExecution> executions = new ArrayList<>();
+        for (WorldEntity row : page.entities()) {
+            if (!(row.data().get("execution") instanceof Map<?, ?> details)) {
+                throw new IllegalStateException("工具执行证据缺少执行记录");
+            }
+            Scope scope = json.convertValue(details.get("scope"), Scope.class);
+            String rangeId = effectiveRangeId(ref, scope, row, active);
+            if (!active.contains(rangeId)) {
+                continue;
+            }
+            Outcome outcome = Objects.requireNonNull(json.convertValue(details.get("outcome"), Outcome.class));
+            boolean external = false;
+            if (outcome == Outcome.FAILURE) {
+                if (!(details.get("failureCause") instanceof Map<?, ?> cause)) {
+                    throw new IllegalStateException("确认失败必须提供失败归因");
+                }
+                FailureCategory category = Objects.requireNonNull(json.convertValue(cause.get("category"), FailureCategory.class));
+                external = category == FailureCategory.ENVIRONMENT;
+            }
+            executions.add(new PlanningExecution(rangeId, outcome, external));
+        }
+        return List.copyOf(executions);
+    }
+
+    private static Set<String> activeRangeIds(List<ApprovedRange> approved) {
+        Set<String> active = new HashSet<>();
+        for (ApprovedRange range : approved) {
+            active.add(range.id());
+        }
+        return active;
+    }
+
+    private static StorageQuery.Filter executionFilter(ToolRef ref) {
+        return new StorageQuery.Filter(List.of(
+                new StorageQuery.Match("/data/kind", List.of(OBSERVATION_KIND)),
+                new StorageQuery.Match("/data/toolName", List.of(ref.toolName())),
+                new StorageQuery.Match("/data/sourceInstance", List.of(ref.sourceInstance())),
+                new StorageQuery.Match("/data/implementationVersion", List.of(ref.implementationVersion()))));
+    }
+
+    private static String effectiveRangeId(ToolRef ref, Scope scope, WorldEntity row, Set<String> active) {
+        if (scope == null || !ref.equals(scope.tool()) || row.contextUnitType() != ContextUnitType.OBSERVATION) {
+            throw new IllegalStateException("工具执行证据的范围或类型不一致");
+        }
+        if (row.data().get("approvedRangeId") instanceof String id && active.contains(id)) {
+            return id;
+        }
+        return scope.rangeId();
+    }
+
+    record PlanningExecution(
+            /** 已批准且适用于该观测的范围。 */
+            String rangeId,
+            /** 已确认结果或未知状态。 */
+            Outcome outcome,
+            /** 确认属于环境失败。 */
+            boolean externalFailure) {
     }
 
     /** 读取当前批准范围。范围内容只能由独立验证与审核流程提交。 */

@@ -1,6 +1,9 @@
 package com.example.myhelper.orchestration;
 
 import com.example.myhelper.agent.AgentCaller;
+import com.example.myhelper.records.TaskInstructionPort;
+import com.example.myhelper.records.TaskRecordPort;
+import com.example.myhelper.skill.ToolReliability.PlanningReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -16,6 +19,7 @@ import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.ai.tool.definition.ToolDefinition;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
@@ -29,10 +33,24 @@ class AgentCallerPlannerTest {
             public ChatModel apply(String reference) {
                 return model;
             }
-        }, List.of());
+        }, List.of(new ToolCallback() {
+            @Override
+            public ToolDefinition getToolDefinition() {
+                return ToolDefinition.builder().name("read_temperature").description("读取室温").inputSchema("{}").build();
+            }
+
+            @Override
+            public String call(String input) {
+                throw new AssertionError("规划只读取工具定义");
+            }
+        }));
         AgentCallerPlanner planner = new AgentCallerPlanner(caller);
         planner.decide(new AgentOrchestrator.PlanningContext("run-fixed", "准备睡眠环境", Map.of("room", "卧室"),
-                "test-model", List.of(), List.of(), List.of()));
+                "test-model", List.of("read_temperature"), List.of(), List.of(), "run-fixed",
+                AgentOrchestrator.PlanningPhase.NORMAL, TaskRecordPort.RecoverySnapshot.empty(),
+                TaskInstructionPort.Snapshot.empty(), Map.of(
+                        "read_temperature", List.of(new PlanningReference("indoor", 0.92, 12, false)),
+                        "restricted_tool", List.of(new PlanningReference("private", 1.0, 5, true)))));
 
         ObjectMapper json = new ObjectMapper();
         Map<String, Object> actual = new LinkedHashMap<>();
@@ -47,7 +65,7 @@ class AgentCallerPlannerTest {
         }
         actual.put("tools", definitions);
         actual.put("internalExecution", options.getInternalToolExecutionEnabled());
-        // 快照包含本轮新增的分支协议；运行检查时仍从独立资源读期望值。
+        // 从独立快照核对提示、允许工具及其可靠度，排除未授权的分数。
         try (InputStream expected = getClass().getResourceAsStream("/llm/planner-request.json")) {
             assertNotNull(expected);
             assertEquals(json.readTree(expected), json.valueToTree(actual));

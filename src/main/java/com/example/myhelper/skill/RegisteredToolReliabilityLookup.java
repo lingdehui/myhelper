@@ -5,6 +5,9 @@ import com.example.myhelper.tools.ToolDirectory.Registration;
 import com.example.myhelper.tools.ToolDirectory.ToolRef;
 import com.example.myhelper.world.model.ExecutionStatistics;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -42,15 +45,38 @@ public final class RegisteredToolReliabilityLookup implements ToolReliability.Lo
         if (evidence.isEmpty() || !ref.equals(evidence.get().ref())) {
             return Optional.empty();
         }
-        VerifiedEvidence verified = evidence.get();
+        return Optional.of(sample(tool, evidence.get()));
+    }
+
+    @Override
+    public Map<String, ToolReliability.Sample> planningSamples(ToolRef ref) {
+        Registration tool = directory.find(ref.toolName()).orElse(null);
+        if (tool == null || !tool.ref().equals(ref)) {
+            return Map.of();
+        }
+        Map<String, ToolReliability.Sample> samples = new LinkedHashMap<>();
+        for (VerifiedEvidence evidence : evidenceLookup.planningEvidence(ref)) {
+            if (ref.equals(evidence.ref())) {
+                samples.put(evidence.verifiedRangeId(), sample(tool, evidence));
+            }
+        }
+        return Collections.unmodifiableMap(samples);
+    }
+
+    private static ToolReliability.Sample sample(Registration tool, VerifiedEvidence verified) {
         ToolDirectory.Prior prior = tool.priorFor(verified.verifiedRangeId()).orElse(NO_PRIOR);
-        return Optional.of(new ToolReliability.Sample(verified.statistics(), verified.externalFailures(),
-                new ToolReliability.Prior(prior.successRate(), prior.weight()), tool.trustedAtomicTool()));
+        return new ToolReliability.Sample(verified.statistics(), verified.externalFailures(),
+                new ToolReliability.Prior(prior.successRate(), prior.weight()), tool.trustedAtomicTool());
     }
 
     public interface VerifiedEvidenceLookup {
         /** 按工具实现和完整参数查当前有效修订及已验证范围。需要读数据库时经统一存储入口。 */
         Optional<VerifiedEvidence> findInVerifiedRange(ToolRef ref, Map<String, Object> arguments);
+
+        /** 只返回当前已批准范围的有界统计。 */
+        default List<VerifiedEvidence> planningEvidence(ToolRef ref) {
+            return List.of();
+        }
     }
 
     public record VerifiedEvidence(

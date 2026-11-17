@@ -14,6 +14,7 @@ import com.example.myhelper.records.TaskRecordPort.Disposition;
 import com.example.myhelper.records.TaskRecordPort.EventKind;
 import com.example.myhelper.records.TaskRecordPort.RecoverySnapshot;
 import com.example.myhelper.records.TaskRecordPort.TaskSnapshot;
+import com.example.myhelper.skill.ToolReliability.PlanningReference;
 import com.example.myhelper.tools.ToolDirectory.ToolRef;
 import com.example.myhelper.orchestration.ExecutionTraceStore.NodeKind;
 import com.example.myhelper.orchestration.ExecutionTraceStore.EdgeKind;
@@ -23,6 +24,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -564,6 +566,8 @@ public final class AgentOrchestrator {
                         // 达到预算后拒绝调用，不在这里偷偷换模型或重试。
                         throw new IllegalStateException(LlmTexts.MODEL_CALL_LIMIT_REACHED);
                     }
+                    Map<String, List<PlanningReference>> references = planningToolReliability(control);
+                    control.check();
                     Map<String, Object> started = new LinkedHashMap<>(assignment);
                     started.put("startedAt", Instant.now().toString());
                     control.records.emit(run, callId, branch.id(), revision, EventKind.MODEL_CALL_STARTED, started);
@@ -577,7 +581,7 @@ public final class AgentOrchestrator {
                         decision = Objects.requireNonNull(planner.decide(new PlanningContext(run, goal, args, branch.modelRef(),
                                 // 把根工具权限、入口候选和本任务反馈交给模型。
                                 control.request.toolNames(), candidates, history, control.records.taskId(), phase, snapshot,
-                                control.records.instructions())));
+                                control.records.instructions(), references)));
                     } finally {
                         // 先结束计时，再写返回记录和链路；失败样本也不混入存储耗时。
                         modelElapsedNanos.set(Math.max(0L, System.nanoTime() - startedNanos));
@@ -649,6 +653,25 @@ public final class AgentOrchestrator {
     }
 
     // 原始任务语义交给分类/画像模块；本类不从供应商名、工具名或字符串规则猜任务标签。
+    private Map<String, List<PlanningReference>> planningToolReliability(Control control) {
+        Map<String, List<PlanningReference>> references = new LinkedHashMap<>();
+        for (String name : new LinkedHashSet<>(control.request.toolNames())) {
+            control.check();
+            try {
+                ToolRef ref = actions.resolveTool(name).orElse(null);
+                if (ref != null && name.equals(ref.toolName())) {
+                    List<PlanningReference> ranges = toolReliability.planningReferences(ref);
+                    if (!ranges.isEmpty()) {
+                        references.put(name, ranges);
+                    }
+                }
+            } catch (RuntimeException unavailable) {
+                // 参考数据读取失败时保留本轮的工具合同，按可靠度未知继续规划。
+            }
+        }
+        return references;
+    }
+
     private static Map<String, Object> modelTaskFacts(Control control, ModelAdapter.Binding branch, String goal,
                                                      Map<String, Object> args, PlanningPhase phase, long revision) {
         Map<String, Object> facts = new LinkedHashMap<>();
@@ -1732,7 +1755,17 @@ public final class AgentOrchestrator {
             /** 外部模块的最新问题和进度，模型据此提出处理方案。 */
             RecoverySnapshot recovery,
             /** 本运行固定采用的指令及其版本；历史实际进度来自 recovery。 */
-            TaskInstructionPort.Snapshot instructions) {
+            TaskInstructionPort.Snapshot instructions,
+            /** 按允许工具名称附带的历史范围估计，缺项表示未知。 */
+            Map<String, List<PlanningReference>> toolReliability) {
+        public PlanningContext(String runId, String goal, Map<String, Object> arguments, String modelRef,
+                               List<String> toolNames, List<CapabilityLookup.Candidate> candidates, List<Feedback> history,
+                               String taskId, PlanningPhase phase, RecoverySnapshot recovery,
+                               TaskInstructionPort.Snapshot instructions) {
+            this(runId, goal, arguments, modelRef, toolNames, candidates, history, taskId, phase, recovery,
+                    instructions, Map.of());
+        }
+
         public PlanningContext(String runId, String goal, Map<String, Object> arguments, String modelRef,
                                List<String> toolNames, List<CapabilityLookup.Candidate> candidates, List<Feedback> history,
                                String taskId, PlanningPhase phase, RecoverySnapshot recovery) {
@@ -1760,6 +1793,14 @@ public final class AgentOrchestrator {
             Objects.requireNonNull(phase);
             Objects.requireNonNull(recovery);
             Objects.requireNonNull(instructions);
+            Map<String, List<PlanningReference>> visibleReferences = new LinkedHashMap<>();
+            for (String name : toolNames) {
+                List<PlanningReference> ranges = toolReliability.get(name);
+                if (ranges != null && !ranges.isEmpty()) {
+                    visibleReferences.put(name, List.copyOf(ranges));
+                }
+            }
+            toolReliability = Map.copyOf(visibleReferences);
         }
     }
 

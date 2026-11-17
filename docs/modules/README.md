@@ -1,6 +1,6 @@
 # 模块、源码与任务窗口
 
-更新于 2026-11-16。目录名优先对应当前代码包。第 13、14 篇主要对应 `orchestration` 包。逐包的实际逻辑、检查与已知问题见[全量实现与代码复核](../completed/全量实现与代码复核.md)。
+更新于 2026-11-17。目录名优先对应当前代码包。第 13、14 篇主要对应 `orchestration` 包。逐包的实际逻辑、检查与已知问题见[全量实现与代码复核](../completed/全量实现与代码复核.md)。
 
 | 模块 | 维护窗口 | 当前源码或接入点 | 文档 |
 | --- | --- | --- | --- |
@@ -18,8 +18,8 @@
 | `skill` 技能固化 | 固化技能窗口，数据库窗口补仓储与接线检查 | [skill 包](../../src/main/java/com/example/myhelper/skill/) 已有生产候选/审核/双库发布、参数仓储、模型范围查询及装配；实际执行自动记账和归档消费待完成 | [16 技能固化](skill/16-技能固化开发文档.md) |
 | `exploration` 自主探索 | 设计待接续 | 开发设计 | [17 自主探索](exploration/17-自主探索开发文档.md) |
 | `tools` 工具管理 | 工具生成管理 | [tools 包](../../src/main/java/com/example/myhelper/tools/)已有来源目录和范围先验配置。动态发布、隔离、公共变量待实现 | [25 工具管理与隔离运行](tools/25-工具管理与隔离运行设计.md) |
-| `interaction` 交互与语音 | 设计待接续 | 语音资源已保留，重写入口待接入 | [20 交互与语音](interaction/20-交互与语音开发文档.md) |
-| `deployment` 应用装配 | 总 | 存储配置已有实现，应用入口与核心装配待做 | [21 装配部署与集成验收](deployment/21-装配部署与集成验收.md) |
+| `interaction` 交互与语音 | 应用入口 | [MyHelperApplication.main](../../src/main/java/com/example/myhelper/MyHelperApplication.java) 启动应用，[interaction 包](../../src/main/java/com/example/myhelper/interaction/) 接收文字、提交任务并显示结果 | [20 应用启动链路](interaction/20-交互与语音开发文档.md#应用启动链路) |
+| `deployment` 应用装配 | 总 | [MyHelperApplication](../../src/main/java/com/example/myhelper/MyHelperApplication.java) 已提供命令行应用启动；生产业务装配与外部服务联调按模块接续 | [21 装配部署与集成验收](deployment/21-装配部署与集成验收.md) |
 | `extensions` 旧扩展 | 设计待接续 | 按场景恢复 | [22 扩展模块边界](extensions/22-扩展模块开发边界.md) |
 
 跨模块的验收、任务进度及恢复设计在 [26 任务验收、进度与断点恢复](../planned/26-任务验收进度与断点恢复设计.md)。总窗口的入口为[项目总文档](../00-重构项目总文档.md)与[接续记录](../重写架构与进度.md)。

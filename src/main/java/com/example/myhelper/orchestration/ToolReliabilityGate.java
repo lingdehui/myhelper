@@ -4,6 +4,7 @@ import com.example.myhelper.llm.LlmTexts;
 import com.example.myhelper.skill.ToolReliability;
 import com.example.myhelper.tools.ToolDirectory.ToolRef;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -44,6 +45,11 @@ public final class ToolReliabilityGate {
     /** 旧装配没有提供技能查询时，不把未知评分当成可靠。 */
     public static ToolReliabilityGate unavailable() {
         return new ToolReliabilityGate(null, DEFAULT_THRESHOLD);
+    }
+
+    /** 为规划提供同一工具实现的已批准范围统计。 */
+    List<ToolReliability.PlanningReference> planningReferences(ToolRef ref) {
+        return reliability == null ? List.of() : reliability.planningReferences(ref);
     }
 
     /** 使用最终工具参数查询，不能按工具名或语义相似度默认放行。 */

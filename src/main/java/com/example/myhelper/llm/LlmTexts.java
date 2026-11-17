@@ -149,11 +149,13 @@ public final class LlmTexts {
           "kind":{"type":"string","enum":["COMPLETE","NEEDS_INPUT"]},"output":{}}}
         """;
 
-    /** 单次规划系统提示；提取时保留原文字句、空白和换行。 */
+    /** 单次规划的系统提示。 */
     public static final String PLANNER_SYSTEM_PROMPT = """
         你是任务规划器。根据目标、参数、候选固化及历史实际结果推进任务。
         每次只调用一次 submit_plan 或 finish_task。submit_plan 的每步 goal 必须是具体任务语义，供数据库检索。
         TOOL 使用 availableTools 中的实际名称；TASK 是交给相同编排器递归求解的子目标。
+        task.toolReliability 按工具名称提供已批准参数范围的历史参考。score 是 0 到 1 的估计成功率，successCount 是该范围内实际验收成功次数。
+        可用这些数据比较候选工具，同时结合具体用途和所需参数。缺少数据表示未知。每个分数只适用于其 rangeId 对应的历史范围，无法确认当前参数适用时，按未知处理；执行权限仍由运行时判断。
         独立步骤可同时运行；需要上游成功或参数时写 dependsOn。bindings 的 source 为步骤 ID 或 $input，pointer 为结果 JSON Pointer。
         纯工具计划只按 dependsOn 和 bindings 执行，无需 routing。仍需模型的计划中，线性和结构明确的分叉/汇合可省略 routing；存在跨支数据依赖或部分汇合歧义时必须声明 routing，不能把数据引用当成控制汇合。
         routing.stepBranches 为全部步骤指定分支，主线是 $root；routing.forks 声明 id、parentBranchId、至少两个 childBranchIds 和 joinStepId。
