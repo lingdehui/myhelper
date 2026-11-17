@@ -8,6 +8,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /** 有界内存执行图；所有更新串行化，消费者只取得不可变快照。尚不支持跨重启恢复。 */
 public final class ExecutionTraceStore implements ExecutionTracePort {
@@ -111,7 +112,16 @@ public final class ExecutionTraceStore implements ExecutionTracePort {
     // 在同一锁内复制图，避免消费者看到一半更新的节点与关系。
     public synchronized Snapshot snapshot(String root) {
         // 先找到已存在的根图，未知根身份明确报错。
-        Graph graph = graph(root);
+        return copySnapshot(graph(root));
+    }
+
+    /** 展示端可按需读图；归档回收与读取用同一把锁，回收后返回空。 */
+    public synchronized Optional<Snapshot> findSnapshot(String root) {
+        Graph graph = runs.get(root);
+        return graph == null ? Optional.empty() : Optional.of(copySnapshot(graph));
+    }
+
+    private static Snapshot copySnapshot(Graph graph) {
         // 仅返回只读集合；节点内部 JSON 也已深复制。
         return new Snapshot(Map.copyOf(graph.nodes), List.copyOf(graph.edges), List.copyOf(graph.events), graph.closed);
     }

@@ -6,20 +6,142 @@ package com.example.myhelper.llm;
  * 本类只保存文本，不调用模型、不决定业务流程；修改协议文本需同步相关文档和检查。
  */
 public final class LlmTexts {
-    /** 固定归档缺口；不将不完整运行作为可固化来源。 */
+    /** 应用停机不等于用户取消，任务可按持久事实恢复。 */
+    public static final String TASK_APPLICATION_STOPPING = "应用正在停止，本次运行收束后保留任务供恢复";
+
+    /** 最终图不存在时保留缺口，不能作为完整固化来源。 */
     public static final String ARCHIVE_NO_GRAPH = "运行没有可读取的最终执行图";
+    /** 封闭执行图失败时记录明确原因。 */
     public static final String ARCHIVE_CLOSE_FAILED = "执行图封闭失败";
+    /** 读取封闭图失败时不能伪造最终快照。 */
     public static final String ARCHIVE_SNAPSHOT_FAILED = "最终执行图读取失败";
+    /** 尚未封闭的执行图仍可能发生变化。 */
     public static final String ARCHIVE_NOT_CLOSED = "执行图尚未封闭";
+    /** 空图不满足完整归档条件。 */
     public static final String ARCHIVE_EMPTY_GRAPH = "执行图没有执行节点";
+    /** 归档节点校验失败的前缀，后接实际节点信息。 */
     public static final String ARCHIVE_INCOMPLETE_NODE = "执行节点状态或身份不完整：";
+    /** 归档关系必须引用图中实际存在的节点。 */
     public static final String ARCHIVE_INCOMPLETE_EDGE = "执行图包含缺失端点";
-    /** 生产任务记录模块的恢复说明。 */
+    /** 最终提交合同要求提供结束事件。 */
+    public static final String ARCHIVE_END_EVENT_REQUIRED = "最终提交必须包含 RUN_ENDED";
+    /** 标记完整时必须提供已封闭且无缺口的图。 */
+    public static final String ARCHIVE_COMPLETE_GRAPH_REQUIRED = "完整归档必须持有封闭且无缺口的执行图";
+    /** 标记不完整时必须给出可回查的缺口说明。 */
+    public static final String ARCHIVE_GAPS_REQUIRED = "不完整归档必须说明缺口";
+    /** 空图不能通过完整归档校验。 */
+    public static final String ARCHIVE_COMPLETE_GRAPH_EMPTY = "完整归档不能是空图";
+    /** 完整归档的所有节点必须已结束且身份一致。 */
+    public static final String ARCHIVE_INVALID_NODE = "完整归档中节点未终止或身份不完整";
+    /** 完整归档的关系不得引用图外节点。 */
+    public static final String ARCHIVE_INVALID_EDGE = "完整归档中关系端点缺失";
+    /** 固定归档身份须与结束事件及合同版本一致。 */
+    public static final String ARCHIVE_IDENTITY_MISMATCH = "归档版本或运行身份不匹配";
+    /** 归档事件集合只接受同一任务的同一根运行。 */
+    public static final String ARCHIVE_EVENT_MISMATCH = "归档混入其他运行的事件";
+    /** 归档事件集合必须包含对应的结束事件。 */
+    public static final String ARCHIVE_END_EVENT_MISSING = "归档缺少结束事件";
+    /** 默认审核策略不采信未经独立确认的处理结论。 */
     public static final String RECORDS_PENDING_REVIEW = "处理结论尚未由独立验收确认";
+    /** 已保存执行结果，下一步需结合证据核对。 */
     public static final String RECORDS_EXECUTION_REVIEW = "已有执行结果需要结合证据判断";
+    /** 模型暂不可用时保留任务供后续尝试。 */
     public static final String RECORDS_MODEL_RETRY = "模型请求失败，等待新的调用机会";
+    /** 未确认效果的同参数动作不能直接重复派发。 */
     public static final String RECORDS_UNCONFIRMED_EFFECT = "动作已记录意图但未确认返回，先核对实际影响";
+    /** 持久任务尚未完成，可按已有事实恢复。 */
     public static final String RECORDS_RESUMABLE = "已保存的任务尚未完成，可按现有记录接续";
+
+    /** 随机生成的任务编号已被其他任务占用。 */
+    public static final String RECORDS_TASK_ID_COLLISION = "任务编号冲突";
+    /** 当前领取未结束或运行编号已在历史中使用。 */
+    public static final String RECORDS_RUN_ALREADY_CLAIMED = "任务仍有领取或运行身份已使用";
+    /** 任务状态不满足恢复条件。 */
+    public static final String RECORDS_NOT_RESUMABLE = "任务当前不允许恢复";
+    /** 结束事件必须与归档和释放领取一起提交。 */
+    public static final String RECORDS_END_REQUIRES_FINALIZATION = "结束事件必须经 endRun 提交";
+    /** 传入领取与权威记录不一致。 */
+    public static final String RECORDS_CLAIM_MISMATCH = "领取身份不匹配";
+    /** 审核依据已被新事实替代，须重新判断。 */
+    public static final String RECORDS_REVIEW_STALE = "审核依据已过期";
+    /** 提案引用的问题已不在当前待核对事项中。 */
+    public static final String RECORDS_REVIEW_ITEM_MISSING = "审核事项不存在";
+    /** 独立审核不能批准本次提案未提出的事项。 */
+    public static final String RECORDS_REVIEW_OUTSIDE_PROPOSAL = "审核批准了未提出的事项";
+    /** 审核期间发生并发写入，不能覆盖新事实。 */
+    public static final String RECORDS_REVIEW_CONFLICT = "审核期间记录变化，请重新核对";
+    /** 最终提交必须包含固定的结束事件。 */
+    public static final String RECORDS_END_EVENT_MISSING = "缺少 RUN_ENDED";
+    /** 同一运行已经归档的载荷不可被修改。 */
+    public static final String RECORDS_ARCHIVE_IMMUTABLE = "已归档运行不得改变";
+    /** 请求的固定归档尚不存在。 */
+    public static final String RECORDS_ARCHIVE_MISSING = "归档不存在";
+    /** 幂等指令编号不能对应两份不同正文。 */
+    public static final String RECORDS_COMMAND_CONFLICT = "相同指令编号的内容不一致";
+    /** 指令提交所依据的版本已失效。 */
+    public static final String RECORDS_INSTRUCTION_STALE = "指令版本过期";
+    /** 任务状态或运行身份不允许建立绑定。 */
+    public static final String RECORDS_BIND_FORBIDDEN = "任务不能绑定当前运行";
+    /** 计划修订号的取值约束。 */
+    public static final String RECORDS_PLAN_REVISION_NEGATIVE = "计划版本不能为负";
+    /** 同一计划身份的重放必须保持内容一致。 */
+    public static final String RECORDS_PLAN_CONFLICT = "同一计划身份内容不同";
+    /** 事件查询必须使用有界分页。 */
+    public static final String RECORDS_EVENT_PAGE_LIMIT = "事件页数量必须介于 1 和 1000";
+    /** 事件游标必须来自当前运行。 */
+    public static final String RECORDS_EVENT_CURSOR_INVALID = "事件游标不存在或属于其他运行";
+    /** 核对旧领取前必须取得旧派发器已经停止的证据。 */
+    public static final String RECORDS_STOP_EVIDENCE_REQUIRED = "必须提供旧运行已经停止的核对证据";
+    /** 同一停止核对的重试不能更换证据载荷。 */
+    public static final String RECORDS_STOP_EVIDENCE_CONFLICT = "停止核对证据不一致";
+    /** 已记录停止核对但未找到对应收尾归档。 */
+    public static final String RECORDS_STOP_ARCHIVE_INCOMPLETE = "停止核对归档不完整";
+    /** 旧运行已不再持有任务，不能影响新的领取。 */
+    public static final String RECORDS_STOP_CLAIM_CHANGED = "旧运行不再是当前领取";
+    /** 幂等事件编号不能对应两份不同正文。 */
+    public static final String RECORDS_EVENT_CONFLICT = "相同事件编号内容不同";
+    /** 当前运行已失去持久领取。 */
+    public static final String RECORDS_CLAIM_EXPIRED = "领取已失效";
+    /** 事件身份须与提交它的领取一致。 */
+    public static final String RECORDS_EVENT_CLAIM_MISMATCH = "事件不属于当前领取";
+    /** CAS 冲突达到有界重试次数，交调用方处理。 */
+    public static final String RECORDS_CAS_EXHAUSTED = "任务记录竞争过多，请重试";
+    /** 数据格式版本不受当前记录实现支持。 */
+    public static final String RECORDS_SCHEMA_INCOMPATIBLE = "任务记录格式不兼容";
+    /** 实体编号与正文中的任务身份不一致。 */
+    public static final String RECORDS_IDENTITY_CORRUPT = "任务记录身份损坏";
+    /** 保存的事件顺序含有重复或无效引用。 */
+    public static final String RECORDS_EVENT_ORDER_CORRUPT = "任务事件顺序损坏";
+    /** 保存的事件顺序遗漏了已经存在的事件。 */
+    public static final String RECORDS_EVENT_ORDER_INCOMPLETE = "任务事件顺序不完整";
+    /** 仓储扫描必须使用有界数量。 */
+    public static final String RECORDS_SCAN_LIMIT = "扫描数量必须介于 1 和 1000";
+    /** 规范化记录内容比较失败。 */
+    public static final String RECORDS_COMPARE_FAILED = "任务记录比较失败";
+    /** 持久记录无法编码为受支持的数据。 */
+    public static final String RECORDS_ENCODE_FAILED = "任务记录编码失败";
+    /** 查询任务缺失的前缀，后接实际任务编号。 */
+    public static final String RECORDS_TASK_MISSING_PREFIX = "任务不存在: ";
+
+    /** 桌面角色空闲时的固定指令与 JSON 输出合同。 */
+    public static final String DESKTOP_BEHAVIOR_PLAN = """
+            为当前空闲的桌面角色安排一小段动作。只返回一个 JSON 对象 {"actions":[...]}。
+            用户消息是本次桌面状态。workspace 含工作区宽高以及角色相对于工作区的坐标，
+            props 是当前已占用槽位及其道具，recentActions 和 lastOutcome 用于避免反复播放相同行为。
+            槽位只接受 LEFT、CENTER、RIGHT。坐标由应用根据槽位计算。动作按顺序播放，
+            允许操作本轮前面已创建的道具。CREATE_PROP 要求槽位空闲；
+            LOOK_AT_SLOT、SHOW_PROP 和 HIDE_PROP 要求已有道具，HIDE_PROP 清空该槽位。
+            选择 1 到 %d 个动作。durationMs 必须是正整数，整段时长合计不得超过 %d 毫秒。
+            每个动作仅填写对应字段：
+            - {"type":"POSE","pose":"REST","durationMs":900}。pose 可选 REST、ALERT、THINK。
+            - {"type":"MOVE_TO_ANCHOR","slot":"LEFT","durationMs":900}
+            - {"type":"CREATE_PROP","style":"CUP","color":"LAVENDER","pattern":"PLAIN","slot":"RIGHT","durationMs":1200}。
+              style 可选 CUP、BOOK、STAR；color 可选 LAVENDER、PINK、BLUE；
+              pattern 可选 PLAIN、DOTS、STRIPES，省略时使用 PLAIN。
+            - {"type":"LOOK_AT_SLOT","slot":"RIGHT","durationMs":900}
+            - {"type":"SHOW_PROP","slot":"RIGHT","durationMs":900}
+            - {"type":"HIDE_PROP","slot":"RIGHT","durationMs":900}
+            """;
 
     /** 工具入参对既有验证范围的成员判断协议。 */
     public static final String TOOL_PARAMETER_RANGE_CHECK = """

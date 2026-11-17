@@ -2,7 +2,7 @@
 
 > 共同开发规则（2026-11-11 用户确认）：固定 LLM 文本集中到 LlmTexts；不用 Lambda，以可读性选择循环、方法和 switch，允许 `case ... ->`；所有测试与检查资料统一放入 `checks`。所有任务继续前阅读[24-LLM文本与代码可读性规范](docs/24-LLM文本与代码可读性规范.md)。
 
-更新：2026-11-17。这里是旧 MyHelper 的模块化重构项目。当前已提供命令行文字入口，使用现有递归并发编排执行任务。
+更新：2026-11-17。这里是旧 MyHelper 的模块化重构项目。当前提供终端与 Swing 桌面调试入口，使用同一套递归并发编排执行任务。
 
 ## 阅读入口
 
@@ -23,7 +23,23 @@ java -jar target/desktop-brain-1.0.0.jar
 
 启动后输入一行任务，回车提交，终端按运行 ID 显示结果。输入 `/exit` 等待已提交的结果后退出。实际处理文字需要可用的 OpenAI 兼容模型连接，可通过 `SPRING_AI_OPENAI_BASE_URL`、`SPRING_AI_OPENAI_API_KEY`、`SPRING_AI_OPENAI_CHAT_OPTIONS_MODEL` 覆盖现有配置。
 
+默认输出任务实时进度。启用正式归档后，可在终端输入 `/history <taskId> <rootRunId>` 查看已结束运行的日志。两个 ID 对应进度日志的 `task=` 和 `root=`。 [任务日志](docs/modules/tasklog/任务日志开发文档.md)
+
 终端默认可运行模型任务。业务工具、固化检索与记录服务按装配提供。语音扩展可在运行中向同一个 [TaskEntry](src/main/java/com/example/myhelper/interaction/TaskEntry.java) 提交最终转写。 [交互与语音](docs/modules/interaction/20-交互与语音开发文档.md)
+
+## 启动桌面调试界面
+
+使用 JDK 25 打包后，从 Windows 桌面会话运行以下命令。
+
+```powershell
+java -jar target/desktop-brain-1.0.0.jar --myhelper.ui=desktop
+```
+
+在 IDE 运行 `MyHelperApplication` 时，把 `--myhelper.ui=desktop` 放入程序参数。点击右下角雷姆单手拎着的小包打开对话，拖动角色可移动位置。头顶的半透明小气泡随任务出现，悬停展开文字，单击打开任务树和时间线。角色轮廓与气泡椭圆之外的区域可以直接操作桌面。已结束的任务可从对话的最近任务列表查看。右键角色选择「退出 MyHelper」关闭应用。
+
+桌面使用与终端相同的模型和记录配置。只调试界面时可加 `--myhelper.records.enabled=false`，以跳过正式记录和启动恢复，此时仍需配置可用的模型端点。 [Swing 开发文档](docs/modules/interaction/31-Swing桌面调试界面开发文档.md)
+
+雷姆默认在连续空闲 2 分钟后调用模型规划短动作和本地道具。任务受理、执行和实际收尾期间按任务阶段播放固定姿势。调试时可传入 `--myhelper.desktop.behavior.idle-delay=5s`，关闭空闲规划使用 `--myhelper.desktop.behavior.enabled=false`。 [短期行为规划器](docs/modules/interaction/32-短期行为规划器设计.md#6-首版实现) · [基础动作](docs/modules/interaction/31-Swing桌面调试界面开发文档.md#7-雷姆基础动作)
 
 测试和替身已按用户要求移到独立 [checks](checks/README.md) 目录，`src` 只保留业务代码和资源；checks 中的 Harness/检查 main 不能当成应用启动入口。
 
@@ -52,3 +68,9 @@ java -jar target/desktop-brain-1.0.0.jar
 ## 历史资料
 
 [旧版资料目录](docs/legacy/README.md)汇总了原 01–08、合并稿、早期 Episode 方案和旧构建参考，附原始设计位置及旧源码版本。
+
+### 持久任务与重启恢复
+
+正式入口默认启用 Neo4j 任务记录和启动恢复；数据库不可用会明确报告启动失败。已有任务沿用 taskId，恢复运行新建 rootRunId，暂停和取消的原目标不会自动恢复。配置 myhelper.records.recovery-batch-size 默认 4，myhelper.records.state-directory 缺省为用户目录下 .myhelper/task-runtime；同一安装保持该目录固定。仅在明确不需要持久恢复的演示中使用 --myhelper.records.enabled=false。
+
+运行中的事件和最终归档读取、未知动作核对及单机所有权边界见[任务记录与恢复](docs/modules/records/28-执行记录与恢复端口开发文档.md#13-2026-11-17-正式持久任务与启动恢复已实现)。

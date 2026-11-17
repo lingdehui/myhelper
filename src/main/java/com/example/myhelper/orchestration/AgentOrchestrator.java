@@ -15,6 +15,8 @@ import com.example.myhelper.records.TaskRecordPort.EventKind;
 import com.example.myhelper.records.TaskRecordPort.RecoverySnapshot;
 import com.example.myhelper.records.TaskRecordPort.TaskSnapshot;
 import com.example.myhelper.skill.ToolReliability.PlanningReference;
+import com.example.myhelper.tasklog.TaskLogPort;
+import com.example.myhelper.tasklog.TaskLogPort.Kind;
 import com.example.myhelper.tools.ToolDirectory.ToolRef;
 import com.example.myhelper.orchestration.ExecutionTraceStore.NodeKind;
 import com.example.myhelper.orchestration.ExecutionTraceStore.EdgeKind;
@@ -83,6 +85,10 @@ public final class AgentOrchestrator {
     private final ExecutionTracePort traces;
     /** 执行记录、进度和恢复事项由外部模块管理，循环只发送及查询。 */
     private final TaskRecordPort records;
+    /** 与权威记录确认相互独立的实时观测输出。 */
+    private final TaskLogPort taskLog;
+    /** 根运行受理和实际收尾的本地活动通知。 */
+    private final RunActivityPort activity;
     /** 固化适用判断来自独立端口，不由循环推断资格或业务影响。 */
     private final CapabilityUsePort capabilityUse;
     /** 调用技能模块查询分数，决定固化工具是否可以省略模型判断。 */
@@ -135,6 +141,22 @@ public final class AgentOrchestrator {
                              ExecutionTracePort traces, Executor workers, ScheduledExecutorService timer, Limits limits,
                              ModelAdapter modelAdapter, TaskRecordPort records, CapabilityUsePort capabilityUse,
                              ToolReliabilityGate toolReliability) {
+        this(planner, lookup, actions, checks, traces, workers, timer, limits, modelAdapter, records, capabilityUse,
+                toolReliability, TaskLogPort.disabled());
+    }
+
+    public AgentOrchestrator(Planner planner, CapabilitySearchPort lookup, ActionExecutor actions, RuntimeGate checks,
+                             ExecutionTracePort traces, Executor workers, ScheduledExecutorService timer, Limits limits,
+                             ModelAdapter modelAdapter, TaskRecordPort records, CapabilityUsePort capabilityUse,
+                             ToolReliabilityGate toolReliability, TaskLogPort taskLog) {
+        this(planner, lookup, actions, checks, traces, workers, timer, limits, modelAdapter, records, capabilityUse,
+                toolReliability, taskLog, RunActivityPort.disabled());
+    }
+
+    public AgentOrchestrator(Planner planner, CapabilitySearchPort lookup, ActionExecutor actions, RuntimeGate checks,
+                             ExecutionTracePort traces, Executor workers, ScheduledExecutorService timer, Limits limits,
+                             ModelAdapter modelAdapter, TaskRecordPort records, CapabilityUsePort capabilityUse,
+                             ToolReliabilityGate toolReliability, TaskLogPort taskLog, RunActivityPort activity) {
         // 保存单次模型决策桥接器，编排器通过它调用模型。
         this.planner = Objects.requireNonNull(planner);
         // 保存独立固化检索组件，便于以后替换检索实现。
@@ -148,6 +170,8 @@ public final class AgentOrchestrator {
         // 保存共享执行图，其他模块通过它读取运行关系。
         this.traces = Objects.requireNonNull(traces);
         this.records = Objects.requireNonNull(records);
+        this.taskLog = Objects.requireNonNull(taskLog);
+        this.activity = Objects.requireNonNull(activity);
         this.capabilityUse = Objects.requireNonNull(capabilityUse);
         this.toolReliability = Objects.requireNonNull(toolReliability);
         // 保存调用方管理的工作池，模型和工具调用都在其中运行。
@@ -162,22 +186,43 @@ public final class AgentOrchestrator {
      * 新用户任务入口。递归子任务从内部入口进入，不重复根任务入口检索。
      */
     public Handle submit(Request request) {
-        return start(request, null);
+        var occupation = activity.occupy();
+        try {
+            return start(request, null, occupation);
+        } catch (RuntimeException | Error failure) {
+            occupation.close();
+            throw failure;
+        }
     }
 
     /** 从外部记录读取原任务和最新问题；不重新执行根入口整条固化。 */
     public Handle resume(String taskId) {
-        if (!records.enabled()) {
-            throw new IllegalStateException(LlmTexts.TASK_RECORDS_REQUIRED);
+        var occupation = activity.occupy();
+        try {
+            if (!records.enabled()) {
+                throw new IllegalStateException(LlmTexts.TASK_RECORDS_REQUIRED);
+            }
+            TaskSnapshot task = records.load(taskId);
+            if (!taskId.equals(task.taskId())) {
+                throw new IllegalStateException(LlmTexts.INVALID_RECORD_CLAIM);
+            }
+            TaskRecordPort.TaskSpec original = task.task();
+            var request = new Request(original.goal(), original.arguments(), original.modelRef(), original.toolNames(),
+                    original.internalValidation());
+            return start(request, task, occupation);
+        } catch (RuntimeException | Error failure) {
+            occupation.close();
+            throw failure;
         }
-        TaskSnapshot task = records.load(taskId);
-        if (!taskId.equals(task.taskId())) {
-            throw new IllegalStateException(LlmTexts.INVALID_RECORD_CLAIM);
-        }
-        TaskRecordPort.TaskSpec original = task.task();
-        return start(new Request(original.goal(), original.arguments(), original.modelRef(), original.toolNames(), original.internalValidation()), task);
     }
 
+    /** 应用退出只停止本次派发，不把用户目标改写为持久 CANCEL。 */
+    public void stopForShutdown(String taskId, String rootRunId) {
+        Control control = activeRuns.get(taskId);
+        if (control != null && control.root.equals(rootRunId)) {
+            control.requestLocalStop(LlmTexts.TASK_APPLICATION_STOPPING);
+        }
+    }
     /** 接收并持久保存指令；返回表示已接收，不表示在途工具已经结束。 */
     public TaskInstructionPort.Receipt instruct(TaskInstructionPort.Command command) {
         if (!records.enabled() || !records.instructions().enabled()) {
@@ -261,10 +306,10 @@ public final class AgentOrchestrator {
     }
 
     // 新任务与恢复共用运行生命周期；跨运行任务身份和领取由外部管理。
-    private Handle start(Request request, TaskSnapshot previous) {
+    private Handle start(Request request, TaskSnapshot previous, RunActivityPort.Occupation occupation) {
         // 为新根任务生成身份，后续子任务和链路都归属于它。
         String root = UUID.randomUUID().toString();
-        RunRecordAccess recordAccess = new RunRecordAccess(records, root, request, previous);
+        RunRecordAccess recordAccess = new RunRecordAccess(records, taskLog, root, request, previous);
         Control control;
         CompletableFuture<Outcome> result = new CompletableFuture<>();
         ScheduledFuture<?> timeout;
@@ -293,6 +338,8 @@ public final class AgentOrchestrator {
             throw failure;
         }
         activeRuns.put(recordAccess.taskId(), control);
+        recordAccess.progress(recordAccess.logContext(root, root, root, 0), Kind.RUN_STARTED,
+                previous == null ? "任务运行已受理" : "恢复运行已受理");
         // 保存真正的在途工作链；它可能比对外的取消结果晚结束。
         CompletableFuture<Outcome> work;
         try {
@@ -306,12 +353,17 @@ public final class AgentOrchestrator {
         work.whenComplete(new BiConsumer<Outcome, Throwable>() {
             @Override
             public void accept(Outcome outcome, Throwable failure) {
-                // 取消尚未触发的计时任务；false 表示不强行中断正在执行的计时线程。
-                timeout.cancel(false);
-                // 把模型会话回收放在真正工作结束后，取消提前返回时不执行它。
-                Outcome completed = endRun(control, failure == null ? outcome : failed(failure));
-                // 先移除旧活动身份，再完成收尾信号，接续回调才能申请新运行。
-                activeRuns.remove(recordAccess.taskId(), control);
+                Outcome completed;
+                try {
+                    // 取消尚未触发的计时任务；false 表示不强行中断正在执行的计时线程。
+                    timeout.cancel(false);
+                    // 把模型会话回收放在真正工作结束后，取消提前返回时不执行它。
+                    completed = endRun(control, failure == null ? outcome : failed(failure));
+                } finally {
+                    // 先释放本根运行，再通知接续。对外提前返回的结果不释放占用。
+                    activeRuns.remove(recordAccess.taskId(), control);
+                    occupation.close();
+                }
                 result.complete(completed);
                 if (control.cleanupFailure == null) {
                     control.settled.complete(completed);
@@ -525,7 +577,7 @@ public final class AgentOrchestrator {
                     @Override
                     public CompletionStage<Outcome> apply(RecoverySnapshot snapshot) {
                         if (snapshot.disposition() == Disposition.WAIT) {
-                            return CompletableFuture.completedFuture(waiting(snapshot));
+                            return CompletableFuture.completedFuture(waiting(control, run, parent, branchContext.id(), round + 1L, snapshot));
                         }
                         return invokeDecision(control, run, parent, goal, args, depth, round,
                                 candidates, history, branchContext, snapshot);
@@ -581,7 +633,7 @@ public final class AgentOrchestrator {
                         decision = Objects.requireNonNull(planner.decide(new PlanningContext(run, goal, args, branch.modelRef(),
                                 // 把根工具权限、入口候选和本任务反馈交给模型。
                                 control.request.toolNames(), candidates, history, control.records.taskId(), phase, snapshot,
-                                control.records.instructions(), references)));
+                                control.records.instructions(), references), control.records.logContext(run, callId, branch.id(), revision)));
                     } finally {
                         // 先结束计时，再写返回记录和链路；失败样本也不混入存储耗时。
                         modelElapsedNanos.set(Math.max(0L, System.nanoTime() - startedNanos));
@@ -589,6 +641,9 @@ public final class AgentOrchestrator {
                     modelReturned.set(true);
                     Map<String, Object> returned = new LinkedHashMap<>(assignment);
                     returned.put("decisionKind", decision.kind().name());
+                    if (decision.plan() != null) {
+                        returned.put("stepCount", decision.plan().steps().size());
+                    }
                     returned.put("elapsedNanos", modelElapsedNanos.get());
                     returned.put("completedAt", Instant.now().toString());
                     // 正常返回不是目标成功；后续工具结果及验收仍按各自的记录关联。
@@ -693,9 +748,6 @@ public final class AgentOrchestrator {
     private Outcome modelFailed(Control control, String run, String callId, ModelAdapter.Binding branch,
                                 long revision, PlanningPhase phase, String goal, long elapsedNanos,
                                 List<Feedback> history, Throwable failure) {
-        if (!control.records.enabled()) {
-            return decisionFailure(control, history, failure);
-        }
         Object previousValue = history.isEmpty() ? null : history.getLast().outcome().value();
         Outcome waiting = new Outcome(Status.WAITING, previousValue, LlmTexts.MODEL_WAITING_PREFIX + message(failure));
         try {
@@ -703,7 +755,7 @@ public final class AgentOrchestrator {
                     Map.of("error", message(failure), "phase", phase.name(), "goal", goal,
                             "modelRef", branch.modelRef(), "elapsedNanos", elapsedNanos,
                             "completedAt", Instant.now().toString()));
-            return waiting;
+            return control.records.enabled() ? waiting : decisionFailure(control, history, failure);
         } catch (RuntimeException recordFailure) {
             return uncertain(waiting, message(recordFailure));
         }
@@ -720,7 +772,10 @@ public final class AgentOrchestrator {
         return new Outcome(result.status(), previousValue, result.error());
     }
 
-    private static Outcome waiting(RecoverySnapshot snapshot) {
+    private static Outcome waiting(Control control, String run, String node, String branch, long revision,
+                                   RecoverySnapshot snapshot) {
+        control.records.progress(control.records.logContext(run, node, branch, revision), Kind.WAITING,
+                "等待恢复条件或外部确认");
         return new Outcome(Status.WAITING, RunRecordAccess.snapshotData(snapshot),
                 snapshot.reason() == null ? LlmTexts.RECOVERY_WAITING : snapshot.reason());
     }
@@ -742,7 +797,7 @@ public final class AgentOrchestrator {
                         @Override
                         public CompletionStage<Outcome> apply(RecoverySnapshot reviewed) {
                             if (reviewed.disposition() == Disposition.WAIT) {
-                                return CompletableFuture.completedFuture(waiting(reviewed));
+                                return CompletableFuture.completedFuture(waiting(control, run, parent, branch.id(), revision, reviewed));
                             }
                             return runDecisionRound(control, run, parent, goal, args, depth, round + 1, candidates, history, branch);
                         }
@@ -824,6 +879,8 @@ public final class AgentOrchestrator {
                         if (depth == 0 && !control.records.applyPlan(run, revision, planData(plan))) {
                             throw new RunInterrupted(Status.WAITING, LlmTexts.TASK_INSTRUCTION_CHANGED);
                         }
+                        control.records.progress(control.records.logContext(run, parent, branch.id(), revision),
+                                Kind.PLAN_APPLIED, "采用计划 steps=" + plan.steps().size());
                         // 整条命中则运行固化定义；否则执行原计划，并逐步骤复用命中的子能力。
                         CompletableFuture<Outcome> execution;
                         if (whole != null) {
@@ -863,7 +920,7 @@ public final class AgentOrchestrator {
                                 return runDecisionRound(control, run, parent, goal, args, depth, nextRound, candidates, history, branch);
                             }
                             if (snapshot.disposition() == Disposition.WAIT) {
-                                return CompletableFuture.completedFuture(waiting(snapshot));
+                                return CompletableFuture.completedFuture(waiting(control, run, parent, branch.id(), nextRound, snapshot));
                             }
                             return CompletableFuture.completedFuture(outcome);
                         }
@@ -1404,6 +1461,10 @@ public final class AgentOrchestrator {
     // 验收结果作为独立事件交给记录模块，由它决定进度和待处理事项变化。
     private Outcome checkedRecorded(Control control, String run, String operation, String branch, long revision,
                                     String goal, Map<String, Object> args, Outcome execution) {
+        if (execution != null && execution.status() == Status.SUCCESS) {
+            control.records.progress(control.records.logContext(run, operation, branch, revision), Kind.VERIFY_STARTED,
+                    "开始验收结果");
+        }
         Outcome result = checked(goal, args, execution, control.records.instructionData());
         try {
             control.records.emit(run, operation, branch, revision, EventKind.VERIFIED,
@@ -1552,6 +1613,11 @@ public final class AgentOrchestrator {
 
         // 输入本轮上下文，返回计划、完成或需要信息三者之一。
         Decision decide(PlanningContext context);
+
+        /** 观测关联由编排器显式传递，不序列化到模型请求。 */
+        default Decision decide(PlanningContext context, TaskLogPort.Context logContext) {
+            return decide(context);
+        }
     }
 
     @FunctionalInterface
@@ -2004,12 +2070,22 @@ public final class AgentOrchestrator {
                 case CANCEL -> TaskInstructionPort.Directive.CANCEL;
             };
             instructionStop.set(new InstructionStop(receipt.revision(), directive));
+            records.progress(records.logContext(root, root, root, 0), Kind.STOP_REQUESTED,
+                    "停止新派发，等待在途工作 directive=" + directive.name());
         }
 
         private synchronized Outcome requestLocalStop(String reason) {
             if (!stopRequestsClosed && stop.compareAndSet(null, reason)) {
                 pendingStopReason = reason;
                 stopRequestedAt = Instant.now();
+                String stopKind = "CANCEL";
+                if (LlmTexts.TASK_TIMEOUT.equals(reason)) {
+                    stopKind = "TIMEOUT";
+                } else if (LlmTexts.TASK_APPLICATION_STOPPING.equals(reason)) {
+                    stopKind = "SHUTDOWN";
+                }
+                records.progress(records.logContext(root, root, root, 0), Kind.STOP_REQUESTED,
+                        "停止新派发，等待在途工作 reason=" + stopKind);
             }
             return new Outcome(Status.CANCELLED, null, reason);
         }

@@ -86,7 +86,7 @@ public interface TaskRecordPort {
         public RunFinalization {
             Objects.requireNonNull(event);
             if (event.kind() != EventKind.RUN_ENDED) {
-                throw new IllegalArgumentException("最终提交必须包含 RUN_ENDED");
+                throw new IllegalArgumentException(LlmTexts.ARCHIVE_END_EVENT_REQUIRED);
             }
             gaps = List.copyOf(gaps);
             evidenceGaps = List.copyOf(evidenceGaps);
@@ -95,24 +95,26 @@ public interface TaskRecordPort {
                         Map.copyOf(graph.nodes()), List.copyOf(graph.edges()), List.copyOf(graph.events()), graph.closed());
             }
             if (graphComplete && (graph == null || !graph.closed() || !gaps.isEmpty())) {
-                throw new IllegalArgumentException("完整归档必须持有封闭且无缺口的执行图");
+                throw new IllegalArgumentException(LlmTexts.ARCHIVE_COMPLETE_GRAPH_REQUIRED);
             }
             if (!graphComplete && gaps.isEmpty()) {
-                throw new IllegalArgumentException("不完整归档必须说明缺口");
+                throw new IllegalArgumentException(LlmTexts.ARCHIVE_GAPS_REQUIRED);
             }
             if (graphComplete) {
-                if (graph.nodes().isEmpty()) { throw new IllegalArgumentException("完整归档不能是空图"); }
+                if (graph.nodes().isEmpty()) {
+                    throw new IllegalArgumentException(LlmTexts.ARCHIVE_COMPLETE_GRAPH_EMPTY);
+                }
                 for (var entry : graph.nodes().entrySet()) {
                     var node = entry.getValue();
                     if (!entry.getKey().equals(node.id()) || node.endedAt() == null
                             || node.status() == com.example.myhelper.orchestration.ExecutionTraceStore.NodeStatus.RUNNING
                             || (node.parentId() != null && !graph.nodes().containsKey(node.parentId()))) {
-                        throw new IllegalArgumentException("完整归档中节点未终止或身份不完整");
+                        throw new IllegalArgumentException(LlmTexts.ARCHIVE_INVALID_NODE);
                     }
                 }
                 for (var edge : graph.edges()) {
                     if (!graph.nodes().containsKey(edge.from()) || !graph.nodes().containsKey(edge.to())) {
-                        throw new IllegalArgumentException("完整归档中关系端点缺失");
+                        throw new IllegalArgumentException(LlmTexts.ARCHIVE_INVALID_EDGE);
                     }
                 }
             }

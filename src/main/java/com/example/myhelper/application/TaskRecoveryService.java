@@ -38,7 +38,15 @@ public final class TaskRecoveryService {
             throw new IllegalStateException("恢复扫描需要已启用的任务记录与指令模块");
         }
         // 先核对整批返回合同，再开启任一任务，避免发现超限时已经执行了部分工作。
-        List<RecoveryCandidate> candidates = validatedCandidates(instructions.recoverable(limit), limit);
+        return resumeCandidates(instructions.recoverable(limit), limit);
+    }
+
+    /** 应用分页读取后交回同一恢复逻辑；领取仍只发生在 orchestrator.resume 内。 */
+    public List<RecoveryAttempt> resumeCandidates(List<RecoveryCandidate> source, int limit) {
+        if (limit < 1 || !records.enabled() || !records.instructions().enabled()) {
+            throw new IllegalStateException("恢复需要已启用记录模块和正数批量上限");
+        }
+        List<RecoveryCandidate> candidates = validatedCandidates(source, limit);
         List<RecoveryAttempt> attempts = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (RecoveryCandidate candidate : candidates) {

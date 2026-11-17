@@ -46,7 +46,8 @@ public final class ModelToolRangeCheck implements RecordedToolReliability.RangeC
             var request = new AgentCaller.Request(modelRef, List.of(
                     new SystemMessage(LlmTexts.TOOL_PARAMETER_RANGE_CHECK), new UserMessage(input)),
                     List.of(), AgentCaller.Mode.CALL_ONLY);
-            var output = caller.call(request).response().getResult().getOutput();
+            var output = caller.call(request, List.of(), AgentCaller.Purpose.TOOL_RANGE_CHECK, null)
+                    .response().getResult().getOutput();
             if (!output.getToolCalls().isEmpty()) {
                 return RangeVerdict.UNKNOWN;
             }

@@ -1,6 +1,7 @@
 package com.example.myhelper.llm;
 
 import com.example.myhelper.agent.AgentCaller;
+import com.example.myhelper.tasklog.TaskLogPort;
 import java.util.List;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.tool.ToolCallback;
@@ -32,8 +33,9 @@ public class ModelClientConfiguration {
     }
 
     @Bean
-    public AgentCaller agentCaller(ConfiguredModelAdapter adapter, ObjectProvider<ToolCallback> callbacks) {
-        return new AgentCaller(adapter, callbacks.orderedStream().toList());
+    public AgentCaller agentCaller(ConfiguredModelAdapter adapter, ObjectProvider<ToolCallback> callbacks,
+                                   ObjectProvider<TaskLogPort> taskLogs) {
+        return new AgentCaller(adapter, callbacks.orderedStream().toList(), taskLogs.getIfAvailable(TaskLogPort::disabled));
     }
 
     /** 应用提交任务与模型目录注册共用同一配置引用。 */

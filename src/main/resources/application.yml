@@ -62,6 +62,13 @@ logging:
 
 # 循环主流程：门限仅决定固化工具是否跳过模型，不替代发布状态、门禁和验收。
 myhelper:
+  records:
+    # 正式入口默认保存任务和恢复状态；关闭只适用于明确无持久恢复的演示。
+    enabled: true
+    # 每页读取候选上限；启动扫描会沿游标继续后续页面。
+    recovery-batch-size: 4
+    # 可设置 state-directory；缺省为用户目录下 .myhelper/task-runtime。
+    # 同一安装必须始终使用同一路径，不复制、不删除正在使用的 task-owner.lock。
   orchestration:
     # 普通技能和可信原子工具的估计成功率都必须严格超过此值。
     direct-tool-reliability-threshold: 0.85

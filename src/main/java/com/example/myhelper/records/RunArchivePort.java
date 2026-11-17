@@ -1,5 +1,6 @@
 package com.example.myhelper.records;
 
+import com.example.myhelper.llm.LlmTexts;
 import com.example.myhelper.orchestration.ExecutionTraceStore;
 import com.example.myhelper.orchestration.TaskPlan;
 import java.util.List;
@@ -8,6 +9,9 @@ import java.util.Optional;
 
 /** 任务外固化消费者读取已确认提交的固定归档；不读取循环的可变内存状态。 */
 public interface RunArchivePort {
+    /** 固定归档的持久合同版本；本次可读性整理仍使用原版本 1。 */
+    int SCHEMA_VERSION = 1;
+
     Optional<ArchivedRun> readArchive(ArchiveRef ref);
 
     /** 发现图和证据均完整且尚未确认消费的用户运行。 */
@@ -60,9 +64,9 @@ public interface RunArchivePort {
         public ArchivedRun {
             Objects.requireNonNull(ref);
             Objects.requireNonNull(endEvent);
-            if (schemaVersion != 1 || !ref.taskId().equals(endEvent.taskId())
+            if (schemaVersion != SCHEMA_VERSION || !ref.taskId().equals(endEvent.taskId())
                     || !ref.rootRunId().equals(endEvent.rootRunId())) {
-                throw new IllegalArgumentException("归档版本或运行身份不匹配");
+                throw new IllegalArgumentException(LlmTexts.ARCHIVE_IDENTITY_MISMATCH);
             }
             TaskRecordPort.RunFinalization checked =
                     new TaskRecordPort.RunFinalization(endEvent, graph, graphComplete, gaps, evidenceGaps);
@@ -73,11 +77,15 @@ public interface RunArchivePort {
             boolean ended = false;
             for (TaskRecordPort.ExecutionEvent event : events) {
                 if (!ref.taskId().equals(event.taskId()) || !ref.rootRunId().equals(event.rootRunId())) {
-                    throw new IllegalArgumentException("归档混入其他运行的事件");
+                    throw new IllegalArgumentException(LlmTexts.ARCHIVE_EVENT_MISMATCH);
                 }
-                if (event.equals(endEvent)) { ended = true; }
+                if (event.equals(endEvent)) {
+                    ended = true;
+                }
             }
-            if (!ended) { throw new IllegalArgumentException("归档缺少结束事件"); }
+            if (!ended) {
+                throw new IllegalArgumentException(LlmTexts.ARCHIVE_END_EVENT_MISSING);
+            }
         }
 
         public boolean evidenceComplete() {

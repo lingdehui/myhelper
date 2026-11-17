@@ -13,6 +13,7 @@ import com.example.myhelper.orchestration.TaskPlan;
 import com.example.myhelper.orchestration.ToolReliabilityGate;
 import com.example.myhelper.capability.CapabilityUsePort;
 import com.example.myhelper.records.TaskRecordPort;
+import com.example.myhelper.tasklog.TaskLogPort;
 import com.example.myhelper.tools.ToolDirectory;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -46,6 +47,7 @@ import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.core.env.StandardEnvironment;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -99,6 +101,8 @@ class TaskEntryTest {
                 new ToolDirectory.Registration(ref, "local-check", false, false, true))));
         beans.registerSingleton("gate", new EchoGate());
         beans.registerSingleton("resources", new EchoResources());
+        CapturedTaskLog taskLog = new CapturedTaskLog();
+        beans.registerSingleton("taskLog", taskLog);
 
         ReplyModel model = new ReplyModel(true);
         var models = new ConfiguredModelAdapter(List.of(
@@ -108,24 +112,56 @@ class TaskEntryTest {
         var traces = config.taskExecutionTraces(environment);
         var tools = config.taskRuntimeTools(new AgentCaller(models, List.of()), models,
                 beans.getBeanProvider(ToolDirectory.Binding.class), beans.getBeanProvider(ToolDirectory.class),
-                beans.getBeanProvider(RuntimeGate.class), beans.getBeanProvider(SpringToolExecutor.ResourceResolver.class));
+                beans.getBeanProvider(RuntimeGate.class), beans.getBeanProvider(SpringToolExecutor.ResourceResolver.class),
+                beans.getBeanProvider(TaskLogPort.class));
         var workers = config.taskWorkers(environment);
         workers.initialize();
         var timer = config.taskTimer();
         try {
-            var orchestrator = config.agentOrchestrator(tools, models, traces, workers, timer, environment,
+            var orchestrator = config.agentOrchestrator(tools, models, traces, workers, timer,
+                    config.taskActivity(), environment,
                     beans.getBeanProvider(CapabilitySearchPort.class), beans.getBeanProvider(CapabilityUsePort.class),
-                    beans.getBeanProvider(TaskRecordPort.class), beans.getBeanProvider(ToolReliabilityGate.class));
+                    beans.getBeanProvider(TaskRecordPort.class), beans.getBeanProvider(ToolReliabilityGate.class),
+                    beans.getBeanProvider(TaskLogPort.class));
             try (var entry = new TaskEntry(orchestrator, "local-check", tools.names(), traces)) {
-                var outcome = entry.submit("执行回声工具").settled().get(5, TimeUnit.SECONDS);
+                var handle = entry.submit("执行回声工具");
+                var outcome = handle.settled().get(5, TimeUnit.SECONDS);
                 assertEquals(AgentOrchestrator.Status.SUCCESS, outcome.status());
                 assertEquals("回声完成", outcome.value());
                 assertEquals("{\"value\":\"你好\"}", echo.arguments.get());
                 assertEquals(List.of("执行回声工具", "执行回声工具"), model.goals);
+                assertEquals(TaskLogPort.Kind.RUN_STARTED, taskLog.events.getFirst().kind());
+                assertEquals(TaskLogPort.Kind.RUN_ENDED, taskLog.events.getLast().kind());
+                assertEquals(taskLog.first(TaskLogPort.Kind.PLAN_CALL_PENDING).context(),
+                        taskLog.first(TaskLogPort.Kind.MODEL_STARTED).context());
+                assertEquals(handle.rootRunId(), taskLog.first(TaskLogPort.Kind.TOOL_RETURNED).context().rootRunId());
+                assertEquals(taskLog.first(TaskLogPort.Kind.TOOL_INTENT).context(),
+                        taskLog.first(TaskLogPort.Kind.TOOL_RETURNED).context());
+                assertFalse(taskLog.events.toString().contains("你好"));
+                assertFalse(taskLog.events.toString().contains("执行回声工具"));
             }
         } finally {
             timer.shutdownNow();
             workers.destroy();
+        }
+    }
+
+    private static final class CapturedTaskLog implements TaskLogPort {
+        /** 收集并发工作线程实际发给已装配端口的摘要。 */
+        private final List<Event> events = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void publish(Event event) {
+            events.add(event);
+        }
+
+        private Event first(Kind kind) {
+            for (Event event : events) {
+                if (event.kind() == kind) {
+                    return event;
+                }
+            }
+            throw new AssertionError("缺少事件 " + kind);
         }
     }
 

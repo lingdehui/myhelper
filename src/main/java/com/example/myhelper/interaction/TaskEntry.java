@@ -35,6 +35,9 @@ public final class TaskEntry implements AutoCloseable {
     // 入口拥有的内存图在编排完成最终提交后释放。
     private final ExecutionTraceStore traces;
 
+    // 可选桌面观察端在执行图释放前取得最终只读快照。
+    private final TraceListener traceListener;
+
     // 已报告超时的任务仍保留在这里，直到实际工作和收尾结束。
     private final Map<String, Handle> active = new ConcurrentHashMap<>();
 
@@ -43,10 +46,16 @@ public final class TaskEntry implements AutoCloseable {
 
     public TaskEntry(AgentOrchestrator orchestrator, String modelRef, List<String> toolNames,
                      ExecutionTraceStore traces) {
+        this(orchestrator, modelRef, toolNames, traces, null);
+    }
+
+    public TaskEntry(AgentOrchestrator orchestrator, String modelRef, List<String> toolNames,
+                     ExecutionTraceStore traces, TraceListener traceListener) {
         this.orchestrator = Objects.requireNonNull(orchestrator);
         this.modelRef = Objects.requireNonNull(modelRef);
         this.toolNames = List.copyOf(toolNames);
         this.traces = Objects.requireNonNull(traces);
+        this.traceListener = traceListener;
     }
 
     /**
@@ -60,11 +69,21 @@ public final class TaskEntry implements AutoCloseable {
             throw new IllegalArgumentException("任务文字不能为空");
         }
         Handle handle = orchestrator.submit(new Request(text, Map.of(), modelRef, toolNames));
-        active.put(handle.rootRunId(), handle);
-        handle.settled().whenComplete(new BiConsumer<Outcome, Throwable>() {
+        return adopt(handle);
+    }
+
+    /** 启动恢复和新任务共享句柄管理；此处不重复提交或领取任务。 */
+    public synchronized Handle adopt(Handle handle) {
+        if (closed) {
+            orchestrator.stopForShutdown(handle.taskId(), handle.rootRunId());
+            throw new IllegalStateException("任务入口已关闭");
+        }
+        if (active.putIfAbsent(handle.rootRunId(), handle) != null) { return handle; }
+        CompletableFuture<Outcome> released = handle.settled().whenComplete(new BiConsumer<Outcome, Throwable>() {
             @Override
             public void accept(Outcome outcome, Throwable failure) {
                 try {
+                    reportFinalTrace(handle.rootRunId());
                     traces.remove(handle.rootRunId());
                 } catch (RuntimeException cleanupFailure) {
                     LOG.warn("无法释放任务 {} 的内存执行图", handle.rootRunId(), cleanupFailure);
@@ -76,7 +95,29 @@ public final class TaskEntry implements AutoCloseable {
                 }
             }
         });
-        return handle;
+        return new Handle(handle.rootRunId(), handle.result(), handle.cancel(), handle.taskId(), released);
+    }
+
+    /** 为进程内的调试视图提供正在管理的句柄，包括已受理的启动恢复。 */
+    public List<Handle> activeHandles() {
+        return List.copyOf(active.values());
+    }
+
+    private void reportFinalTrace(String rootRunId) {
+        if (traceListener == null) { return; }
+        try {
+            var snapshot = traces.findSnapshot(rootRunId).orElse(null);
+            if (snapshot != null && snapshot.closed()) {
+                traceListener.afterClose(rootRunId, snapshot);
+            }
+        } catch (RuntimeException failure) {
+            LOG.warn("无法投影任务 {} 的最终执行图", rootRunId, failure);
+        }
+    }
+
+    @FunctionalInterface
+    public interface TraceListener {
+        void afterClose(String rootRunId, ExecutionTraceStore.Snapshot snapshot);
     }
 
     @Override
@@ -93,7 +134,7 @@ public final class TaskEntry implements AutoCloseable {
         for (Handle handle : remaining) {
             settlements.add(handle.settled());
             try {
-                handle.cancel().run();
+                orchestrator.stopForShutdown(handle.taskId(), handle.rootRunId());
             } catch (RuntimeException failure) {
                 LOG.warn("无法请求停止任务 {}", handle.rootRunId(), failure);
             }

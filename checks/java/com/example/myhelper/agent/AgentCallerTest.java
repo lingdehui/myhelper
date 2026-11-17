@@ -1,11 +1,15 @@
 package com.example.myhelper.agent;
 
+import com.example.myhelper.tasklog.TaskLogPort;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 import org.springframework.ai.chat.messages.*;
+import org.springframework.ai.chat.metadata.ChatResponseMetadata;
+import org.springframework.ai.chat.metadata.DefaultUsage;
 import org.springframework.ai.chat.model.*;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
@@ -124,5 +128,87 @@ class AgentCallerTest {
                 }, List.of(echo)).call(request(AgentCaller.Mode.CALL_ONLY));
             }
         });
+    }
+
+    @Test void reportsActualModelBoundaryWithCorrelationAndAvailableUsage() {
+        List<TaskLogPort.Event> events = new ArrayList<>();
+        var context = new TaskLogPort.Context("task-1", "root-1", "run-1", "node-1", "branch-1", 2);
+        ChatResponse response = new ChatResponse(List.of(new Generation(new AssistantMessage("private response"))),
+                ChatResponseMetadata.builder().usage(new DefaultUsage(4, 2, 6)).build());
+        ChatModel model = new ChatModel() {
+            @Override
+            public ChatResponse call(Prompt prompt) {
+                assertEquals(1, events.size());
+                assertEquals(TaskLogPort.Kind.MODEL_STARTED, events.getFirst().kind());
+                return response;
+            }
+        };
+        var result = observedCaller(model, events::add).call(textRequest(), List.of(),
+                AgentCaller.Purpose.RECOVERY_PLANNING, context);
+
+        assertSame(response, result.response());
+        assertEquals(2, events.size());
+        var finished = events.getLast();
+        assertEquals(TaskLogPort.Kind.MODEL_RETURNED, finished.kind());
+        assertEquals(context, finished.context());
+        assertEquals("node-1", finished.correlationId());
+        assertEquals(finished.correlationId(), events.getFirst().correlationId());
+        assertTrue(finished.summary().contains("purpose=RECOVERY_PLANNING model=test-model durationMs="));
+        assertTrue(finished.summary().contains("promptTokens=4 completionTokens=2 totalTokens=6"));
+        assertFalse(events.toString().contains("private"));
+    }
+
+    @Test void reportsSafeFailureStageAndRetainsOriginalError() {
+        List<TaskLogPort.Event> events = new ArrayList<>();
+        var upstream = new IllegalStateException("private upstream error");
+        var caller = observedCaller(new ChatModel() {
+            @Override
+            public ChatResponse call(Prompt prompt) { throw upstream; }
+        }, events::add);
+        assertSame(upstream, assertThrows(IllegalStateException.class, new Executable() {
+            @Override
+            public void execute() { caller.call(textRequest()); }
+        }));
+        assertEquals(2, events.size());
+        assertEquals(TaskLogPort.Kind.MODEL_FAILED, events.getLast().kind());
+        assertEquals(events.getFirst().correlationId(), events.getLast().correlationId());
+        assertTrue(events.getLast().summary().contains("stage=CALL failure=IllegalStateException"));
+        assertFalse(events.toString().contains("private"));
+    }
+
+    @Test void reportsResponseValidationFailureEvenWhenTheLogConsumerThrows() {
+        List<TaskLogPort.Event> events = new ArrayList<>();
+        ChatModel model = new ChatModel() {
+            @Override
+            public ChatResponse call(Prompt prompt) { return new ChatResponse(List.of()); }
+        };
+        var caller = observedCaller(model, new TaskLogPort() {
+            @Override
+            public void publish(Event event) {
+                events.add(event);
+                throw new IllegalStateException("test log consumer failed");
+            }
+        });
+
+        assertThrows(IllegalStateException.class, new Executable() {
+            @Override
+            public void execute() { caller.call(textRequest()); }
+        });
+        assertEquals(2, events.size());
+        assertEquals(TaskLogPort.Kind.MODEL_FAILED, events.getLast().kind());
+        assertTrue(events.getLast().summary().contains("stage=RESPONSE_VALIDATION"));
+        assertFalse(events.getLast().summary().contains("Tokens"));
+    }
+
+    private static AgentCaller observedCaller(ChatModel model, TaskLogPort taskLog) {
+        return new AgentCaller(new Function<String, ChatModel>() {
+            @Override
+            public ChatModel apply(String ref) { return model; }
+        }, List.of(), taskLog);
+    }
+
+    private static AgentCaller.Request textRequest() {
+        return new AgentCaller.Request("test-model", List.of(new UserMessage("private prompt")), List.of(),
+                AgentCaller.Mode.CALL_ONLY);
     }
 }

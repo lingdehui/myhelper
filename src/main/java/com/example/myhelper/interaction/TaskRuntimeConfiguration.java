@@ -1,11 +1,13 @@
 package com.example.myhelper.interaction;
 
 import com.example.myhelper.agent.AgentCaller;
+import com.example.myhelper.application.TaskActivity;
 import com.example.myhelper.capability.CapabilityLookup;
 import com.example.myhelper.capability.CapabilitySearchPort;
 import com.example.myhelper.capability.CapabilityUsePort;
 import com.example.myhelper.capability.CheckedCapabilityUse;
 import com.example.myhelper.gate.RuntimeGate;
+import com.example.myhelper.interaction.desktop.DesktopConfiguration;
 import com.example.myhelper.llm.ConfiguredModelAdapter;
 import com.example.myhelper.llm.ModelClientConfiguration;
 import com.example.myhelper.orchestration.AgentCallerPlanner;
@@ -14,6 +16,8 @@ import com.example.myhelper.orchestration.ExecutionTraceStore;
 import com.example.myhelper.orchestration.SpringToolExecutor;
 import com.example.myhelper.orchestration.ToolReliabilityGate;
 import com.example.myhelper.records.TaskRecordPort;
+import com.example.myhelper.tasklog.TaskLogConfiguration;
+import com.example.myhelper.tasklog.TaskLogPort;
 import com.example.myhelper.tools.ToolDirectory;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -26,15 +30,22 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
 import org.springframework.core.env.Environment;
 import org.springframework.scheduling.concurrent.CustomizableThreadFactory;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 /** 应用入口共享的编排运行时，默认仅启用模型规划和答复。 */
 @Configuration(proxyBeanMethods = false)
+@Import({TaskLogConfiguration.class, DesktopConfiguration.class})
 public class TaskRuntimeConfiguration {
     /** 编排预算和运行容量共用此配置前缀。 */
     private static final String PREFIX = "myhelper.orchestration.";
+
+    @Bean
+    public TaskActivity taskActivity() {
+        return new TaskActivity();
+    }
 
     @Bean
     public ExecutionTraceStore taskExecutionTraces(Environment environment) {
@@ -73,7 +84,8 @@ public class TaskRuntimeConfiguration {
             ObjectProvider<ToolDirectory.Binding> bindings,
             ObjectProvider<ToolDirectory> directories,
             ObjectProvider<RuntimeGate> gates,
-            ObjectProvider<SpringToolExecutor.ResourceResolver> resourceResolvers) {
+            ObjectProvider<SpringToolExecutor.ResourceResolver> resourceResolvers,
+            ObjectProvider<TaskLogPort> taskLogs) {
         List<ToolDirectory.Binding> active = bindings.orderedStream().toList();
         RuntimeGate gate = gates.getIfAvailable();
         if (active.isEmpty()) {
@@ -103,7 +115,7 @@ public class TaskRuntimeConfiguration {
             names.add(name);
             callbacks.add(binding.callback());
         }
-        return new RuntimeTools(new AgentCaller(models, callbacks),
+        return new RuntimeTools(new AgentCaller(models, callbacks, taskLogs.getIfAvailable(TaskLogPort::disabled)),
                 SpringToolExecutor.withBindings(active, resources, 64), gate, List.copyOf(names));
     }
 
@@ -114,11 +126,13 @@ public class TaskRuntimeConfiguration {
             ExecutionTraceStore taskExecutionTraces,
             @Qualifier("taskWorkers") ThreadPoolTaskExecutor workers,
             @Qualifier("taskTimer") ScheduledThreadPoolExecutor timer,
+            TaskActivity activity,
             Environment environment,
             ObjectProvider<CapabilitySearchPort> searches,
             ObjectProvider<CapabilityUsePort> capabilityUses,
             ObjectProvider<TaskRecordPort> records,
-            ObjectProvider<ToolReliabilityGate> reliability) {
+            ObjectProvider<ToolReliabilityGate> reliability,
+            ObjectProvider<TaskLogPort> taskLogs) {
         CapabilitySearchPort search = searches.getIfAvailable();
         if (search == null) {
             search = CapabilitySearchPort.disabled();
@@ -137,15 +151,17 @@ public class TaskRuntimeConfiguration {
                 environment.getProperty(PREFIX + "timeout", Duration.class, Duration.ofMinutes(2)));
         return new AgentOrchestrator(new AgentCallerPlanner(tools.caller()), search, tools.actions(), tools.gate(),
                 taskExecutionTraces, workers, timer, limits, models, records.getIfAvailable(TaskRecordPort::disabled),
-                capabilityUse, reliability.getIfAvailable(ToolReliabilityGate::unavailable));
+                capabilityUse, reliability.getIfAvailable(ToolReliabilityGate::unavailable),
+                taskLogs.getIfAvailable(TaskLogPort::disabled), activity);
     }
 
     @Bean
     TaskEntry taskEntry(AgentOrchestrator orchestrator, RuntimeTools tools,
                         @Qualifier("openAiChatModel") OpenAiChatModel client,
-                        Environment environment, ExecutionTraceStore taskExecutionTraces) {
+                        Environment environment, ExecutionTraceStore taskExecutionTraces,
+                        ObjectProvider<TaskEntry.TraceListener> traceListeners) {
         return new TaskEntry(orchestrator, ModelClientConfiguration.configuredModelRef(environment, client),
-                tools.names(), taskExecutionTraces);
+                tools.names(), taskExecutionTraces, traceListeners.getIfAvailable());
     }
 
     private static int number(Environment environment, String property, int defaultValue) {

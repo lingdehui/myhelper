@@ -1,6 +1,8 @@
 package com.example.myhelper.agent;
 
 import com.example.myhelper.llm.LlmTexts;
+import com.example.myhelper.tasklog.TaskLogPort;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -9,9 +11,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.metadata.EmptyUsage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
@@ -31,11 +38,18 @@ public final class AgentCaller {
     private final Function<String, ChatModel> models;
     // 工具注册表：工具名对应一个可执行回调。
     private final Map<String, ToolCallback> tools;
+    /** 单次模型调用的运行观测，可独立关闭。 */
+    private final TaskLogPort taskLog;
 
     // 装配单次调用所用的模型解析器和全局工具注册表。
     public AgentCaller(Function<String, ChatModel> models, Collection<ToolCallback> tools) {
+        this(models, tools, TaskLogPort.disabled());
+    }
+
+    public AgentCaller(Function<String, ChatModel> models, Collection<ToolCallback> tools, TaskLogPort taskLog) {
         // 保存外部传入的模型解析函数，不在此处创建模型或配置密钥。
         this.models = Objects.requireNonNull(models, "models");
+        this.taskLog = Objects.requireNonNull(taskLog, "taskLog");
         // 建立临时工具表，注册时检查名称冲突。
         Map<String, ToolCallback> registry = new LinkedHashMap<>();
         // 逐个读取调用方提供的工具。
@@ -58,6 +72,11 @@ public final class AgentCaller {
         CALL_ONLY,
         /** 调用一次模型，再执行这次响应中的工具。 */
         CALL_AND_EXECUTE
+    }
+
+    /** 应用提供的调用用途，只用于观测，不写入发送给模型的消息。 */
+    public enum Purpose {
+        DIRECT, PLANNING, RECOVERY_PLANNING, SKILL_CONSOLIDATION, TOOL_RANGE_CHECK, DESKTOP_BEHAVIOR
     }
 
     public record Request(
@@ -112,8 +131,25 @@ public final class AgentCaller {
 
     /** 本轮临时工具只进入本次注册表，供外层编排使用，不污染其他并发请求。 */
     public Result call(Request request, Collection<ToolCallback> scopedTools) {
+        return call(request, scopedTools, Purpose.DIRECT, null);
+    }
+
+    /** 任务归属和用途在调用链中显式传递，避免并发分支之间串用日志上下文。 */
+    public Result call(Request request, Collection<ToolCallback> scopedTools,
+                       Purpose purpose, TaskLogPort.Context logContext) {
+        return call(request, scopedTools, purpose, logContext, null);
+    }
+
+    /** 请求准备完成后由调用方仲裁派发。未获准时不调用模型，也不产生模型调用事件。 */
+    public Optional<Result> callIfPermitted(Request request, Purpose purpose, BooleanSupplier permit) {
+        return Optional.ofNullable(call(request, List.of(), purpose, null, Objects.requireNonNull(permit, "permit")));
+    }
+
+    private Result call(Request request, Collection<ToolCallback> scopedTools,
+                        Purpose purpose, TaskLogPort.Context logContext, BooleanSupplier permit) {
         // 先检查请求本身，避免空请求在读取模型引用时产生不明确的错误。
         Objects.requireNonNull(request, "request");
+        Objects.requireNonNull(purpose, "purpose");
         // 每个调用使用自己的合并表，允许不同任务并发携带不同编排上下文。
         Map<String, ToolCallback> available = new LinkedHashMap<>(tools);
         // 逐个合并本次调用独有的编排工具，避免污染其他任务。
@@ -148,34 +184,16 @@ public final class AgentCaller {
                 .toolCallbacks(Collections.unmodifiableList(callbacks)).internalToolExecutionEnabled(false).build();
         // 将当前文本、历史反馈和工具选项组成请求。
         Prompt prompt = new Prompt(request.messages(), options);
-        // 仅在这一行调用一次 LLM；本方法后面不会再调用模型。
-        ChatResponse response = Objects.requireNonNull(model.call(prompt), LlmTexts.EMPTY_MODEL_RESPONSE);
-        // 本模块只处理一个候选响应，不擅自选择或执行多个候选。
-        if (response.getResults().size() != 1) {
-            // 候选数不符合约定时抛出协议错误。
-            throw new IllegalStateException(LlmTexts.SINGLE_RESPONSE_REQUIRED);
+        // 本轮只允许执行入参指定的工具。
+        Set<String> allowed = new HashSet<>(request.toolNames());
+        ChatResponse response = invokeModel(model, prompt, allowed, request.modelRef(), purpose, logContext, permit);
+        if (response == null) {
+            return null;
         }
         // 复制输入历史，为返回值追加本轮响应。
         List<Message> history = new ArrayList<>(request.messages());
         // 保留模型文本及工具调用编号、名称和参数。
         history.add(response.getResult().getOutput());
-        // 本轮只允许执行入参指定的工具。
-        Set<String> allowed = new HashSet<>(request.toolNames());
-        // 调用 ID 必须在本响应中唯一，才能正确配对工具结果。
-        Set<String> callIds = new HashSet<>();
-        // 整批预检，避免先执行部分工具后才发现越界调用。
-        for (var call : response.getResult().getOutput().getToolCalls()) {
-            // CALL_ONLY 同样需要协议预检，不能将错误调用交给外层执行。
-            if (call.id() == null || call.id().isBlank() || !callIds.add(call.id())) {
-                // 请求或工具协议不合法时明确报错，不进入实际调用。
-                throw new IllegalArgumentException(LlmTexts.INVALID_TOOL_CALL_ID);
-            }
-            // 模型请求了本轮未提供的工具时拒绝整个批次。
-            if (!allowed.contains(call.name())) {
-                // 报告越界调用，不执行它。
-                throw new IllegalArgumentException(LlmTexts.UNAVAILABLE_TOOL_REQUESTED_PREFIX + call.name());
-            }
-        }
         // 仅调用模式或无工具调用时，预检后直接返回，不执行任何工具。
         if (request.mode() == Mode.CALL_ONLY || !response.hasToolCalls()) {
             // 返回模型响应；false 表示没有尝试执行工具，不等于模型没有请求工具。
@@ -206,6 +224,95 @@ public final class AgentCaller {
         var execution = manager.executeToolCalls(prompt, response);
         // 返回包含工具结果的完整消息，下一轮由上层发起。
         return new Result(response, execution.conversationHistory(), true);
+    }
+
+    private ChatResponse invokeModel(ChatModel model, Prompt prompt, Set<String> allowed, String modelRef,
+                                     Purpose purpose, TaskLogPort.Context logContext, BooleanSupplier permit) {
+        if (taskLog == TaskLogPort.disabled()) {
+            if (permit != null && !permit.getAsBoolean()) {
+                return null;
+            }
+            return validateResponse(model.call(prompt), allowed);
+        }
+        String callId = logContext != null && logContext.nodeId() != null
+                ? logContext.nodeId() : UUID.randomUUID().toString();
+        String summary = "purpose=" + purpose + " model=" + TaskLogPort.safeLabel(modelRef);
+        var startEvent = new TaskLogPort.Event(Instant.now(), logContext, callId, TaskLogPort.Kind.MODEL_STARTED, summary);
+        if (permit == null) {
+            TaskLogPort.report(taskLog, startEvent);
+        }
+        long started = System.nanoTime();
+        ChatResponse response = null;
+        boolean returned = false;
+        // 独立请求先取得许可并直接调用，避免日志监听延迟把已允许的请求推迟到任务占用期。
+        if (permit != null && !permit.getAsBoolean()) { return null; }
+        try {
+            response = model.call(prompt);
+            returned = true;
+            validateResponse(response, allowed);
+        } catch (RuntimeException failure) {
+            if (permit != null) { TaskLogPort.report(taskLog, startEvent); }
+            // 供应商异常可能带请求体或凭证，默认只展示类型及失败阶段。
+            String stage = returned ? "RESPONSE_VALIDATION" : "CALL";
+            TaskLogPort.report(taskLog, new TaskLogPort.Event(Instant.now(), logContext, callId, TaskLogPort.Kind.MODEL_FAILED,
+                    summary + " durationMs=" + elapsedMillis(started) + " stage=" + stage
+                            + " failure=" + TaskLogPort.safeLabel(failure.getClass().getSimpleName())
+                            + usageSummary(response)));
+            throw failure;
+        }
+        if (permit != null) { TaskLogPort.report(taskLog, startEvent); }
+        TaskLogPort.report(taskLog, new TaskLogPort.Event(Instant.now(), logContext, callId, TaskLogPort.Kind.MODEL_RETURNED,
+                summary + " durationMs=" + elapsedMillis(started) + usageSummary(response)));
+        return response;
+    }
+
+    /** 两种模式都必须先校验完整响应，才允许执行任何工具或继续规划。 */
+    private static ChatResponse validateResponse(ChatResponse response, Set<String> allowed) {
+        Objects.requireNonNull(response, LlmTexts.EMPTY_MODEL_RESPONSE);
+        if (response.getResults().size() != 1) {
+            throw new IllegalStateException(LlmTexts.SINGLE_RESPONSE_REQUIRED);
+        }
+        Set<String> callIds = new HashSet<>();
+        for (var call : response.getResult().getOutput().getToolCalls()) {
+            if (call.id() == null || call.id().isBlank() || !callIds.add(call.id())) {
+                throw new IllegalArgumentException(LlmTexts.INVALID_TOOL_CALL_ID);
+            }
+            if (!allowed.contains(call.name())) {
+                throw new IllegalArgumentException(LlmTexts.UNAVAILABLE_TOOL_REQUESTED_PREFIX + call.name());
+            }
+        }
+        return response;
+    }
+
+    private static long elapsedMillis(long started) {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+    }
+
+    /** 只读取框架提供的数值用量，缺失时省略，绝不序列化供应商原始元数据。 */
+    private static String usageSummary(ChatResponse response) {
+        if (response == null) {
+            return "";
+        }
+        try {
+            var metadata = response.getMetadata();
+            var usage = metadata == null ? null : metadata.getUsage();
+            if (usage == null || usage instanceof EmptyUsage) {
+                return "";
+            }
+            StringBuilder summary = new StringBuilder();
+            appendTokens(summary, "promptTokens", usage.getPromptTokens());
+            appendTokens(summary, "completionTokens", usage.getCompletionTokens());
+            appendTokens(summary, "totalTokens", usage.getTotalTokens());
+            return summary.toString();
+        } catch (RuntimeException ignored) {
+            return "";
+        }
+    }
+
+    private static void appendTokens(StringBuilder summary, String label, Integer tokens) {
+        if (tokens != null && tokens >= 0) {
+            summary.append(' ').append(label).append('=').append(tokens);
+        }
     }
 
     /** 供规划器读取默认工具合同，不暴露可修改注册表。 */

@@ -10,6 +10,11 @@ import com.example.myhelper.records.TaskRecordPort.RecoverySnapshot;
 import com.example.myhelper.records.TaskRecordPort.RunClaim;
 import com.example.myhelper.records.TaskRecordPort.TaskSnapshot;
 import com.example.myhelper.records.TaskRecordPort.TaskSpec;
+import com.example.myhelper.tasklog.TaskLogPort;
+import com.example.myhelper.tasklog.TaskLogPort.Context;
+import com.example.myhelper.tasklog.TaskLogPort.Event;
+import com.example.myhelper.tasklog.TaskLogPort.Kind;
+import com.example.myhelper.tasklog.TaskLogProjection;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -26,6 +31,8 @@ final class RunRecordAccess {
     private final boolean internalValidation;
     /** 记录与恢复事项由调用方装配，可明确关闭。 */
     private final TaskRecordPort port;
+    /** 异步展示端口，与权威记录的确认结果分开处理。 */
+    private final TaskLogPort taskLog;
     /** 稳定任务身份，来自外部登记或恢复读取。 */
     private final String taskId;
     /** 每次实际执行重新生成的根运行身份。 */
@@ -42,7 +49,13 @@ final class RunRecordAccess {
     private TaskRecordPort.RunFinalization pendingEnd;
 
     RunRecordAccess(TaskRecordPort port, String rootRunId, AgentOrchestrator.Request request, TaskSnapshot previous) {
+        this(port, TaskLogPort.disabled(), rootRunId, request, previous);
+    }
+
+    RunRecordAccess(TaskRecordPort port, TaskLogPort taskLog, String rootRunId,
+                    AgentOrchestrator.Request request, TaskSnapshot previous) {
         this.port = port;
+        this.taskLog = taskLog;
         this.rootRunId = rootRunId;
         this.internalValidation = request.internalValidation();
         // 未接入记录模块的旧调用仍能运行，但不提供跨运行恢复。
@@ -119,15 +132,55 @@ final class RunRecordAccess {
 
     // 同步返回表示外部已经按合同接受记录；发生异常时不悄悄退回内存。
     void emit(String runId, String nodeId, String branchId, long revision, EventKind kind, Map<String, Object> details) {
-        if (enabled()) {
-            ExecutionEvent fact = event(runId, nodeId, branchId, revision, kind, details);
-            try {
-                port.append(claim, fact);
-            } catch (RuntimeException failure) {
-                unconfirmedEvents.add("事件写入未确认 " + fact.kind()
-                        + " nodeId=" + fact.nodeId() + " eventId=" + fact.eventId());
-                throw failure;
+        boolean recording = enabled();
+        if (!recording) {
+            if (taskLog != TaskLogPort.disabled()) {
+                try {
+                    TaskLogPort.report(taskLog, TaskLogProjection.from(Instant.now(), logContext(runId, nodeId, branchId, revision),
+                            UUID.randomUUID().toString(), kind, details));
+                } catch (RuntimeException ignored) {
+                    // 旧的无记录路径不要求自定义工具证据能够持久化。
+                }
             }
+            return;
+        }
+        ExecutionEvent fact = event(runId, nodeId, branchId, revision, kind, details);
+        try {
+            port.append(claim, fact);
+        } catch (RuntimeException failure) {
+            unconfirmedEvents.add("事件写入未确认 " + fact.kind()
+                    + " nodeId=" + fact.nodeId() + " eventId=" + fact.eventId());
+            reportUnconfirmed(fact);
+            throw failure;
+        }
+        report(fact);
+    }
+
+    Context logContext(String run, String node, String branch, long revision) {
+        return new Context(taskId, rootRunId, run, node, branch, revision);
+    }
+
+    void progress(Context context, Kind kind, String summary) {
+        if (taskLog != TaskLogPort.disabled()) {
+            TaskLogPort.report(taskLog, new Event(Instant.now(), context, context.nodeId(), kind, summary));
+        }
+    }
+
+    private void report(ExecutionEvent fact) {
+        if (taskLog != TaskLogPort.disabled()) {
+            try {
+                TaskLogPort.report(taskLog, TaskLogProjection.from(fact));
+            } catch (RuntimeException ignored) {
+                // 事实已经提交，展示故障不能改变提交结果。
+            }
+        }
+    }
+
+    private void reportUnconfirmed(ExecutionEvent fact) {
+        if (taskLog != TaskLogPort.disabled()) {
+            Context context = logContext(fact.runId(), fact.nodeId(), fact.branchId(), fact.planRevision());
+            TaskLogPort.report(taskLog, new Event(Instant.now(), context, fact.eventId(), Kind.RECORD_UNCONFIRMED,
+                    "记录写入未确认 stage=" + fact.kind()));
         }
     }
 
@@ -207,9 +260,15 @@ final class RunRecordAccess {
                     port.endRun(claim, pendingEnd);
                     break;
                 } catch (RuntimeException failure) {
-                    if (attempt == FINALIZATION_ATTEMPTS) { throw failure; }
+                    if (attempt == FINALIZATION_ATTEMPTS) {
+                        reportUnconfirmed(pendingEnd.event());
+                        throw failure;
+                    }
                 }
             }
+            report(pendingEnd.event());
+        } else if (taskLog != TaskLogPort.disabled()) {
+            emit(rootRunId, rootRunId, rootRunId, 0, EventKind.RUN_ENDED, Map.of("outcome", outcome.asMap()));
         }
         ended = true;
         if (enabled() && pendingEnd.graphComplete() && pendingEnd.evidenceComplete() && !internalValidation) {

@@ -4,6 +4,7 @@ import com.example.myhelper.agent.AgentCaller;
 import com.example.myhelper.gate.SkillWriteGate;
 import com.example.myhelper.llm.LlmTexts;
 import com.example.myhelper.orchestration.TaskPlan;
+import com.example.myhelper.tasklog.TaskLogPort;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -43,7 +44,10 @@ public final class SkillConsolidationService {
                 new SystemMessage(LlmTexts.SKILL_CONSOLIDATION),
                 new UserMessage(json.writeValueAsString(evidence))),
                 List.of(), AgentCaller.Mode.CALL_ONLY);
-        var output = caller.call(request).response().getResult().getOutput();
+        // 固化从已封存的来源运行派生，本次模型调用拥有自己的调用身份。
+        var logContext = new TaskLogPort.Context(null, evidence.source().rootRunId(), null, null, null, 0);
+        var output = caller.call(request, List.of(), AgentCaller.Purpose.SKILL_CONSOLIDATION, logContext)
+                .response().getResult().getOutput();
         if (!output.getToolCalls().isEmpty()) {
             throw new IllegalArgumentException("固化模型返回了工具调用");
         }
