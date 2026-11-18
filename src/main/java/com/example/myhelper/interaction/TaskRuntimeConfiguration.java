@@ -6,6 +6,7 @@ import com.example.myhelper.capability.CapabilityLookup;
 import com.example.myhelper.capability.CapabilitySearchPort;
 import com.example.myhelper.capability.CapabilityUsePort;
 import com.example.myhelper.capability.CheckedCapabilityUse;
+import com.example.myhelper.gate.DeviceReadGate;
 import com.example.myhelper.gate.RuntimeGate;
 import com.example.myhelper.interaction.desktop.DesktopConfiguration;
 import com.example.myhelper.llm.ConfiguredModelAdapter;
@@ -15,8 +16,10 @@ import com.example.myhelper.orchestration.AgentOrchestrator;
 import com.example.myhelper.orchestration.ExecutionTraceStore;
 import com.example.myhelper.orchestration.SpringToolExecutor;
 import com.example.myhelper.orchestration.ToolReliabilityGate;
+import com.example.myhelper.orchestration.WorldContextPort;
 import com.example.myhelper.records.TaskRecordPort;
 import com.example.myhelper.tasklog.TaskLogConfiguration;
+import com.example.myhelper.tools.DeviceStateTool;
 import com.example.myhelper.tasklog.TaskLogPort;
 import com.example.myhelper.tools.ToolDirectory;
 import java.time.Duration;
@@ -105,6 +108,10 @@ public class TaskRuntimeConfiguration {
         List<ToolCallback> callbacks = new ArrayList<>();
         for (ToolDirectory.Binding binding : active) {
             String name = binding.ref().toolName();
+            if (binding.callback() instanceof DeviceStateTool
+                    && (!(gate instanceof DeviceReadGate deviceGate) || !deviceGate.protects(name))) {
+                throw new IllegalStateException("启用设备状态工具需要为其配置设备读取门禁");
+            }
             if (name.equals(AgentCallerPlanner.SUBMIT_PLAN_TOOL) || name.equals(AgentCallerPlanner.FINISH_TASK_TOOL)) {
                 throw new IllegalArgumentException("任务工具与编排协议重名：" + name);
             }
@@ -132,7 +139,8 @@ public class TaskRuntimeConfiguration {
             ObjectProvider<CapabilityUsePort> capabilityUses,
             ObjectProvider<TaskRecordPort> records,
             ObjectProvider<ToolReliabilityGate> reliability,
-            ObjectProvider<TaskLogPort> taskLogs) {
+            ObjectProvider<TaskLogPort> taskLogs,
+            ObjectProvider<WorldContextPort> worldContexts) {
         CapabilitySearchPort search = searches.getIfAvailable();
         if (search == null) {
             search = CapabilitySearchPort.disabled();
@@ -152,7 +160,8 @@ public class TaskRuntimeConfiguration {
         return new AgentOrchestrator(new AgentCallerPlanner(tools.caller()), search, tools.actions(), tools.gate(),
                 taskExecutionTraces, workers, timer, limits, models, records.getIfAvailable(TaskRecordPort::disabled),
                 capabilityUse, reliability.getIfAvailable(ToolReliabilityGate::unavailable),
-                taskLogs.getIfAvailable(TaskLogPort::disabled), activity);
+                taskLogs.getIfAvailable(TaskLogPort::disabled), activity,
+                worldContexts.getIfAvailable(WorldContextPort::disabled));
     }
 
     @Bean

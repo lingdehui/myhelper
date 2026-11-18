@@ -4,10 +4,12 @@ import com.example.myhelper.application.TaskRecoveryConfiguration;
 import com.example.myhelper.interaction.ConsoleInput;
 import com.example.myhelper.interaction.TaskEntry;
 import com.example.myhelper.interaction.TaskRuntimeConfiguration;
+import com.example.myhelper.world.WorldModelConfiguration;
 import com.example.myhelper.interaction.desktop.DesktopSession;
 import com.example.myhelper.llm.ModelClientConfiguration;
 import com.example.myhelper.records.RunArchivePort;
 import com.example.myhelper.tasklog.TaskLogHistory;
+import com.example.myhelper.tools.DeviceStateToolConfiguration;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -25,7 +27,8 @@ import org.springframework.core.env.SimpleCommandLinePropertySource;
 /** MyHelper 的正式进程入口。 */
 @SpringBootConfiguration(proxyBeanMethods = false)
 @EnableAutoConfiguration
-@Import({ModelClientConfiguration.class, TaskRuntimeConfiguration.class, TaskRecoveryConfiguration.class})
+@Import({ModelClientConfiguration.class, TaskRuntimeConfiguration.class, TaskRecoveryConfiguration.class,
+        WorldModelConfiguration.class, DeviceStateToolConfiguration.class})
 public class MyHelperApplication {
     public static void main(String[] args) throws IOException {
         SpringApplication application = application();

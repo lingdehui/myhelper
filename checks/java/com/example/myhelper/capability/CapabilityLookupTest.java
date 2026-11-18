@@ -58,6 +58,9 @@ class CapabilityLookupTest {
         assertEquals(1, loads.get());
         published.set(false);
         assertFalse(lookup.isAvailable(first.ref()));
+        assertTrue(lookup.searchAtEntry(query).selected().isEmpty());
+        // 重新发布后再独立检查缓存淘汰；停用内容不能参与当前选择。
+        published.set(true);
         id.set("two");
         lookup.searchAtEntry(query);
         assertEquals(1, lookup.cachedCount());
@@ -87,8 +90,8 @@ class CapabilityLookupTest {
     }
 
     @Test void candidateThatDisappearsDuringLoadDoesNotHideOtherMatches() {
-        var stale = new CapabilityLookup.Candidate(new CapabilityLookup.Ref("test", "stale", 1), "stale", Map.of());
-        var available = new CapabilityLookup.Candidate(new CapabilityLookup.Ref("test", "available", 1), "available", Map.of());
+        var stale = new CapabilityLookup.Candidate(new CapabilityLookup.Ref("test", "stale", 1), "stale", Map.of(), 0.9);
+        var available = new CapabilityLookup.Candidate(new CapabilityLookup.Ref("test", "available", 1), "available", Map.of(), 0.8);
         AtomicReference<List<CapabilityLookup.Candidate>> candidates = new AtomicReference<>(List.of(stale, available));
         CapabilityLookup lookup = new CapabilityLookup(new CapabilityLookup.Repository() {
             public List<CapabilityLookup.Candidate> search(CapabilityLookup.Query query) { return candidates.get(); }
@@ -217,6 +220,7 @@ class CapabilityLookupTest {
             var conditions = json.parse(body.get()).path("filter").path("must");
             assertEquals("query_terms", conditions.get(2).path("key").asText());
             assertEquals("[\"/unitType\",\"string\",\"PLAN_STEP\"]", conditions.get(2).path("match").path("any").get(0).asText());
+            assertEquals("[\"/unitType\",\"string\",\"INTENT\"]", conditions.get(2).path("match").path("any").get(1).asText());
             assertEquals("[\"/data/publicationStatus\",\"string\",\"PUBLISHED\"]", conditions.get(3).path("match").path("any").get(0).asText());
             assertEquals(1.0, json.parse(body.get()).path("query").get(0).asDouble());
             assertEquals(0.0, json.parse(body.get()).path("query").get(1).asDouble());

@@ -10,10 +10,12 @@ import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
 import org.springframework.core.env.Environment;
 
 /** 将技能业务接到共享存储、模型和工具目录。 */
 @Configuration(proxyBeanMethods = false)
+@Import(SkillChainReliabilityConfiguration.class)
 public class SkillRuntimeConfiguration {
     @Bean
     public ToolParameterStore toolParameterStore(DualWriteStore storage) {
@@ -60,9 +62,10 @@ public class SkillRuntimeConfiguration {
     public ArchivedSkillProcessing archivedSkillProcessing(
             ObjectProvider<RunArchivePort> archives,
             ArchivedToolParameterRecorder recorder,
+            ArchivedSkillChainReliability chains,
             ObjectProvider<CompletedRunConsolidation> consolidation,
             @Qualifier("skillBackgroundExecutor") ThreadPoolTaskExecutor executor) {
-        return new ArchivedSkillProcessing(archives, recorder, consolidation, executor);
+        return new ArchivedSkillProcessing(archives, recorder, chains, consolidation, executor);
     }
 
     private static String modelRef(Environment environment, OpenAiChatModel client) {

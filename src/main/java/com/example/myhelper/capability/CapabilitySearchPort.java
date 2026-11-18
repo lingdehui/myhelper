@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /** 循环侧使用的固化检索端口；数据库、匹配和缓存实现由外部模块提供。 */
 public interface CapabilitySearchPort {
@@ -43,6 +44,23 @@ public interface CapabilitySearchPort {
 
     /** 执行前核对指定能力版本的资格；缓存命中不能代替此检查。 */
     boolean isAvailable(Ref ref);
+
+    /**
+     * 在本次召回候选内按实际参数重新选择，不再进行向量检索。
+     * 旧实现只复核既有 selected；普通候选不因兼容适配而获得执行资格。
+     */
+    default Match select(Query query, Match match, Set<Ref> excluded) {
+        Objects.requireNonNull(query);
+        Objects.requireNonNull(match);
+        Objects.requireNonNull(excluded);
+        if (match.selected().isPresent()) {
+            Ref ref = match.selected().get().ref();
+            if (!excluded.contains(ref) && isAvailable(ref)) {
+                return match;
+            }
+        }
+        return new Match(match.candidates(), Optional.empty());
+    }
 
     /** 尚未接入外部模块时显式使用空实现，不拦截已启用实现的异常。 */
     static CapabilitySearchPort disabled() {

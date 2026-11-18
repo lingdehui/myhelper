@@ -5,6 +5,8 @@ import com.example.myhelper.capability.CapabilitySearchPort;
 import com.example.myhelper.capability.CapabilityUsePort;
 import com.example.myhelper.capability.CheckedCapabilityUse;
 import com.example.myhelper.gate.RuntimeGate;
+import com.example.myhelper.gate.RuntimeGate.CompletionContext;
+import com.example.myhelper.gate.RuntimeGate.ToolCall;
 import com.example.myhelper.llm.LlmTexts;
 import com.example.myhelper.llm.ModelAdapter;
 import com.example.myhelper.records.ExecutionTracePort;
@@ -93,6 +95,8 @@ public final class AgentOrchestrator {
     private final CapabilityUsePort capabilityUse;
     /** 调用技能模块查询分数，决定固化工具是否可以省略模型判断。 */
     private final ToolReliabilityGate toolReliability;
+    /** 按每轮当前任务取只读世界上下文，兄弟任务分别查询。 */
+    private final WorldContextPort worldContext;
     /**
      * 由调用方管理的有界工作执行器。
      */
@@ -157,6 +161,16 @@ public final class AgentOrchestrator {
                              ExecutionTracePort traces, Executor workers, ScheduledExecutorService timer, Limits limits,
                              ModelAdapter modelAdapter, TaskRecordPort records, CapabilityUsePort capabilityUse,
                              ToolReliabilityGate toolReliability, TaskLogPort taskLog, RunActivityPort activity) {
+        this(planner, lookup, actions, checks, traces, workers, timer, limits, modelAdapter, records, capabilityUse,
+                toolReliability, taskLog, activity, WorldContextPort.disabled());
+    }
+
+    /** 装配每轮规划的世界上下文提供方，沿用已有模型、记录及门禁端口。 */
+    public AgentOrchestrator(Planner planner, CapabilitySearchPort lookup, ActionExecutor actions, RuntimeGate checks,
+                             ExecutionTracePort traces, Executor workers, ScheduledExecutorService timer, Limits limits,
+                             ModelAdapter modelAdapter, TaskRecordPort records, CapabilityUsePort capabilityUse,
+                             ToolReliabilityGate toolReliability, TaskLogPort taskLog, RunActivityPort activity,
+                             WorldContextPort worldContext) {
         // 保存单次模型决策桥接器，编排器通过它调用模型。
         this.planner = Objects.requireNonNull(planner);
         // 保存独立固化检索组件，便于以后替换检索实现。
@@ -174,6 +188,7 @@ public final class AgentOrchestrator {
         this.activity = Objects.requireNonNull(activity);
         this.capabilityUse = Objects.requireNonNull(capabilityUse);
         this.toolReliability = Objects.requireNonNull(toolReliability);
+        this.worldContext = Objects.requireNonNull(worldContext);
         // 保存调用方管理的工作池，模型和工具调用都在其中运行。
         this.workers = Objects.requireNonNull(workers);
         // 保存超时计时器；计时线程不执行模型或业务工具。
@@ -493,56 +508,58 @@ public final class AgentOrchestrator {
         return finish(control, node, result);
     }
 
-    // 根入口的唯一固化查询；适用判断及恢复事项数据都来自外部模块。
+    // 根入口的唯一语义检索；派发前选择只使用本次候选，不重复向量查询。
     private CompletableFuture<Outcome> executeEntry(Control control, String run, String parent, String goal,
-                                                     Map<String, Object> args, int depth, ModelAdapter.Binding branch,
-                                                     RecoverySnapshot snapshot) {
+            Map<String, Object> args, int depth, ModelAdapter.Binding branch, RecoverySnapshot snapshot) {
+        CapabilityLookup.Query query = new CapabilityLookup.Query(run, 0, CapabilityLookup.ENTRY_QUERY_ID, goal, args);
         return async(control, run, parent, NodeKind.SEARCH, goal, 0,
                 Map.of("phase", CapabilityLookup.SearchPhase.ENTRY.name(), "enabled", lookup.enabled()),
                 new Supplier<CapabilityLookup.Match>() {
                     @Override
                     public CapabilityLookup.Match get() {
-                        return lookup.searchAtEntry(new CapabilityLookup.Query(run, 0, CapabilityLookup.ENTRY_QUERY_ID, goal, args),
-                                control.records.context(run, snapshot));
+                        return lookup.searchAtEntry(query, control.records.context(run, snapshot));
                     }
                 }).thenCompose(new Function<CapabilityLookup.Match, CompletionStage<Outcome>>() {
                     @Override
                     public CompletionStage<Outcome> apply(CapabilityLookup.Match match) {
-                        if (match.selected().isEmpty()) {
-                            return runDecisionRound(control, run, parent, goal, args, depth, 0,
-                                    match.candidates(), List.of(), branch);
-                        }
-                        CapabilityLookup.Definition definition = match.selected().get();
-                        return capability(control, run, parent, goal, args, definition, depth, 0, branch)
-                                .thenCompose(new Function<Outcome, CompletionStage<Outcome>>() {
+                        return tryCapabilities(control, run, parent, goal, args, match, depth, 0, branch, query,
+                                true, Set.of()).thenCompose(new Function<CapabilityAttempt, CompletionStage<Outcome>>() {
                                     @Override
-                                    public CompletionStage<Outcome> apply(Outcome outcome) {
-                                        if (outcome.status() != Status.SUCCESS) {
-                                            // 入口失败也带实际执行反馈求解；未知效果需外部提供专门处理事项。
-                                            return continueAfterExecution(control, run, parent, goal, args, depth, 0,
-                                                    match.candidates(), List.of(new Feedback(0, definition.plan(), outcome)), outcome, branch);
-                                        }
-                                        // 成功纯工具路径可直接结束；外部若发现问题则先交模型判断。
-                                        return preserveResult(queryRecovery(control, run, parent, goal, 0)
-                                                .thenCompose(new Function<RecoverySnapshot, CompletionStage<Outcome>>() {
-                                                    @Override
-                                                    public CompletionStage<Outcome> apply(RecoverySnapshot latest) {
-                                                        if (latest.disposition() == Disposition.CONTINUE) {
-                                                            if (depth == 0) {
-                                                                control.completionRevision.set(latest.revision());
-                                                            }
-                                                            return CompletableFuture.completedFuture(outcome);
-                                                        }
-                                                        return runDecisionRound(control, run, parent, goal, args, depth, 0,
-                                                                match.candidates(), List.of(new Feedback(0, definition.plan(), outcome)), branch);
-                                                    }
-                                                }), outcome);
+                                    public CompletionStage<Outcome> apply(CapabilityAttempt attempt) {
+                                        return afterEntryAttempt(control, run, parent, goal, args, depth, branch, match, attempt);
                                     }
                                 });
                     }
                 });
     }
 
+    private CompletableFuture<Outcome> afterEntryAttempt(Control control, String run, String parent, String goal,
+            Map<String, Object> args, int depth, ModelAdapter.Binding branch,
+            CapabilityLookup.Match match, CapabilityAttempt attempt) {
+        if (attempt.definition() == null) {
+            return runDecisionRound(control, run, parent, goal, args, depth, 0, match.candidates(), List.of(), branch);
+        }
+        Outcome outcome = attempt.outcome();
+        List<Feedback> feedback = List.of(new Feedback(0, attempt.definition().plan(), outcome));
+        if (outcome.status() != Status.SUCCESS) {
+            return continueAfterExecution(control, run, parent, goal, args, depth, 0,
+                    match.candidates(), feedback, outcome, branch);
+        }
+        return preserveResult(queryRecovery(control, run, parent, goal, 0)
+                .thenCompose(new Function<RecoverySnapshot, CompletionStage<Outcome>>() {
+                    @Override
+                    public CompletionStage<Outcome> apply(RecoverySnapshot latest) {
+                        if (latest.disposition() == Disposition.CONTINUE) {
+                            if (depth == 0) {
+                                control.completionRevision.set(latest.revision());
+                            }
+                            return CompletableFuture.completedFuture(outcome);
+                        }
+                        return runDecisionRound(control, run, parent, goal, args, depth, 0,
+                                match.candidates(), feedback, branch);
+                    }
+                }), outcome);
+    }
     // 查询不创建本地待办；未装配记录时明确只有本次运行能力。
     private CompletableFuture<RecoverySnapshot> queryRecovery(Control control, String run, String parent,
                                                                String goal, long revision) {
@@ -620,6 +637,12 @@ public final class AgentOrchestrator {
                     }
                     Map<String, List<PlanningReference>> references = planningToolReliability(control);
                     control.check();
+                    // 先取得当前任务本轮的世界快照，查询失败按规划准备失败处理。
+                    PlanningContext request = new PlanningContext(run, goal, args, branch.modelRef(),
+                            control.request.toolNames(), candidates, history, control.records.taskId(), phase, snapshot,
+                            control.records.instructions(), references);
+                    PlanningContext context = request.withWorldContext(worldContext.snapshot(request));
+                    control.check();
                     Map<String, Object> started = new LinkedHashMap<>(assignment);
                     started.put("startedAt", Instant.now().toString());
                     control.records.emit(run, callId, branch.id(), revision, EventKind.MODEL_CALL_STARTED, started);
@@ -630,10 +653,8 @@ public final class AgentOrchestrator {
                     modelInvoked.set(true);
                     Decision decision;
                     try {
-                        decision = Objects.requireNonNull(planner.decide(new PlanningContext(run, goal, args, branch.modelRef(),
-                                // 把根工具权限、入口候选和本任务反馈交给模型。
-                                control.request.toolNames(), candidates, history, control.records.taskId(), phase, snapshot,
-                                control.records.instructions(), references), control.records.logContext(run, callId, branch.id(), revision)));
+                        decision = Objects.requireNonNull(planner.decide(context,
+                                control.records.logContext(run, callId, branch.id(), revision)));
                     } finally {
                         // 先结束计时，再写返回记录和链路；失败样本也不混入存储耗时。
                         modelElapsedNanos.set(Math.max(0L, System.nanoTime() - startedNanos));
@@ -807,7 +828,7 @@ public final class AgentOrchestrator {
             @Override
             public Outcome get() {
                 return checkedRecorded(control, run, parent, branch.id(), revision, goal, args,
-                        new Outcome(Status.SUCCESS, output, null));
+                        new Outcome(Status.SUCCESS, output, null), null);
             }
         }).thenCompose(new Function<Outcome, CompletionStage<Outcome>>() {
             @Override
@@ -872,10 +893,7 @@ public final class AgentOrchestrator {
                         // 检索仍每次执行；本轮已拒绝的版本不能再次替换模型的新计划。
                         CapabilityLookup.PlanMatches matches = withoutRejectedCapabilities(control, found);
                         CapabilityLookup.Definition whole = matches.whole().selected().orElse(null);
-                        // 整条替换由固化定义自己的执行计划校验模型路由。
-                        if (whole == null && planNeedsModels(plan, matches)) {
-                            PlanBranches.analyze(plan);
-                        }
+                        // 最终采用哪份计划由候选选择决定；executePlan 再校验该实际计划的模型路由。
                         if (depth == 0 && !control.records.applyPlan(run, revision, planData(plan))) {
                             throw new RunInterrupted(Status.WAITING, LlmTexts.TASK_INSTRUCTION_CHANGED);
                         }
@@ -883,9 +901,21 @@ public final class AgentOrchestrator {
                                 Kind.PLAN_APPLIED, "采用计划 steps=" + plan.steps().size());
                         // 整条命中则运行固化定义；否则执行原计划，并逐步骤复用命中的子能力。
                         CompletableFuture<Outcome> execution;
-                        if (whole != null) {
+                        if (whole != null || !matches.whole().candidates().isEmpty()) {
                             // 整条计划已匹配：直接执行固定能力定义。
-                            execution = capability(control, run, parent, plan.goal(), args, whole, depth, revision, branch);
+                            execution = tryCapabilities(control, run, parent, plan.goal(), args, matches.whole(), depth,
+                                    revision, branch, new CapabilityLookup.Query(run, revision,
+                                            CapabilityLookup.WHOLE_PLAN_QUERY_ID, plan.goal(), args), true, Set.of())
+                                    .thenCompose(new Function<CapabilityAttempt, CompletionStage<Outcome>>() {
+                                        @Override
+                                        public CompletionStage<Outcome> apply(CapabilityAttempt attempt) {
+                                            if (attempt.definition() != null) {
+                                                return CompletableFuture.completedFuture(attempt.outcome());
+                                            }
+                                            return executePlan(control, run, parent, plan, args, matches, depth,
+                                                    revision, branch, null);
+                                        }
+                                    });
                         } else {
                             // 否则执行原计划，并在各步骤使用已选子能力。
                             execution = executePlan(control, run, parent, plan, args, matches, depth, revision, branch, null);
@@ -928,20 +958,90 @@ public final class AgentOrchestrator {
         }, outcome);
     }
 
+    /** 使用已有召回候选重新核对；只有确认尚未进入动作路径时才直接尝试下一链。 */
+    private CompletableFuture<CapabilityAttempt> tryCapabilities(Control control, String run, String parent,
+            String goal, Map<String, Object> args, CapabilityLookup.Match match, int depth, long revision,
+            ModelAdapter.Binding branch, CapabilityLookup.Query query, boolean allowModelSteps,
+            Set<CapabilityLookup.Ref> attempted) {
+        if (match.selected().isEmpty() && match.candidates().isEmpty()) {
+            return CompletableFuture.completedFuture(new CapabilityAttempt(null, null, true));
+        }
+        Set<CapabilityLookup.Ref> excluded = new LinkedHashSet<>(attempted);
+        excluded.addAll(control.capabilityFailures.excluded(args));
+        excluded.addAll(control.modelRequiredCapabilities);
+        return async(control, run, parent, NodeKind.GATE, goal, revision, Map.of("phase", "CHAIN_SELECTION"),
+                new Supplier<CapabilityLookup.Match>() {
+                    @Override
+                    public CapabilityLookup.Match get() {
+                        return lookup.select(query, match, Set.copyOf(excluded));
+                    }
+                }).thenCompose(new Function<CapabilityLookup.Match, CompletionStage<CapabilityAttempt>>() {
+                    @Override
+                    public CompletionStage<CapabilityAttempt> apply(CapabilityLookup.Match selected) {
+                        if (selected.selected().isEmpty()) {
+                            return CompletableFuture.completedFuture(new CapabilityAttempt(null, null, true));
+                        }
+                        CapabilityLookup.Definition definition = selected.selected().get();
+                        if (excluded.contains(definition.ref()) || attempted.size() > match.candidates().size()) {
+                            throw new IllegalStateException(LlmTexts.CAPABILITY_SELECTION_REPEATED);
+                        }
+                        Set<CapabilityLookup.Ref> next = new LinkedHashSet<>(attempted);
+                        next.add(definition.ref());
+                        // 派发阶段不得把已按纯工具建立的分支拓扑偷偷改为模型分叉。
+                        if (!allowModelSteps && hasModelSteps(definition.plan().steps())) {
+                            return tryCapabilities(control, run, parent, goal, args, match, depth, revision,
+                                    branch, query, allowModelSteps, Set.copyOf(next));
+                        }
+                        return capability(control, run, parent, goal, args, definition, depth, revision, branch)
+                                .thenCompose(new Function<CapabilityAttempt, CompletionStage<CapabilityAttempt>>() {
+                                    @Override
+                                    public CompletionStage<CapabilityAttempt> apply(CapabilityAttempt result) {
+                                        if (result.outcome().status() == Status.FAILED) {
+                                            control.capabilityFailures.add(definition.ref(), args);
+                                        }
+                                        if (result.retrySafe() && result.outcome().status() == Status.FAILED) {
+                                            return tryCapabilities(control, run, parent, goal, args, match, depth,
+                                                    revision, branch, query, allowModelSteps, Set.copyOf(next))
+                                                    .thenApply(new Function<CapabilityAttempt, CapabilityAttempt>() {
+                                                        @Override
+                                                        public CapabilityAttempt apply(CapabilityAttempt alternative) {
+                                                            // 都不可用时保留本次拒绝原因，交给模型而不是丢掉反馈。
+                                                            return alternative.definition() == null ? result : alternative;
+                                                        }
+                                                    });
+                                        }
+                                        return CompletableFuture.completedFuture(result);
+                                    }
+                                });
+                    }
+                });
+    }
+
+    private static boolean hasModelSteps(List<TaskPlan.Step> steps) {
+        for (TaskPlan.Step step : steps) {
+            if (step.kind() == TaskPlan.Kind.TASK) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // 运行已固定版本的能力定义；仍受本次门禁、验收和预算限制。
-    private CompletableFuture<Outcome> capability(Control control, String run, String parent, String goal,
+    private CompletableFuture<CapabilityAttempt> capability(Control control, String run, String parent, String goal,
                                                   Map<String, Object> args, CapabilityLookup.Definition definition, int depth, long revision,
                                                   ModelAdapter.Binding branch) {
         // 本根运行已交回模型的版本不再自动复用；新运行会重新查询评分。
         if (control.modelRequiredCapabilities.contains(definition.ref())) {
-            return CompletableFuture.completedFuture(new Outcome(Status.FAILED, null,
-                    LlmTexts.TOOL_RELIABILITY_REPLAN));
+            return CompletableFuture.completedFuture(new CapabilityAttempt(definition,
+                    new Outcome(Status.FAILED, null, LlmTexts.TOOL_RELIABILITY_REPLAN), true));
         }
         // 限制固化组合展开深度，避免无限递归。
         if (depth > limits.maxDepth()) {
             // 返回已完成的失败结果，明确本分支没有继续执行动作。
-            return CompletableFuture.completedFuture(new Outcome(Status.FAILED, null, LlmTexts.CAPABILITY_DEPTH_LIMIT_REACHED));
+            return CompletableFuture.completedFuture(new CapabilityAttempt(definition,
+                    new Outcome(Status.FAILED, null, LlmTexts.CAPABILITY_DEPTH_LIMIT_REACHED), false));
         }
+        DirectCapability direct = new DirectCapability(definition.ref());
         // 建立能力执行节点，记录固定能力 ID。
         String unit = node(control, run, parent, NodeKind.UNIT, definition.ref().id(), revision,
                 // 记录能力来源、固定修订以及本次调用参数，便于追溯。
@@ -973,7 +1073,7 @@ public final class AgentOrchestrator {
                             allowed.reason() == null ? LlmTexts.CAPABILITY_NOT_ALLOWED : allowed.reason()));
                 }
                 // 固化定义不是新的 LLM 规划，不在此处再次检索数据库候选。
-                return executePlan(control, run, unit, definition.plan(), args, null, depth + 1, revision, branch, definition.ref())
+                return executePlan(control, run, unit, definition.plan(), args, null, depth + 1, revision, branch, direct)
                         // 能力各步骤执行完成后，对组合结果做验收。
                         .thenCompose(new Function<Outcome, CompletionStage<Outcome>>() {
                             @Override
@@ -981,7 +1081,7 @@ public final class AgentOrchestrator {
                                 return preserveResult(async(control, run, unit, NodeKind.VERIFY, goal, revision, args, new Supplier<Outcome>() {
                                     @Override
                                     public Outcome get() {
-                                        return checkedRecorded(control, run, unit, branch.id(), revision, goal, args, outcome);
+                                        return checkedRecorded(control, run, unit, branch.id(), revision, goal, args, outcome, null);
                                     }
                                 }), outcome);
                             }
@@ -989,13 +1089,18 @@ public final class AgentOrchestrator {
             }
         });
         // 把组合结果写回该能力节点，并返回给上层步骤。
-        return finish(control, unit, result);
+        return finish(control, unit, result).thenApply(new Function<Outcome, CapabilityAttempt>() {
+            @Override
+            public CapabilityAttempt apply(Outcome outcome) {
+                return new CapabilityAttempt(definition, outcome, !direct.mayHaveEffects.get());
+            }
+        });
     }
 
     // 创建有限 DAG 并按依赖调度；只等待各节点的 Future，不同步阻塞父线程。
     private CompletableFuture<Outcome> executePlan(Control control, String run, String parent, TaskPlan plan,
                                                    Map<String, Object> input, CapabilityLookup.PlanMatches matches, int depth, long revision,
-                                                   ModelAdapter.Binding branch, CapabilityLookup.Ref directCapability) {
+                                                   ModelAdapter.Binding branch, DirectCapability directCapability) {
         // 分析本计划的分叉/汇合；不同计划作用域不会共享可变的分支映射。
         PlanModelBindings modelBindings = new PlanModelBindings(plan, branch, control.modelAccess,
                 routingTasksByStep(plan, matches, control.request.toolNames()));
@@ -1139,7 +1244,7 @@ public final class AgentOrchestrator {
                                                          TaskPlan.Step step, Map<String, Object> input,
                                                          Map<String, CompletableFuture<Outcome>> predecessors,
                                                          CapabilityLookup.PlanMatches matches, int depth, long revision,
-                                                         PlanModelBindings modelBindings, CapabilityLookup.Ref directCapability) {
+                                                         PlanModelBindings modelBindings, DirectCapability directCapability) {
         // 在继续调度前检查共享取消信号和截止时间。
         control.check();
         // 这些 Future 已经完成，join 这里只读取结果；任一前驱失败就阻止后继。
@@ -1159,21 +1264,67 @@ public final class AgentOrchestrator {
         // 依赖已经结束：局部汇合恢复父模型，首次分叉则一次分配全部子绑定。
         ModelAdapter.Binding branch = modelBindings.ready(step.id());
         // 读取本计划缓存中该步骤命中的固化；固化展开内部没有新的匹配表。
-        CapabilityLookup.Definition selected = selectedCapability(matches, step.id());
-        // 优先执行已匹配能力，跳过该步骤原本需要的额外求解。
-        if (selected != null) {
-            // 步骤命中固化后直接执行能力，避免额外模型调用。
-            return capability(control, run, nodes.get(step.id()), step.goal(), args, selected, depth, revision, branch);
+        CapabilityLookup.Match match = matches == null ? null : matches.steps().get(step.id());
+        if (match != null && (match.selected().isPresent() || !match.candidates().isEmpty())) {
+            TaskPlan.Step resolved = new TaskPlan.Step(step.id(), step.goal(), step.kind(), step.toolName(),
+                    args, step.dependsOn(), Map.of());
+            CapabilityLookup.Query query = new CapabilityLookup.Query(run, revision, step.id(), step.goal(), args, resolved);
+            return tryCapabilities(control, run, nodes.get(step.id()), step.goal(), args, match, depth, revision,
+                    branch, query, hasModelSteps(effectiveSteps(step, matches)), Set.of())
+                    .thenCompose(new Function<CapabilityAttempt, CompletionStage<Outcome>>() {
+                        @Override
+                        public CompletionStage<Outcome> apply(CapabilityAttempt attempt) {
+                            if (attempt.definition() != null) {
+                                return CompletableFuture.completedFuture(attempt.outcome());
+                            }
+                            if (step.kind() == TaskPlan.Kind.TASK && !hasModelSteps(effectiveSteps(step, matches))) {
+                                return CompletableFuture.completedFuture(new Outcome(Status.FAILED,
+                                        Map.of("executed", false), LlmTexts.CAPABILITY_ROUTING_REPLAN));
+                            }
+                            return executeOriginalStep(control, run, nodes.get(step.id()), step, args,
+                                    depth, revision, branch, directCapability);
+                        }
+                    });
+        }
+        return executeOriginalStep(control, run, nodes.get(step.id()), step, args, depth, revision, branch, directCapability);
+    }
+
+    private CompletableFuture<Outcome> executeOriginalStep(Control control, String run, String parent,
+            TaskPlan.Step step, Map<String, Object> args, int depth, long revision,
+            ModelAdapter.Binding branch, DirectCapability directCapability) {
+        if (directCapability != null && step.kind() == TaskPlan.Kind.TASK) {
+            // 子任务可能调用模型和动作，不能据其失败回执推断整条链尚未执行。
+            directCapability.mayHaveEffects.set(true);
         }
         // 这里才区分“已有工具”和“需要模型求解的子任务”。
         return switch (step.kind()) {
             // 子任务递归进入任务入口，但不重复根入口固化检索。
-            case TASK -> task(control, nodes.get(step.id()), step.goal(), args, depth + 1, false, branch);
+            case TASK -> task(control, parent, step.goal(), args, depth + 1, false, branch);
             // 模型明确规划的工具保留原执行路径；固化工具先查询可靠度。
             case TOOL -> directCapability == null
-                    ? executeToolStep(control, run, nodes.get(step.id()), step, args, revision, branch)
-                    : executeReliableTool(control, run, nodes.get(step.id()), step, args, revision, branch, directCapability);
+                    ? executeToolStep(control, run, parent, step, args, revision, branch)
+                    : executeReliableTool(control, run, parent, step, args, revision, branch, directCapability);
         };
+    }
+
+    /** 候选尝试只记录调度事实，retrySafe 不能由工具返回的任意 value 字段声明。 */
+    private record CapabilityAttempt(
+            /** 实际尝试的定义；为空表示没有合格候选。 */
+            CapabilityLookup.Definition definition,
+            /** 实际执行或拒绝结果；无候选时为空。 */
+            Outcome outcome,
+            /** 本链尚未进入任何可能执行动作的 TOOL/TASK 路径。 */
+            boolean retrySafe) { }
+
+    private static final class DirectCapability {
+        /** 本次展开采用的固定链版本。 */
+        private final CapabilityLookup.Ref ref;
+        /** 并发步骤中任一进入动作路径后，整链不可直接换候选重做。 */
+        private final AtomicBoolean mayHaveEffects = new AtomicBoolean();
+
+        private DirectCapability(CapabilityLookup.Ref ref) {
+            this.ref = ref;
+        }
     }
 
     // 已查询到的候选仍可作为参考，只取消当前运行已拒绝版本的自动选中。
@@ -1196,7 +1347,8 @@ public final class AgentOrchestrator {
     // 参数已绑定，数据库查询异步运行；评分未通过时不会产生工具执行意图或调用计数。
     private CompletableFuture<Outcome> executeReliableTool(Control control, String run, String parent,
                                                            TaskPlan.Step step, Map<String, Object> args, long revision,
-                                                           ModelAdapter.Binding branch, CapabilityLookup.Ref ref) {
+                                                           ModelAdapter.Binding branch, DirectCapability directCapability) {
+        CapabilityLookup.Ref ref = directCapability.ref;
         ToolRef toolBinding = actions.resolveTool(step.toolName()).orElse(null);
         return async(control, run, parent, NodeKind.GATE, step.goal(), revision,
                 Map.of("phase", "TOOL_RELIABILITY", "tool", step.toolName(), "arguments", args,
@@ -1222,7 +1374,7 @@ public final class AgentOrchestrator {
                         control.check();
                         if (decision.direct()) {
                             // 高分仅省去模型；原有工具门禁、记录、预算与验收继续执行。
-                            return executeToolStep(control, run, parent, step, args, revision, branch, toolBinding);
+                            return executeToolStep(control, run, parent, step, args, revision, branch, toolBinding, directCapability);
                         }
                         // 原有父循环收集所有实际结果后交给模型，保留此前成功步骤且不盲目重放。
                         return CompletableFuture.completedFuture(new Outcome(Status.FAILED,
@@ -1269,20 +1421,32 @@ public final class AgentOrchestrator {
     private CompletableFuture<Outcome> executeToolStep(Control control, String run, String parent,
                                                        TaskPlan.Step step, Map<String, Object> args, long revision,
                                                        ModelAdapter.Binding branch) {
-        return executeToolStep(control, run, parent, step, args, revision, branch, null);
+        ToolRef toolBinding = null;
+        if (actions instanceof SpringToolExecutor springTools) {
+            toolBinding = springTools.resolveTool(step.toolName()).orElse(null);
+        }
+        return executeToolStep(control, run, parent, step, args, revision, branch, toolBinding);
     }
 
     private CompletableFuture<Outcome> executeToolStep(Control control, String run, String parent,
                                                        TaskPlan.Step step, Map<String, Object> args, long revision,
                                                        ModelAdapter.Binding branch, ToolRef toolBinding) {
+        return executeToolStep(control, run, parent, step, args, revision, branch, toolBinding, null);
+    }
+
+    private CompletableFuture<Outcome> executeToolStep(Control control, String run, String parent,
+            TaskPlan.Step step, Map<String, Object> args, long revision,
+            ModelAdapter.Binding branch, ToolRef toolBinding, DirectCapability directCapability) {
         // 工具调用身份同时用于事件及外部回执，不再把父 STEP 身份当成实际 TOOL 身份。
         String operation = node(control, run, parent, NodeKind.TOOL, step.goal(), revision,
                 Map.of("tool", step.toolName(), "arguments", args));
+        var toolCall = new ToolCall(step.toolName(), toolBinding, step.goal(), args,
+                control.records.taskId(), control.root, run, operation);
         return asyncNode(control, operation, new Supplier<Outcome>() {
                     @Override
                     public Outcome get() {
-                        // 普通工具也先过门禁；null ref 表示这次不是固化能力引用。
-                        if (!checks.allow(step.goal(), args, null)) {
+                        // 在记录执行意图和派发之前，检查实际绑定及参数。
+                        if (!checks.allowTool(toolCall)) {
                             // 返回明确失败及原因，让所属任务统一决定后续处理。
                             return new Outcome(Status.FAILED, null, LlmTexts.TOOL_NOT_ALLOWED);
                         }
@@ -1292,7 +1456,7 @@ public final class AgentOrchestrator {
                             throw new IllegalStateException(LlmTexts.TOOL_CALL_LIMIT_REACHED);
                         }
                         Outcome executed = null;
-                        boolean entered = false;
+                        var dispatchGate = new ToolDispatchGate(checks, toolCall);
                         try {
                             // 外部确认已记录执行意图后才派发；失败不降级成无记录执行。
                             control.records.emit(run, operation, branch.id(), revision, EventKind.INTENT,
@@ -1312,40 +1476,74 @@ public final class AgentOrchestrator {
                                     });
                             // 记录确认和排队期间可能有新指令；自定义执行器的入口也受版本检查。
                             context.check();
-                            // 按工具名和 Map 参数执行，并注入根身份、任务身份、步骤及取消上下文。
-                            entered = true;
-                            executed = toolBinding == null ? actions.execute(step.toolName(), args, context)
-                                    : actions.execute(toolBinding, args, context);
+                            executed = dispatchTool(toolCall, context, dispatchGate);
                             // 保存真实返回，再独立记录验收，避免“修改已完成但验收失败”被混为未执行。
-                            control.records.emit(run, operation, branch.id(), revision, EventKind.RETURNED,
-                                    Map.of("goal", step.goal(), "tool", step.toolName(), "arguments", args, "outcome", executed.asMap()));
+                            recordToolReturn(control, toolCall, branch.id(), revision, executed, dispatchGate.started);
+                            // 明确未派发时没有可验收结果，也不应生成外部影响待核对事项。
+                            if (!dispatchGate.started) {
+                                return executed;
+                            }
                             // 对实际工具结果做业务验收，不把回调正常返回当成整个任务成功。
-                            return checkedRecorded(control, run, operation, branch.id(), revision, step.goal(), args, executed);
+                            return checkedRecorded(control, run, operation, branch.id(), revision, step.goal(), args, executed, toolCall);
                         } catch (RuntimeException failure) {
-                            if (!entered && failure instanceof RunInterrupted) {
+                            if (!dispatchGate.started && failure instanceof RunInterrupted) {
                                 Outcome skipped = failed(failure);
                                 // 意图已保存但尚未进入执行器，明确记录未派发，避免恢复误当在途效果。
-                                control.records.emit(run, operation, branch.id(), revision, EventKind.RETURNED,
-                                        Map.of("goal", step.goal(), "tool", step.toolName(), "arguments", args,
-                                                "dispatchStarted", false, "outcome", skipped.asMap()));
+                                recordToolReturn(control, toolCall, branch.id(), revision, skipped, false);
                                 return skipped;
                             }
                             // 自定义执行适配器也可能在副作用发生后抛错，不能转成可随意重试的普通失败。
                             Outcome uncertain = new Outcome(Status.UNKNOWN, executed == null ? null : executed.value(),
                                     LlmTexts.EXECUTION_UNKNOWN_PREFIX + message(failure));
-                            if (entered && executed == null) {
+                            if (dispatchGate.started && executed == null) {
                                 try {
-                                    control.records.emit(run, operation, branch.id(), revision, EventKind.RETURNED,
-                                            Map.of("goal", step.goal(), "tool", step.toolName(), "arguments", args, "outcome", uncertain.asMap()));
+                                    recordToolReturn(control, toolCall, branch.id(), revision, uncertain, true);
                                 } catch (RuntimeException recordFailure) {
                                     // 原执行异常与记录错误同时保留；已派发的效果不能改写成未发生。
                                     return new Outcome(Status.UNKNOWN, uncertain.value(), uncertain.error() + " | " + message(recordFailure));
                                 }
                             }
                             return uncertain;
+                        } finally {
+                            // 只用宿主派发门禁的真实标记，不采信工具 value 中自称未执行的字段。
+                            if (directCapability != null && dispatchGate.started) {
+                                directCapability.mayHaveEffects.set(true);
+                            }
                         }
                     }
                 });
+    }
+
+    private Outcome dispatchTool(ToolCall call, CallContext context, ToolDispatchGate gate) {
+        if (actions instanceof SpringToolExecutor springTools) {
+            return springTools.executeChecked(call, context, gate);
+        }
+        // 旧执行器没有统一的锁边界，在调用执行器之前检查派发许可。
+        try {
+            if (!gate.start(context)) {
+                return new Outcome(Status.FAILED, null, LlmTexts.TOOL_NOT_ALLOWED);
+            }
+        } catch (RunInterrupted interrupted) {
+            throw interrupted;
+        } catch (RuntimeException failure) {
+            return failed(failure);
+        }
+        if (call.toolRef() == null) {
+            return actions.execute(call.toolName(), call.args(), context);
+        }
+        return actions.execute(call.toolRef(), call.args(), context);
+    }
+
+    private void recordToolReturn(Control control, ToolCall call, String branch, long revision, Outcome outcome, boolean started) {
+        var details = new LinkedHashMap<String, Object>();
+        details.put("goal", call.goal());
+        details.put("tool", call.toolName());
+        details.put("arguments", call.args());
+        if (!started) {
+            details.put("dispatchStarted", false);
+        }
+        details.put("outcome", outcome.asMap());
+        control.records.emit(call.runId(), call.operationId(), branch, revision, EventKind.RETURNED, details);
     }
 
     // 统一提交耗时工作并记录链路；T 可以是决策、检索结果或执行结果。
@@ -1441,7 +1639,7 @@ public final class AgentOrchestrator {
     }
 
     // 成功返回还要业务验收；非成功结果保留原状态。
-    private Outcome checked(String goal, Map<String, Object> args, Outcome outcome, Map<String, Object> instructions) {
+    private Outcome checked(CompletionContext completion, ToolCall toolCall, Outcome outcome, Map<String, Object> instructions) {
         // 执行器不能返回 null，否则无法判定真实结果。
         Objects.requireNonNull(outcome, LlmTexts.EMPTY_EXECUTOR_OUTCOME);
         // 失败、取消、未知等结果不再当成功结果验收。
@@ -1451,7 +1649,10 @@ public final class AgentOrchestrator {
         }
         try {
             // 验收通过才保留成功；明确不通过则保存原结果并标记失败。
-            return checks.verify(goal, args, outcome.value(), instructions) ? outcome : new Outcome(Status.FAILED, outcome.value(), LlmTexts.VERIFICATION_FAILED);
+            boolean verified = toolCall == null
+                    ? checks.verifyCompletion(completion, outcome.value(), instructions)
+                    : checks.verifyTool(toolCall, outcome.value(), instructions);
+            return verified ? outcome : new Outcome(Status.FAILED, outcome.value(), LlmTexts.VERIFICATION_FAILED);
         } catch (RuntimeException failure) {
             // 动作可能已经成功，验收服务故障不能触发自动重做动作。
             return new Outcome(Status.UNKNOWN, outcome.value(), LlmTexts.VERIFICATION_UNKNOWN_PREFIX + message(failure));
@@ -1460,12 +1661,13 @@ public final class AgentOrchestrator {
 
     // 验收结果作为独立事件交给记录模块，由它决定进度和待处理事项变化。
     private Outcome checkedRecorded(Control control, String run, String operation, String branch, long revision,
-                                    String goal, Map<String, Object> args, Outcome execution) {
+                                    String goal, Map<String, Object> args, Outcome execution, ToolCall toolCall) {
         if (execution != null && execution.status() == Status.SUCCESS) {
             control.records.progress(control.records.logContext(run, operation, branch, revision), Kind.VERIFY_STARTED,
                     "开始验收结果");
         }
-        Outcome result = checked(goal, args, execution, control.records.instructionData());
+        var completion = new CompletionContext(goal, args, control.records.taskId(), control.root, run, operation);
+        Outcome result = checked(completion, toolCall, execution, control.records.instructionData());
         try {
             control.records.emit(run, operation, branch, revision, EventKind.VERIFIED,
                     Map.of("goal", goal, "arguments", args, "performed", execution.status() == Status.SUCCESS,
@@ -1637,6 +1839,30 @@ public final class AgentOrchestrator {
                 return new Outcome(Status.FAILED, null, LlmTexts.TOOL_BINDING_CHANGED);
             }
             return execute(ref.toolName(), args, context);
+        }
+    }
+
+    /** 本步骤的宿主派发许可，与工具开放的执行上下文隔离。 */
+    static final class ToolDispatchGate {
+        /** 提供业务许可的门禁。 */
+        private final RuntimeGate checks;
+        /** 与实际派发和验收共用的调用身份。 */
+        private final ToolCall call;
+        /** 已通过派发许可和最后一次取消检查，即将进入实际工具。 */
+        private boolean started;
+
+        private ToolDispatchGate(RuntimeGate checks, ToolCall call) {
+            this.checks = checks;
+            this.call = call;
+        }
+
+        boolean start(CallContext context) {
+            if (!checks.beforeToolDispatch(call)) {
+                return false;
+            }
+            context.check();
+            started = true;
+            return true;
         }
     }
 
@@ -1823,7 +2049,18 @@ public final class AgentOrchestrator {
             /** 本运行固定采用的指令及其版本；历史实际进度来自 recovery。 */
             TaskInstructionPort.Snapshot instructions,
             /** 按允许工具名称附带的历史范围估计，缺项表示未知。 */
-            Map<String, List<PlanningReference>> toolReliability) {
+            Map<String, List<PlanningReference>> toolReliability,
+            /** 用于当前任务本轮规划的只读世界证据。 */
+            Map<String, Object> worldContext) {
+        public PlanningContext(String runId, String goal, Map<String, Object> arguments, String modelRef,
+                               List<String> toolNames, List<CapabilityLookup.Candidate> candidates, List<Feedback> history,
+                               String taskId, PlanningPhase phase, RecoverySnapshot recovery,
+                               TaskInstructionPort.Snapshot instructions,
+                               Map<String, List<PlanningReference>> toolReliability) {
+            this(runId, goal, arguments, modelRef, toolNames, candidates, history, taskId, phase, recovery,
+                    instructions, toolReliability, Map.of());
+        }
+
         public PlanningContext(String runId, String goal, Map<String, Object> arguments, String modelRef,
                                List<String> toolNames, List<CapabilityLookup.Candidate> candidates, List<Feedback> history,
                                String taskId, PlanningPhase phase, RecoverySnapshot recovery,
@@ -1867,6 +2104,14 @@ public final class AgentOrchestrator {
                 }
             }
             toolReliability = Map.copyOf(visibleReferences);
+            // 复制嵌套的证据、历史等 JSON 集合，避免后续查询修改本轮输入。
+            worldContext = TaskPlan.immutableMap(worldContext);
+        }
+
+        /** 保留本次任务快照，附上这一轮查询得到的世界证据。 */
+        PlanningContext withWorldContext(Map<String, Object> snapshot) {
+            return new PlanningContext(runId, goal, arguments, modelRef, toolNames, candidates, history,
+                    taskId, phase, recovery, instructions, toolReliability, snapshot);
         }
     }
 
@@ -1958,6 +2203,8 @@ public final class AgentOrchestrator {
     private static final class Control {
         /** 仅本根运行的回退选择，防止拒绝的固化再次抢占模型方案；不修改发布状态。 */
         private final Set<CapabilityLookup.Ref> modelRequiredCapabilities = ConcurrentHashMap.newKeySet();
+        /** 本根任务已确认失败的链版本与实际参数，不影响其他输入和发布状态。 */
+        private final CapabilityFailures capabilityFailures = new CapabilityFailures();
         /** 应用可等待真实收尾；取消的对外结果不会提前完成它。 */
         private final CompletableFuture<Outcome> settled = new CompletableFuture<>();
         /** 允许重复修订返回同一个已经启动的运行句柄。 */

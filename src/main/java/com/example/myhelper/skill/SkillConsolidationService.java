@@ -144,10 +144,39 @@ public final class SkillConsolidationService {
             /** 审核结论。 */
             boolean approved,
             /** 审核依据。 */
-            String reason) {
+            String reason,
+            /** 本次独立审核批准的意图归组，为空时沿用单链直接索引。 */
+            IntentGroup intent) {
+        public Review(String reviewer, boolean approved, String reason) {
+            this(reviewer, approved, reason, null);
+        }
+
         public Review {
             required(reviewer);
             required(reason);
+            if (!approved && intent != null) {
+                throw new IllegalArgumentException("拒绝审核不能批准意图归组");
+            }
+        }
+    }
+
+    public record IntentGroup(
+            /** 审核选择的稳定意图 ID。 */
+            String id,
+            /** 归组各链共同满足的业务目标。 */
+            String goal,
+            /** 审核确认的共同输入合同。 */
+            String inputContract,
+            /** 审核确认的共同输出合同。 */
+            String outputContract,
+            /** 审核确认的共同副作用合同，无副作用时也须明确声明。 */
+            String sideEffectContract) {
+        public IntentGroup {
+            required(id);
+            required(goal);
+            required(inputContract);
+            required(outputContract);
+            required(sideEffectContract);
         }
     }
 

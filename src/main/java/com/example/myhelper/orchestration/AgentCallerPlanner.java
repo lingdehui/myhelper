@@ -6,6 +6,7 @@ import com.example.myhelper.llm.ModelAdapter;
 import com.example.myhelper.tasklog.TaskLogPort;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -63,7 +64,13 @@ public final class AgentCallerPlanner implements AgentOrchestrator.Planner {
                 systemPrompt = systemPrompt + "\n" + LlmTexts.INSTRUCTION_PLANNING_PROMPT;
             }
             // 每次组织完整的结构化反馈快照，不把未配对的工具请求塞进下一次历史。
-            String input = json.writeValueAsString(Map.of(LlmTexts.PLANNING_TASK_FIELD, context, LlmTexts.AVAILABLE_TOOLS_FIELD, caller.toolDefinitions(context.toolNames())));
+            ObjectNode task = json.valueToTree(context);
+            // 世界证据是独立的顶层字段，去除 task 中同名的记录分量。
+            task.remove(LlmTexts.WORLD_CONTEXT_FIELD);
+            String input = json.writeValueAsString(Map.of(
+                    LlmTexts.PLANNING_TASK_FIELD, task,
+                    LlmTexts.AVAILABLE_TOOLS_FIELD, caller.toolDefinitions(context.toolNames()),
+                    LlmTexts.WORLD_CONTEXT_FIELD, context.worldContext()));
             // 使用 CALL_ONLY 获取工具请求；控制工具由外层解释，不由框架执行。
             var request = new AgentCaller.Request(context.modelRef(), List.of(
                     // 说明模型的规划职责；真正的线程调度和参数取值由代码执行。

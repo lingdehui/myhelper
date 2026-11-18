@@ -10,6 +10,7 @@ import com.example.myhelper.world.model.UnitType;
 import com.example.myhelper.world.model.WorldEntity;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +26,10 @@ import java.util.function.Function;
 public final class QdrantCapabilityRepository implements CapabilityLookup.Repository {
     /** 本适配器的候选数量保护上限；不是 Qdrant 服务的硬性限制。 */
     private static final int MAX_CANDIDATES_PER_QUERY = 1000;
+    /** 权威链展开的单页上限；总量仍受 MAX_CANDIDATES_PER_QUERY 约束。 */
+    private static final int CHAIN_PAGE_SIZE = 100;
+    /** 链到稳定语义入口的权威关联，不把意图修订当作链的修订。 */
+    private static final String INTENT_ID_FIELD = "intentId";
     /** 能力 data 中的发布状态字段，须与发布模块使用相同协议。 */
     private static final String PUBLICATION_STATUS_FIELD = "publicationStatus";
     /** 当前支持的可执行发布状态；不能随意改名，否则已有数据无法识别。 */
@@ -32,8 +37,8 @@ public final class QdrantCapabilityRepository implements CapabilityLookup.Reposi
     /** 能力 data 中保存 TaskPlan JSON 的字段名。 */
     private static final String EXECUTION_PLAN_FIELD = "executionPlan";
     /** 在向量候选限额生效前按类型与索引发布状态筛选。 */
-    private static final StorageQuery.Filter PUBLISHED_PLANS = new StorageQuery.Filter(List.of(
-            new StorageQuery.Match("/unitType", List.of(UnitType.PLAN_STEP.name())),
+    private static final StorageQuery.Filter PUBLISHED_ENTRIES = new StorageQuery.Filter(List.of(
+            new StorageQuery.Match("/unitType", List.of(UnitType.PLAN_STEP.name(), UnitType.INTENT.name())),
             new StorageQuery.Match("/data/" + PUBLICATION_STATUS_FIELD, List.of(PUBLISHED_STATUS))));
 
     /** 所有数据库读取都通过同一个存储入口。 */
@@ -74,20 +79,100 @@ public final class QdrantCapabilityRepository implements CapabilityLookup.Reposi
         // 本次召回以索引的固定引用为准，从指定的权威来源一次取得实体。
         Set<String> ids = new LinkedHashSet<>();
         for (StorageQuery.Hit hit : hits) {
+            if (hit.entity().unitType() == UnitType.INTENT
+                    && config.authoritativeSource() != DualWriteStore.Database.NEO4J) {
+                throw new IllegalStateException(LlmTexts.CAPABILITY_INTENT_AUTHORITY_REQUIRED);
+            }
             ids.add(hit.entity().id());
         }
         Map<String, WorldEntity> authoritative = store.readBatch(config.authoritativeSource(), List.copyOf(ids));
-        List<CapabilityLookup.Candidate> result = new ArrayList<>();
+        Map<CapabilityLookup.Ref, CapabilityLookup.Candidate> result = new LinkedHashMap<>();
+        Map<String, Double> intentScores = new LinkedHashMap<>();
         for (StorageQuery.Hit hit : hits) {
             WorldEntity indexed = hit.entity();
             WorldEntity current = authoritative.get(indexed.id());
-            // 保留召回顺序，但过期索引不能用新修订或已停用实体充当旧候选。
-            if (published(indexed) && matchesPublishedRevision(current, indexed.revision())) {
-                result.add(new CapabilityLookup.Candidate(ref(current), current.text() == null ? current.name() : current.text(), current.data()));
+            // 索引只负责召回；已停用、缺失、类型或版本不一致的入口不能继续展开。
+            if (!publishedEntry(indexed) || !matchesPublishedEntry(current, indexed)) {
+                continue;
+            }
+            switch (current.unitType()) {
+                case PLAN_STEP -> addCandidate(result, current, hit.score());
+                case INTENT -> {
+                    Double previous = intentScores.get(current.id());
+                    if (previous == null || hit.score() > previous) {
+                        intentScores.put(current.id(), hit.score());
+                    }
+                }
+                default -> { }
             }
         }
+        expandIntents(intentScores, result);
         // 每次调用都重新查库，不增加候选缓存。
-        return List.copyOf(result);
+        return List.copyOf(result.values());
+    }
+
+    /** 一次条件批量查询所有召回意图的链；没有逐意图 N 次查询或全库扫描。 */
+    private void expandIntents(Map<String, Double> intentScores,
+                               Map<CapabilityLookup.Ref, CapabilityLookup.Candidate> candidates) {
+        if (intentScores.isEmpty()) {
+            return;
+        }
+        List<Object> intentIds = new ArrayList<>(intentScores.keySet());
+        StorageQuery.Filter filter = new StorageQuery.Filter(List.of(
+                new StorageQuery.Match("/unitType", List.of(UnitType.PLAN_STEP.name())),
+                new StorageQuery.Match("/data/" + PUBLICATION_STATUS_FIELD, List.of(PUBLISHED_STATUS)),
+                new StorageQuery.Match("/data/" + INTENT_ID_FIELD, intentIds)));
+        StorageQuery.Cursor cursor = null;
+        // 按扫描行数而非去重后数量计数，重复页面也不能绕过读取上限。
+        int remaining = MAX_CANDIDATES_PER_QUERY - candidates.size();
+        do {
+            if (remaining <= 0) {
+                throw new IllegalStateException(LlmTexts.CAPABILITY_EXPANSION_LIMIT);
+            }
+            int pageLimit = Math.min(CHAIN_PAGE_SIZE, remaining);
+            StorageQuery.Page page = store.query(DualWriteStore.Database.NEO4J,
+                    new StorageQuery.PageRequest(filter, pageLimit, cursor));
+            if (page.entities().size() > pageLimit) {
+                throw new IllegalStateException(LlmTexts.CAPABILITY_EXPANSION_LIMIT);
+            }
+            for (WorldEntity chain : page.entities()) {
+                Double semanticScore = intentScores.get(chain.data().get(INTENT_ID_FIELD));
+                if (published(chain) && semanticScore != null) {
+                    addCandidate(candidates, chain, semanticScore);
+                }
+            }
+            remaining -= page.entities().size();
+            StorageQuery.Cursor next = page.nextCursor();
+            // 异常分页不能产生无限循环，也不能返回被截断的“最优链”。
+            if (next != null && (page.entities().isEmpty() || next.equals(cursor))) {
+                throw new IllegalStateException(LlmTexts.CAPABILITY_EXPANSION_LIMIT);
+            }
+            cursor = next;
+        } while (cursor != null);
+    }
+
+    /** 同一固定链可由新意图和旧索引同时召回，只保留一次及最高语义分。 */
+    private void addCandidate(Map<CapabilityLookup.Ref, CapabilityLookup.Candidate> candidates,
+                              WorldEntity entity, double semanticScore) {
+        CapabilityLookup.Ref identity = ref(entity);
+        CapabilityLookup.Candidate previous = candidates.get(identity);
+        if (previous == null || semanticScore > previous.semanticScore()) {
+            candidates.put(identity, new CapabilityLookup.Candidate(identity,
+                    entity.text() == null ? entity.name() : entity.text(), entity.data(), semanticScore));
+        }
+    }
+
+    /** 意图只承载稳定检索合同，链才必须具有可执行计划。 */
+    private static boolean publishedEntry(WorldEntity entity) {
+        if (entity == null || !PUBLISHED_STATUS.equals(entity.data().get(PUBLICATION_STATUS_FIELD))) {
+            return false;
+        }
+        return entity.unitType() == UnitType.INTENT || published(entity);
+    }
+
+    private static boolean matchesPublishedEntry(WorldEntity current, WorldEntity indexed) {
+        return current != null && current.unitType() == indexed.unitType()
+                && current.revision() == indexed.revision() && publishedEntry(current);
     }
 
     @Override
@@ -159,7 +244,7 @@ public final class QdrantCapabilityRepository implements CapabilityLookup.Reposi
                 vector.add(narrowed);
             }
             return new StorageQuery.VectorRequest(vector, embedding.model(), embedding.modelVersion(),
-                    PUBLISHED_PLANS, config.limit(), config.scoreThreshold());
+                    PUBLISHED_ENTRIES, config.limit(), config.scoreThreshold());
         }
     }
 
@@ -175,7 +260,7 @@ public final class QdrantCapabilityRepository implements CapabilityLookup.Reposi
                 throw new IllegalArgumentException(LlmTexts.INVALID_QUERY_VECTOR);
             }
             return new StorageQuery.VectorRequest(vector, config.embeddingModel(), config.embeddingVersion(),
-                    PUBLISHED_PLANS, config.limit(), config.scoreThreshold());
+                    PUBLISHED_ENTRIES, config.limit(), config.scoreThreshold());
         }
     }
 

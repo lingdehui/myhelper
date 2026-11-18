@@ -14,15 +14,19 @@ public final class ArchivedSkillProcessing implements RunArchivePort.Listener {
     private final ObjectProvider<RunArchivePort> archives;
     /** 后台参数保存。 */
     private final ArchivedToolParameterRecorder recorder;
+    /** 固定链版本及适用范围的实际验收统计。 */
+    private final ArchivedSkillChainReliability chains;
     /** 新候选等其它固化工作。 */
     private final ObjectProvider<CompletedRunConsolidation> consolidation;
     /** 专用后台线程，不占用用户任务调度器。 */
     private final Executor executor;
 
     public ArchivedSkillProcessing(ObjectProvider<RunArchivePort> archives, ArchivedToolParameterRecorder recorder,
+                                   ArchivedSkillChainReliability chains,
                                    ObjectProvider<CompletedRunConsolidation> consolidation, Executor executor) {
         this.archives = Objects.requireNonNull(archives);
         this.recorder = Objects.requireNonNull(recorder);
+        this.chains = Objects.requireNonNull(chains);
         this.consolidation = Objects.requireNonNull(consolidation);
         this.executor = Objects.requireNonNull(executor);
     }
@@ -54,6 +58,7 @@ public final class ArchivedSkillProcessing implements RunArchivePort.Listener {
             return;
         }
         recorder.record(run);
+        chains.record(run);
         CompletedRunConsolidation handler = consolidation.getIfAvailable();
         if (handler != null && handler.process(ref.rootRunId())) {
             archive.acknowledgeConsolidation(ref);

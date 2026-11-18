@@ -45,12 +45,17 @@ class AgentCallerPlannerTest {
             }
         }));
         AgentCallerPlanner planner = new AgentCallerPlanner(caller);
-        planner.decide(new AgentOrchestrator.PlanningContext("run-fixed", "准备睡眠环境", Map.of("room", "卧室"),
+        var observations = new ArrayList<>(List.of(Map.of("subjectId", "room:bedroom", "predicate", "temperature",
+                "value", 22, "evidence", Map.of("id", "observation:temperature", "revision", 3))));
+        var context = new AgentOrchestrator.PlanningContext("run-fixed", "准备睡眠环境", Map.of("room", "卧室"),
                 "test-model", List.of("read_temperature"), List.of(), List.of(), "run-fixed",
                 AgentOrchestrator.PlanningPhase.NORMAL, TaskRecordPort.RecoverySnapshot.empty(),
                 TaskInstructionPort.Snapshot.empty(), Map.of(
                         "read_temperature", List.of(new PlanningReference("indoor", 0.92, 12, false)),
-                        "restricted_tool", List.of(new PlanningReference("private", 1.0, 5, true)))));
+                        "restricted_tool", List.of(new PlanningReference("private", 1.0, 5, true))),
+                Map.of("snapshotId", "snapshot-fixed", "observations", observations));
+        observations.clear();
+        assertEquals(AgentOrchestrator.DecisionKind.COMPLETE, planner.decide(context).kind());
 
         ObjectMapper json = new ObjectMapper();
         Map<String, Object> actual = new LinkedHashMap<>();

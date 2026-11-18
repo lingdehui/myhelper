@@ -3,12 +3,16 @@ package com.example.myhelper.capability;
 import com.example.myhelper.llm.LlmTexts;
 
 import com.example.myhelper.orchestration.TaskPlan;
+import com.example.myhelper.skill.SkillChainReliability;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.Set;
 
 /** 独立的固化检索与有限内容缓存；每次 search 都调用仓储，不缓存未命中的搜索。 */
 public final class CapabilityLookup implements CapabilitySearchPort {
@@ -33,6 +37,8 @@ public final class CapabilityLookup implements CapabilitySearchPort {
     private final Repository repository;
     /** 语义候选是否满足目标合同由外部匹配策略决定，不默认按相似度放行。 */
     private final Matcher matcher;
+    /** 只读取本链固定版本及实际参数范围的可靠度，不借用工具分。 */
+    private final SkillChainReliability reliability;
     /** 热点内容条数上限；当前计划另持有自己的不可变绑定。 */
     private final int capacity;
     /** 内容 TTL，避免缓存无限存活。 */
@@ -42,10 +48,17 @@ public final class CapabilityLookup implements CapabilitySearchPort {
 
     // 装配查询源和业务匹配策略，缓存容量及存活期由调用方提供。
     public CapabilityLookup(Repository repository, Matcher matcher, int capacity, java.time.Duration ttl) {
+        this(repository, matcher, capacity, ttl, new UnknownReliability());
+    }
+
+    /** 链评分由技能模块提供；缺省构造将评分视为未知。 */
+    public CapabilityLookup(Repository repository, Matcher matcher, int capacity, java.time.Duration ttl,
+                            SkillChainReliability reliability) {
         // 保存数据库检索端口；每次 search 都访问此端口。
         this.repository = Objects.requireNonNull(repository);
         // 保存合同匹配策略，不默认把向量相近当作可执行。
         this.matcher = Objects.requireNonNull(matcher);
+        this.reliability = Objects.requireNonNull(reliability);
         // 内容缓存必须有正容量和正存活时间。
         if (capacity < 1 || ttl.isNegative() || ttl.isZero()) {
             // 参数或协议不符合约定，立即报错，不继续执行。
@@ -90,23 +103,108 @@ public final class CapabilityLookup implements CapabilitySearchPort {
     // 先获取新候选，再做业务合同匹配；缓存只用于加载内容。
     private Match search(Query query) {
         // 每次都查询仓储，避免缓存未命中遮蔽新发布能力。
-        List<Candidate> candidates = new ArrayList<>(List.copyOf(repository.search(query)));
-        // 按仓储候选顺序检查适用性，不直接按描述执行。
-        var remaining = candidates.iterator();
-        while (remaining.hasNext()) {
-            Candidate candidate = remaining.next();
-            // 只有匹配策略明确确认合同适用，才加载固定版本定义。
-            if (matcher.matches(query, candidate)) {
-                Optional<Definition> definition = load(candidate.ref());
-                if (definition.isPresent()) {
-                    return new Match(List.copyOf(candidates), definition);
-                }
-                // 候选在匹配和加载之间失效，跳过并从模型可见候选中移除。
-                remaining.remove();
+        List<Candidate> candidates = List.copyOf(repository.search(query));
+        return select(query, new Match(candidates, Optional.empty()), Set.of());
+    }
+
+    /** 选择时重新核对权威资格和参数范围；有限缓存只缓存定义，不缓存分数。 */
+    @Override
+    public Match select(Query query, Match match, Set<Ref> excluded) {
+        Objects.requireNonNull(query);
+        Objects.requireNonNull(match);
+        Objects.requireNonNull(excluded);
+        List<Candidate> candidates = uniqueCandidates(match.candidates());
+        if (query.step() != null && !query.step().bindings().isEmpty()) {
+            // 前驱输出仍未知，不能用参数字面部分给整条链打分或选定定义。
+            return new Match(candidates, Optional.empty());
+        }
+        List<RankedCandidate> applicable = new ArrayList<>();
+        List<Candidate> references = new ArrayList<>();
+        for (Candidate candidate : candidates) {
+            if (!repository.isAvailable(candidate.ref())) {
+                continue;
+            }
+            if (excluded.contains(candidate.ref()) || !matcher.matches(query, candidate)) {
+                references.add(candidate);
+                continue;
+            }
+            OptionalDouble score = validScore(reliability.score(candidate.ref().id(),
+                    candidate.ref().revision(), query.arguments()));
+            applicable.add(new RankedCandidate(candidate, score));
+        }
+        applicable.sort(new ReliabilityOrder());
+        List<Candidate> visible = new ArrayList<>();
+        for (RankedCandidate ranked : applicable) {
+            visible.add(ranked.candidate());
+        }
+        visible.addAll(references);
+        for (RankedCandidate ranked : applicable) {
+            Optional<Definition> definition = load(ranked.candidate().ref());
+            if (definition.isPresent()) {
+                return new Match(visible, definition);
+            }
+            // 匹配与读取间失效时接着检查下一条；不以新版本冒充原固定版本。
+            visible.remove(ranked.candidate());
+        }
+        return new Match(visible, Optional.empty());
+    }
+
+    private static List<Candidate> uniqueCandidates(List<Candidate> candidates) {
+        Map<Ref, Candidate> unique = new LinkedHashMap<>();
+        for (Candidate candidate : candidates) {
+            Candidate previous = unique.get(candidate.ref());
+            if (previous == null || candidate.semanticScore() > previous.semanticScore()) {
+                unique.put(candidate.ref(), candidate);
             }
         }
-        // 未明确匹配时保留候选供后续模型参考，不伪造可执行能力。
-        return new Match(List.copyOf(candidates), Optional.empty());
+        return List.copyOf(unique.values());
+    }
+
+    private static OptionalDouble validScore(OptionalDouble score) {
+        Objects.requireNonNull(score, "chainReliability");
+        if (score.isEmpty()) {
+            return score;
+        }
+        double value = score.getAsDouble();
+        return Double.isFinite(value) && value >= 0 && value <= 1 ? score : OptionalDouble.empty();
+    }
+
+    /** 缺少链级证据时只按语义与固定身份排序，不从工具统计推算链分。 */
+    private static final class UnknownReliability implements SkillChainReliability {
+        @Override
+        public OptionalDouble score(String skillId, long revision, Map<String, Object> arguments) {
+            return OptionalDouble.empty();
+        }
+    }
+
+    private record RankedCandidate(
+            /** 已通过当前参数合同检查的固定候选。 */
+            Candidate candidate,
+            /** 对本次实际参数的链级分数；空表示证据不足。 */
+            OptionalDouble reliability) { }
+
+    /** 有证据优先，再按链分、语义分和固定身份给出确定次序。 */
+    private static final class ReliabilityOrder implements Comparator<RankedCandidate> {
+        @Override
+        public int compare(RankedCandidate left, RankedCandidate right) {
+            int order = Boolean.compare(right.reliability().isPresent(), left.reliability().isPresent());
+            if (order == 0 && left.reliability().isPresent()) {
+                order = Double.compare(right.reliability().getAsDouble(), left.reliability().getAsDouble());
+            }
+            if (order == 0) {
+                order = Double.compare(right.candidate().semanticScore(), left.candidate().semanticScore());
+            }
+            if (order == 0) {
+                order = left.candidate().ref().namespace().compareTo(right.candidate().ref().namespace());
+            }
+            if (order == 0) {
+                order = left.candidate().ref().id().compareTo(right.candidate().ref().id());
+            }
+            if (order == 0) {
+                order = Long.compare(left.candidate().ref().revision(), right.candidate().ref().revision());
+            }
+            return order;
+        }
     }
 
     /** 执行前重新核对发布/停用状态，缓存不代表本次可执行。 */
@@ -233,11 +331,20 @@ public final class CapabilityLookup implements CapabilitySearchPort {
             /** 提供给匹配策略和模型的描述。 */
             String description,
             /** 参数、适用范围与审核依据。 */
-            Map<String, Object> contract) {
+            Map<String, Object> contract,
+            /** 向量相似度仅用于召回及链分相同后的排序。 */
+            double semanticScore) {
+        public Candidate(Ref ref, String description, Map<String, Object> contract) {
+            this(ref, description, contract, 0);
+        }
+
         // 候选只携带引用和合同，不代表已经通过执行门禁。
         public Candidate {
             // 候选或定义必须指向一个明确能力版本。
             Objects.requireNonNull(ref);
+            if (!Double.isFinite(semanticScore)) {
+                throw new IllegalArgumentException(LlmTexts.INVALID_CAPABILITY_SCORE);
+            }
             // 冻结候选合同中的嵌套数据，避免多个匹配任务相互改写。
             contract = TaskPlan.immutableMap(contract);
         }
@@ -261,7 +368,12 @@ public final class CapabilityLookup implements CapabilitySearchPort {
             /** 本次新检索的候选。 */
             List<Candidate> candidates,
             /** 已经通过匹配策略的固定定义，执行前仍需门禁。 */
-            Optional<Definition> selected) { }
+            Optional<Definition> selected) {
+        public Match {
+            candidates = List.copyOf(candidates);
+            Objects.requireNonNull(selected);
+        }
+    }
 
     public record PlanMatches(
             /** 本次整个计划的匹配。 */

@@ -3,6 +3,7 @@ package com.example.myhelper.orchestration;
 import com.example.myhelper.agent.AgentCaller;
 import com.example.myhelper.capability.CapabilityLookup;
 import com.example.myhelper.support.TestModelAdapter;
+import com.example.myhelper.tasklog.TaskLogPort;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -45,6 +46,7 @@ class AgentOrchestratorTest {
         try (Harness h = new Harness(repo, NEVER_MATCH, new AgentOrchestrator.Planner() {
             @Override
             public AgentOrchestrator.Decision decide(AgentOrchestrator.PlanningContext context) {
+                assertEquals(Map.of(), context.worldContext());
                 int round = calls.incrementAndGet();
                 return round <= 2 ? plan("模型计划" + round, step("s", "模型子任务" + round, TaskPlan.Kind.TOOL)) : complete("结束");
             }
@@ -60,6 +62,57 @@ class AgentOrchestratorTest {
             assertEquals(1, entryQueryCount(repo.queries));
             assertEquals(3, calls.get());
             assertTrue(h.traces.snapshot(handle.rootRunId()).closed());
+        }
+    }
+
+    @Test void worldContextIsReadForEachTaskAndPlanningRound() throws Exception {
+        List<AgentOrchestrator.PlanningContext> queries = new CopyOnWriteArrayList<>();
+        WorldContextPort world = new WorldContextPort() {
+            @Override
+            public Map<String, Object> snapshot(AgentOrchestrator.PlanningContext context) {
+                assertTrue(context.worldContext().isEmpty());
+                queries.add(context);
+                return Map.of("observedFor", context.arguments().getOrDefault("room", "root"),
+                        "round", context.history().size() + 1);
+            }
+        };
+        try (Harness h = new Harness(new Repo(), NEVER_MATCH, new AgentOrchestrator.Planner() {
+            @Override
+            public AgentOrchestrator.Decision decide(AgentOrchestrator.PlanningContext context) {
+                switch (context.goal()) {
+                    case "子任务 A":
+                        assertEquals(Map.of("observedFor", "A", "round", 1), context.worldContext());
+                        return complete("A");
+                    case "子任务 B":
+                        assertEquals(Map.of("observedFor", "B", "round", 1), context.worldContext());
+                        return complete("B");
+                    default:
+                        assertEquals(Map.of("observedFor", "root", "round", context.history().size() + 1),
+                                context.worldContext());
+                        if (context.history().isEmpty()) {
+                            return plan("分解",
+                                    new TaskPlan.Step("a", "子任务 A", TaskPlan.Kind.TASK,
+                                            null, Map.of("room", "A"), List.of(), Map.of()),
+                                    new TaskPlan.Step("b", "子任务 B", TaskPlan.Kind.TASK,
+                                            null, Map.of("room", "B"), List.of(), Map.of()));
+                        }
+                        return complete("完成");
+                }
+            }
+        }, new AgentOrchestrator.ActionExecutor() {
+            @Override
+            public AgentOrchestrator.Outcome execute(String tool, Map<String, Object> args, AgentOrchestrator.CallContext context) {
+                throw new AssertionError("本任务只需规划与子任务答复");
+            }
+        }, 2, world)) {
+            var handle = h.submit();
+            assertEquals(AgentOrchestrator.Status.SUCCESS, handle.settled().get(5, TimeUnit.SECONDS).status());
+            assertEquals(4, queries.size());
+            String parentRun = queries.getFirst().runId();
+            assertEquals(parentRun, queries.getLast().runId());
+            assertNotEquals(queries.get(1).runId(), queries.get(2).runId());
+            assertNotEquals(parentRun, queries.get(1).runId());
+            assertNotEquals(parentRun, queries.get(2).runId());
         }
     }
 
@@ -359,13 +412,18 @@ class AgentOrchestratorTest {
         private final AgentOrchestrator runtime;
         private Harness(Repo repo, CapabilityLookup.Matcher matcher, AgentOrchestrator.Planner planner,
                         AgentOrchestrator.ActionExecutor actions, int threads) {
+            this(repo, matcher, planner, actions, threads, WorldContextPort.disabled());
+        }
+
+        private Harness(Repo repo, CapabilityLookup.Matcher matcher, AgentOrchestrator.Planner planner,
+                        AgentOrchestrator.ActionExecutor actions, int threads, WorldContextPort world) {
             workers = Executors.newFixedThreadPool(threads);
             CapabilityLookup lookup = new CapabilityLookup(repo, matcher, 8, Duration.ofMinutes(1));
             runtime = new AgentOrchestrator(planner, lookup, com.example.myhelper.support.ReliableTools.bind(actions),
                     CHECKS, traces, workers, timer, new AgentOrchestrator.Limits(5, 5, 20, 20, 30, 30, Duration.ofSeconds(10)),
                     new TestModelAdapter(List.of("model")), com.example.myhelper.records.TaskRecordPort.disabled(),
                     new com.example.myhelper.capability.CheckedCapabilityUse(lookup, CHECKS),
-                    com.example.myhelper.support.ReliableTools.gate());
+                    com.example.myhelper.support.ReliableTools.gate(), TaskLogPort.disabled(), RunActivityPort.disabled(), world);
         }
         private AgentOrchestrator.Handle submit() { return runtime.submit(new AgentOrchestrator.Request("用户目标", Map.of(), "model", List.of("echo"))); }
         public void close() {

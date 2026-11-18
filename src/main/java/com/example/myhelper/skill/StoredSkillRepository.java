@@ -4,6 +4,7 @@ import com.example.myhelper.gate.SkillWriteGate;
 import com.example.myhelper.persistence.DualWriteStore;
 import com.example.myhelper.persistence.EntityJson;
 import com.example.myhelper.skill.SkillConsolidationService.Candidate;
+import com.example.myhelper.skill.SkillConsolidationService.IntentGroup;
 import com.example.myhelper.skill.SkillConsolidationService.Published;
 import com.example.myhelper.skill.SkillConsolidationService.Review;
 import com.example.myhelper.skill.SkillConsolidationService.Source;
@@ -37,6 +38,8 @@ public final class StoredSkillRepository implements SkillConsolidationService.Re
     private final DualWriteStore.Database index;
     /** 外部配置的实际嵌入生成器，生成失败不会宣布发布成功。 */
     private final Function<Candidate, Embedding> embed;
+    /** 共享的文本嵌入入口，用于首次建立意图索引。 */
+    private final Function<String, Embedding> embedIntent;
     /** 实体序列化同时固定待发布载荷，失败重试不重新生成内容。 */
     private final EntityJson json = new EntityJson();
     /** 候选合同不含额外时间类型，按已有 record 还原。 */
@@ -46,6 +49,12 @@ public final class StoredSkillRepository implements SkillConsolidationService.Re
 
     public StoredSkillRepository(DualWriteStore store, DualWriteStore.Database authority,
                                  DualWriteStore.Database index, Function<Candidate, Embedding> embed) {
+        this(store, authority, index, embed, null);
+    }
+
+    public StoredSkillRepository(DualWriteStore store, DualWriteStore.Database authority,
+                                 DualWriteStore.Database index, Function<Candidate, Embedding> embed,
+                                 Function<String, Embedding> embedIntent) {
         // 显式装配依赖，不从 WorldEntity 类型或 embedding 推导位置。
         this.store = Objects.requireNonNull(store);
         // 当前候选条件写需要 Neo4j，索引发布需要 Qdrant。
@@ -59,6 +68,7 @@ public final class StoredSkillRepository implements SkillConsolidationService.Re
         this.index = index;
         // 真实嵌入由应用提供，不能用空向量冒充索引就绪。
         this.embed = Objects.requireNonNull(embed);
+        this.embedIntent = embedIntent;
     }
 
     @Override
@@ -110,7 +120,7 @@ public final class StoredSkillRepository implements SkillConsolidationService.Re
             // 每次使用当前完整快照参与 CAS。
             WorldEntity old = requireCandidate(candidate);
             // 相同审核的重试保持幂等。
-            if (same(old.data().get("review"), review)) {
+            if (same(mapper.convertValue(old.data().get("review"), Review.class), review)) {
                 // 发布期间重复送达同一审核不改动版本。
                 return;
             }
@@ -143,6 +153,10 @@ public final class StoredSkillRepository implements SkillConsolidationService.Re
         WorldEntity state = stagePublication(candidate);
         // 整个实体及其引用都通过统一编解码还原。
         WorldEntity publication = json.entity((String) state.data().get("publicationJson"));
+        Review review = mapper.convertValue(state.data().get("review"), Review.class);
+        if (review.intent() != null) {
+            return publishGrouped(candidate, state, publication, review.intent());
+        }
         // 已完成发布之后统计可能增加；重复发布不得重新覆盖这些事实。
         if ("PUBLISHED".equals(state.data().get("publicationStatus"))) {
             // 核对当前发布定义仍在两边，不把后续统计更新当作需要重放的旧快照。
@@ -197,6 +211,62 @@ public final class StoredSkillRepository implements SkillConsolidationService.Re
                 throw new IllegalStateException("发布写入后未能读回完整双库实体");
             }
         }
+        return finishPublication(candidate, state, publication, writeAttempt);
+    }
+
+    private Published publishGrouped(Candidate candidate, WorldEntity state, WorldEntity publication,
+                                      IntentGroup group) {
+        boolean alreadyPublished = "PUBLISHED".equals(state.data().get("publicationStatus"));
+        WorldEntity intent = requireIntent(group, !alreadyPublished);
+        Optional<WorldEntity> indexed = store.read(index, intent.id());
+        if (indexed.isEmpty() && !alreadyPublished) {
+            // 权威实体固定同一份向量，索引故障后的恢复继续使用这份载荷。
+            store.write(index, intent);
+            indexed = store.read(index, intent.id());
+        }
+        if (indexed.isEmpty() || !same(intent, indexed.get())) {
+            throw new IllegalStateException("意图索引缺失或与权威合同不一致");
+        }
+        if (!alreadyPublished) {
+            // 分组链只写权威库。条件写保护已发表链的统计、停用与后续修订。
+            store.writeIfAbsent(authority, publication);
+        }
+        checkPublishedDefinition(publication, authority);
+        return finishPublication(candidate, state, publication, null);
+    }
+
+    private WorldEntity requireIntent(IntentGroup group, boolean allowCreate) {
+        WorldEntity intent = store.read(authority, group.id()).orElse(null);
+        if (intent == null && allowCreate) {
+            if (embedIntent == null) {
+                throw new IllegalStateException("技能意图嵌入入口尚未装配");
+            }
+            String text = String.join("\n", group.goal(), group.inputContract(), group.outputContract(),
+                    group.sideEffectContract());
+            Embedding embedding = Objects.requireNonNull(embedIntent.apply(text), "意图嵌入不能为空");
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("publicationStatus", "PUBLISHED");
+            data.put("intentContract", mapper.convertValue(group, Map.class));
+            Instant now = Instant.now();
+            WorldEntity pending = new WorldEntity(group.id(), null, null, UnitType.INTENT, null,
+                    group.goal(), text, data, List.of(), embedding, 1, null, List.of(), Map.of(), now, now);
+            store.writeIfAbsent(authority, pending);
+            intent = store.read(authority, group.id()).orElse(null);
+        }
+        checkIntentContract(group, intent);
+        return intent;
+    }
+
+    private void checkIntentContract(IntentGroup group, WorldEntity intent) {
+        if (intent == null || intent.unitType() != UnitType.INTENT || intent.embedding() == null
+                || !"PUBLISHED".equals(intent.data().get("publicationStatus"))
+                || !same(intent.data().get("intentContract"), group)) {
+            throw new IllegalStateException("意图归组合同缺失或不兼容");
+        }
+    }
+
+    private Published finishPublication(Candidate candidate, WorldEntity state, WorldEntity publication,
+                                        String writeAttempt) {
         // 发布完成标识使用条件更新，不覆盖其他审核状态。
         for (int attempt = 0; attempt < 32; attempt++) {
             // 状态提交失败后重试仍读取相同冻结载荷。
@@ -247,13 +317,24 @@ public final class StoredSkillRepository implements SkillConsolidationService.Re
                 return old;
             }
             // 精确嵌入失败在任何发布写入之前向上报告。
-            Embedding embedding = Objects.requireNonNull(embed.apply(candidate), "发布嵌入不能为空");
+            Embedding embedding = null;
+            if (review.intent() == null) {
+                embedding = Objects.requireNonNull(embed.apply(candidate), "发布嵌入不能为空");
+            } else {
+                WorldEntity existingIntent = store.read(authority, review.intent().id()).orElse(null);
+                if (existingIntent != null) {
+                    checkIntentContract(review.intent(), existingIntent);
+                }
+            }
             // 与现有能力读取仓储共享 executionPlan/publicationStatus 合同。
             Map<String, Object> publishedData = new LinkedHashMap<>();
             // 原计划与参数绑定完整保存。
             publishedData.put("executionPlan", mapper.convertValue(candidate.evidence().plan(), Map.class));
             // 发布状态由本业务仓储设置，存储层不解释。
             publishedData.put("publicationStatus", "PUBLISHED");
+            if (review.intent() != null) {
+                publishedData.put("intentId", review.intent().id());
+            }
             // 保留审核和来源证据，便于追溯。
             publishedData.put("candidateId", old.id());
             // 以原始字段保存验收依据，不伪造 EntityRef 类型。
@@ -305,6 +386,8 @@ public final class StoredSkillRepository implements SkillConsolidationService.Re
         if (actual.revision() != expected.revision() || actual.unitType() != UnitType.PLAN_STEP
                 || !"PUBLISHED".equals(actual.data().get("publicationStatus"))
                 || !Objects.equals(actual.data().get("candidateId"), expected.data().get("candidateId"))
+                || !Objects.equals(actual.data().get("intentId"), expected.data().get("intentId"))
+                || !same(actual.scope(), expected.scope())
                 || !same(actual.data().get("executionPlan"), expected.data().get("executionPlan"))) {
             // 停用、修订或内容变更不能靠旧发布请求重新启用。
             throw new IllegalStateException("已发布定义发生变化，拒绝旧发布重放");

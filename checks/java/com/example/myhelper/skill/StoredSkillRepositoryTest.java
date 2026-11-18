@@ -6,6 +6,8 @@ import com.example.myhelper.orchestration.TaskPlan;
 import com.example.myhelper.persistence.DualWriteStore;
 import com.example.myhelper.persistence.EntityJson;
 import com.example.myhelper.persistence.SnapshotParticipant;
+import com.example.myhelper.persistence.StorageQuery;
+import com.example.myhelper.world.model.UnitType;
 import com.example.myhelper.skill.SkillConsolidationService.*;
 import com.example.myhelper.world.model.Embedding;
 import com.example.myhelper.world.model.WorldEntity;
@@ -199,6 +201,101 @@ class StoredSkillRepositoryTest {
         assertEquals("SUSPENDED", f.graph.entities.get(published.unitId()).data().get("publicationStatus"));
     }
 
+    @Test void sharedIntentPublishesOneVectorAndExpandsBothAuthorityChains() {
+        Fixture f = new Fixture();
+        IntentGroup group = group("read-only");
+        Candidate a = f.repo.saveCandidateIfAbsent(groupCandidate("a"));
+        Candidate b = f.repo.saveCandidateIfAbsent(groupCandidate("b"));
+        f.repo.saveReview(a, groupedReview(group));
+        f.repo.saveReview(b, groupedReview(group));
+
+        Published first = f.repo.publishApproved(a);
+        WorldEntity originalIntent = f.index.entities.get(group.id());
+        Published second = f.repo.publishApproved(b);
+
+        assertNotEquals(first.unitId(), second.unitId());
+        assertEquals(0, f.embeds);
+        assertEquals(1, f.intentEmbeds);
+        assertEquals(Map.of(group.id(), originalIntent), f.index.entities);
+        assertEquals(UnitType.INTENT, originalIntent.unitType());
+        assertEquals(group.id(), f.graph.entities.get(first.unitId()).data().get("intentId"));
+        assertEquals(group.id(), f.graph.entities.get(second.unitId()).data().get("intentId"));
+        assertNull(f.graph.entities.get(first.unitId()).embedding());
+
+        var lookup = new QdrantCapabilityRepository(f.store,
+                new QdrantCapabilityRepository.Config("skills", NEO4J, "embed", "v1", 2, 10, 0),
+                new Function<String, List<Float>>() {
+                    @Override public List<Float> apply(String text) { return List.of(1f, 0f); }
+                });
+        var query = new CapabilityLookup.Query("run", 0, "$entry", "echo", Map.of());
+        assertEquals(java.util.Set.of(first.unitId(), second.unitId()), hitIds(lookup.search(query)));
+        assertEquals(first, f.repo.publishApproved(a));
+        assertEquals(second, f.repo.publishApproved(b));
+        assertEquals(1, f.intentEmbeds);
+
+        WorldEntity active = f.graph.entities.get(first.unitId());
+        Map<String, Object> inactive = new LinkedHashMap<>(active.data());
+        inactive.put("publicationStatus", "SUSPENDED");
+        WorldEntity stopped = new WorldEntity(active.id(), null, null, UnitType.PLAN_STEP, null,
+                active.name(), active.text(), inactive, active.bindings(), active.embedding(), active.revision(),
+                active.source(), active.evidence(), active.scope(), active.createdAt(), active.updatedAt(),
+                active.chainPositions(), active.statistics());
+        assertTrue(f.store.compareAndSet(NEO4J, active, stopped));
+        assertEquals(java.util.Set.of(second.unitId()), hitIds(lookup.search(query)));
+        assertEquals(originalIntent, f.index.entities.get(group.id()));
+    }
+
+    @Test void compatibleReviewIsRequiredAndIndexRetryKeepsFrozenIntentVector() {
+        Fixture f = new Fixture();
+        var group = group("read-only");
+        Candidate a = f.repo.saveCandidateIfAbsent(groupCandidate("a"));
+        Candidate b = f.repo.saveCandidateIfAbsent(groupCandidate("b"));
+        f.repo.saveReview(a, groupedReview(group));
+        f.index.failNextSave = true;
+        assertThrows(DualWriteStore.WriteFailure.class, new Executable() {
+            @Override public void execute() { f.repo.publishApproved(a); }
+        });
+        assertEquals(1, f.intentEmbeds);
+        assertTrue(f.index.entities.isEmpty());
+        WorldEntity authoritativeIntent = f.graph.entities.get(group.id());
+        assertNotNull(authoritativeIntent);
+        assertNotNull(f.repo.publishApproved(a));
+        assertEquals(1, f.intentEmbeds);
+        assertEquals(authoritativeIntent, f.index.entities.get(group.id()));
+
+        f.repo.saveReview(b, groupedReview(group("writes externally")));
+        assertThrows(IllegalStateException.class, new Executable() {
+            @Override public void execute() { f.repo.publishApproved(b); }
+        });
+        f.repo.saveReview(b, groupedReview(group));
+        assertNotNull(f.repo.publishApproved(b));
+        assertEquals(authoritativeIntent, f.index.entities.get(group.id()));
+        assertEquals(1, f.intentEmbeds);
+    }
+
+    private static java.util.Set<String> hitIds(List<CapabilityLookup.Candidate> hits) {
+        var ids = new java.util.LinkedHashSet<String>();
+        for (CapabilityLookup.Candidate hit : hits) {
+            ids.add(hit.ref().id());
+        }
+        return ids;
+    }
+
+    private static IntentGroup group(String effects) {
+        return new IntentGroup("intent:echo", "echo message", "input: message", "output: message", effects);
+    }
+
+    private static Review groupedReview(IntentGroup group) {
+        return new Review("independent-reviewer", true, "compatible contract and accepted trace", group);
+    }
+
+    private static Candidate groupCandidate(String run) {
+        Candidate original = candidate("alternative " + run);
+        var evidence = new Evidence(new Source(run, 12, "slice"), "acceptance:" + run,
+                original.evidence().verifiedScope(), original.evidence().plan());
+        return new Candidate(evidence, original.description());
+    }
+
     private static Review approved() { return new Review("independent-reviewer", true, "accepted trace"); }
 
     private static Candidate candidate(String name) {
@@ -214,12 +311,19 @@ class StoredSkillRepositoryTest {
         final Memory index = new Memory();
         final DualWriteStore store = new DualWriteStore(graph, index);
         int embeds;
+        int intentEmbeds;
         boolean failEmbedding;
         final StoredSkillRepository repo = new StoredSkillRepository(store, NEO4J, QDRANT,
                 new Function<Candidate, Embedding>() {
                     @Override public Embedding apply(Candidate candidate) {
                         embeds++;
                         if (failEmbedding) { throw new IllegalStateException("embedding offline"); }
+                        return new Embedding("embed", "v1", List.of(1.0, 0.0));
+                    }
+                }, new Function<String, Embedding>() {
+                    @Override public Embedding apply(String intentText) {
+                        intentEmbeds++;
+                        assertTrue(intentText.startsWith("echo message"));
                         return new Embedding("embed", "v1", List.of(1.0, 0.0));
                     }
                 });
@@ -241,6 +345,24 @@ class StoredSkillRepositoryTest {
                 hits.add(new com.example.myhelper.persistence.StorageQuery.Hit(entity, 1));
             }
             return hits;
+        }
+        @Override public StorageQuery.Page query(StorageQuery.PageRequest request) {
+            var found = new java.util.ArrayList<WorldEntity>();
+            for (WorldEntity entity : entities.values()) {
+                var row = json.parse(json.encode(entity));
+                boolean accepted = true;
+                for (StorageQuery.Match condition : request.filter().matches()) {
+                    boolean matched = false;
+                    for (Object value : condition.values()) {
+                        matched |= row.at(condition.pointer()).equals(json.parse(json.encode(value)));
+                    }
+                    accepted &= matched;
+                }
+                if (accepted) {
+                    found.add(entity);
+                }
+            }
+            return new StorageQuery.Page(found, null);
         }
         @Override public boolean writeConditionally(WorldEntity expected, WorldEntity replacement) {
             if (!Objects.equals(entities.get(replacement.id()), expected)) { return false; }

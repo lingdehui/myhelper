@@ -11,10 +11,16 @@ import com.example.myhelper.orchestration.ExecutionTraceStore;
 import com.example.myhelper.orchestration.SpringToolExecutor;
 import com.example.myhelper.orchestration.TaskPlan;
 import com.example.myhelper.orchestration.ToolReliabilityGate;
+import com.example.myhelper.orchestration.WorldContextPort;
 import com.example.myhelper.capability.CapabilityUsePort;
 import com.example.myhelper.records.TaskRecordPort;
 import com.example.myhelper.tasklog.TaskLogPort;
+import com.example.myhelper.tools.DeviceStateTool;
+import com.example.myhelper.tools.HomeAssistantStateReader;
 import com.example.myhelper.tools.ToolDirectory;
+import com.example.myhelper.world.WorldDeviceStatus;
+import com.example.myhelper.world.model.EntityRef;
+import com.example.myhelper.world.model.UnitType;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.BufferedReader;
@@ -22,6 +28,7 @@ import java.io.PrintWriter;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -122,7 +129,7 @@ class TaskEntryTest {
                     config.taskActivity(), environment,
                     beans.getBeanProvider(CapabilitySearchPort.class), beans.getBeanProvider(CapabilityUsePort.class),
                     beans.getBeanProvider(TaskRecordPort.class), beans.getBeanProvider(ToolReliabilityGate.class),
-                    beans.getBeanProvider(TaskLogPort.class));
+                    beans.getBeanProvider(TaskLogPort.class), beans.getBeanProvider(WorldContextPort.class));
             try (var entry = new TaskEntry(orchestrator, "local-check", tools.names(), traces)) {
                 var handle = entry.submit("执行回声工具");
                 var outcome = handle.settled().get(5, TimeUnit.SECONDS);
@@ -143,6 +150,42 @@ class TaskEntryTest {
         } finally {
             timer.shutdownNow();
             workers.destroy();
+        }
+    }
+
+    @Test
+    void deviceToolRequiresTheDeviceGateAtApplicationAssembly() {
+        var ref = new ToolDirectory.ToolRef("device-power", "local-check", "1");
+        var sensor = new WorldDeviceStatus.Sensor(new EntityRef("sensor:power", 1L, null, null, UnitType.TOOL, null),
+                "local-check");
+        var tool = new DeviceStateTool(ref, sensor, List.of(new DeviceStateTool.Mapping("ac", "climate.ac")),
+                new NoDeviceReads());
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("binding", tool.binding());
+        beans.registerSingleton("directory", new ToolDirectory(List.of(
+                new ToolDirectory.Registration(ref, "local-check", false, false, true))));
+        beans.registerSingleton("gate", new EchoGate());
+        beans.registerSingleton("resources", new EchoResources());
+        var models = new ConfiguredModelAdapter(List.of(
+                new ConfiguredModelAdapter.ModelConfig("local-check", new ReplyModel(false), true, true)));
+        var failure = assertThrows(IllegalStateException.class, new AssembleRuntime(beans, models));
+        assertEquals("启用设备状态工具需要为其配置设备读取门禁", failure.getMessage());
+    }
+
+    private record AssembleRuntime(DefaultListableBeanFactory beans, ConfiguredModelAdapter models) implements Executable {
+        @Override
+        public void execute() {
+            new TaskRuntimeConfiguration().taskRuntimeTools(new AgentCaller(models, List.of()), models,
+                    beans.getBeanProvider(ToolDirectory.Binding.class), beans.getBeanProvider(ToolDirectory.class),
+                    beans.getBeanProvider(RuntimeGate.class), beans.getBeanProvider(SpringToolExecutor.ResourceResolver.class),
+                    beans.getBeanProvider(TaskLogPort.class));
+        }
+    }
+
+    private static final class NoDeviceReads implements DeviceStateTool.Reader {
+        @Override
+        public HomeAssistantStateReader.Reading read(String entityId, Instant deadline) {
+            throw new AssertionError("装配不得读取设备");
         }
     }
 

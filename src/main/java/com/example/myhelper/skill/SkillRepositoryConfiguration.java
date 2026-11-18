@@ -25,7 +25,7 @@ public class SkillRepositoryConfiguration {
         DualWriteStore.Database index = environment.getProperty("myhelper.skill.index",
                 DualWriteStore.Database.class, DualWriteStore.Database.QDRANT);
         // 共享真正的文本向量生成器，发布失败沿用仓储的重试状态。
-        return new StoredSkillRepository(store, authority, index, new CandidateEmbedding(embedding));
+        return new StoredSkillRepository(store, authority, index, new CandidateEmbedding(embedding), embedding);
     }
 
     private record CandidateEmbedding(

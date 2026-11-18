@@ -1,5 +1,6 @@
 package com.example.myhelper.orchestration;
 
+import com.example.myhelper.gate.RuntimeGate.ToolCall;
 import com.example.myhelper.llm.LlmTexts;
 import com.example.myhelper.tools.ToolDirectory;
 import com.example.myhelper.tools.ToolDirectory.ToolRef;
@@ -94,7 +95,7 @@ public final class SpringToolExecutor implements AgentOrchestrator.ActionExecuto
         if (dispatch == null || !ref.equals(dispatch.ref())) {
             return new AgentOrchestrator.Outcome(AgentOrchestrator.Status.FAILED, null, LlmTexts.TOOL_BINDING_CHANGED);
         }
-        return execute(ref.toolName(), dispatch, args, context);
+        return execute(ref.toolName(), dispatch, args, context, null);
     }
 
     @Override
@@ -107,11 +108,25 @@ public final class SpringToolExecutor implements AgentOrchestrator.ActionExecuto
             // 返回未开始动作的失败，不误报外部副作用未知。
             return new AgentOrchestrator.Outcome(AgentOrchestrator.Status.FAILED, null, LlmTexts.TOOL_NOT_REGISTERED_PREFIX + tool);
         }
-        return execute(tool, dispatch, args, context);
+        return execute(tool, dispatch, args, context, null);
+    }
+
+    /** 编排路径强制核对获准派发的身份，包括未绑定版本的旧工具。 */
+    AgentOrchestrator.Outcome executeChecked(ToolCall call, AgentOrchestrator.CallContext context,
+                                             AgentOrchestrator.ToolDispatchGate gate) {
+        Dispatch dispatch = tools.get(call.toolName());
+        if (dispatch == null) {
+            return new AgentOrchestrator.Outcome(AgentOrchestrator.Status.FAILED, null,
+                    LlmTexts.TOOL_NOT_REGISTERED_PREFIX + call.toolName());
+        }
+        if (!Objects.equals(call.toolRef(), dispatch.ref())) {
+            return new AgentOrchestrator.Outcome(AgentOrchestrator.Status.FAILED, null, LlmTexts.TOOL_BINDING_CHANGED);
+        }
+        return execute(call.toolName(), dispatch, call.args(), context, gate);
     }
 
     private AgentOrchestrator.Outcome execute(String tool, Dispatch dispatch, Map<String, Object> args,
-                                              AgentOrchestrator.CallContext context) {
+                                              AgentOrchestrator.CallContext context, AgentOrchestrator.ToolDispatchGate gate) {
         // 记录本次已拿到的锁，异常时也能完整释放。
         List<ReentrantLock> acquired = new ArrayList<>();
         // 记录是否已经进入实际回调，用来区分明确失败和副作用未知。
@@ -145,6 +160,10 @@ public final class SpringToolExecutor implements AgentOrchestrator.ActionExecuto
                         "toolName", ref.toolName(), "sourceInstance", ref.sourceInstance(),
                         "implementationVersion", ref.implementationVersion()));
                 context.check();
+            }
+            // 等锁结束后才消费本次许可；未获许可时不会进入实际工具。
+            if (gate != null && !gate.start(context)) {
+                return new AgentOrchestrator.Outcome(AgentOrchestrator.Status.FAILED, null, LlmTexts.TOOL_NOT_ALLOWED);
             }
             // 接下来进入外部动作；此后异常不能断言什么都没发生。
             started = true;
