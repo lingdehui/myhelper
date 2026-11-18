@@ -61,7 +61,7 @@ final class SkillChainExecutionStore {
     /** 即使模型不可用，实际验收事实仍已保存。 */
     Optional<String> record(Fact fact) {
         String id = factId(fact);
-        var data = Map.of("kind", KIND, "skillId", fact.chain().id(), "skillRevision", fact.chain().revision(),
+        Map<String, Object> data = Map.of("kind", KIND, "skillId", fact.chain().id(), "skillRevision", fact.chain().revision(),
                 "fact", factData(fact));
         WorldEntity observation = observation(id, 1, source(fact), data);
         if (storage.writeIfAbsent(DualWriteStore.Database.NEO4J, observation)) {
