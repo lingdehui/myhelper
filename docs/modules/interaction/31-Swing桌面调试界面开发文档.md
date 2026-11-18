@@ -1,24 +1,24 @@
 # Swing 桌面调试界面开发文档
 
-2026-11-17 · Swing 首版已实现。玩偶、任务气泡、悬停和对话框的交互见 [29 桌面助手调试界面设计](../../planned/29-桌面助手调试界面设计.md)。下文保留实施方案，当前交付范围见[第 6 节](#6-首版实现与验证)。
+更新于 2026-11-18。Swing 首版、雷姆基础动作和空闲行为均已实现。本页记录当前使用方式、接口与验证范围。最初的交互方案仍见[29 桌面设计](../../planned/29-桌面助手调试界面设计.md)。
 
 ## 1. 放在哪，怎么启动
 
-桌面适配放在 `interaction.desktop`，使用 JDK 25 自带 Swing/AWT。借用现有 `MyHelperApplication` 创建一个非 Web Spring 容器。建议通过 `--myhelper.ui=desktop` 选择桌面模式，默认依旧使用现有终端入口。同一个应用实例中的 `TaskEntry`、编排器、模型客户端、工作池、记录和恢复服务由两种入口共用。启动时只选择其中一个输入入口。 [现有启动类](../../../src/main/java/com/example/myhelper/MyHelperApplication.java)
+桌面适配放在 `interaction.desktop`，使用 JDK 25 自带 Swing/AWT。`MyHelperApplication` 创建非 Web Spring 容器。通过 `--myhelper.ui=desktop` 打开桌面模式，缺省启动终端。本次进程只启用一个输入界面，两种模式使用同一套 `TaskEntry`、编排器、模型客户端、工作池与持久恢复装配。默认恢复需要 Neo4j。仅调试交互时可显式加 `--myhelper.records.enabled=false`。 [启动类](../../../src/main/java/com/example/myhelper/MyHelperApplication.java) · [装配文档](../deployment/21-装配部署与集成验收.md)
 
 - 桌面模式在 Spring 启动前配置 `SpringApplication.setHeadless(false)`，在 Spring 装配阶段装好轻量日志监听器及缓存，使启动恢复任务的首批事件可以先放进缓存。窗口创建安排到 Swing 事件线程（EDT）。
 - 角色、任务泡和悬停预览需要逐像素透明与窗口裁形支持。按鼠标所在屏幕和窗口实际工作区计算停靠位置，并对工作区边缘做夹取。悬停预览保持非输入焦点，用户打开对话时再让对话框接收键盘输入。
 - 当前 `main` 用 `try` 管理 Spring 容器寿命。桌面窗口创建后，启动线程在 EDT 之外等待显式退出信号。关闭对话或详情仅隐藏该窗口。退出桌面助手时先让 UI 停止提交和订阅，再由启动线程关闭容器，复用现有停机与任务收尾。 [应用入口清理](../../../src/main/java/com/example/myhelper/interaction/TaskEntry.java)
 
-## 2. 现有接口和首版需要接上的接口
+## 2. 桌面使用的接口
 
-| 需求 | 复用的入口 | 桌面端要补的部分 |
+| 需求 | 复用的入口 | 当前桌面接法 |
 | --- | --- | --- |
 | 发送对话文字 | `TaskEntry.submit(String)` 返回 `Handle`，包括 `taskId`、`rootRunId`、`result()`、`settled()` 和取消操作 | 后台提交，保留输入直到获得句柄，按返回身份关联气泡。`result` 用于回复，`settled` 用于真实收尾。 |
-| 收实时过程 | `TaskLogPort.Listener.onEvent(Event)`，由日志线程触发，应用默认输出同时保留 | 注册仅在桌面模式装配的监听 Bean。回调只写入有界的桌面事件缓存并安排刷新。桌面消费端补序号、按运行订阅和最近事件回放。 |
-| 读取运行中的任务树 | `ExecutionTraceStore.snapshot(rootRunId)` 返回只读节点、边和图内事件 | 加只读视图映射。读取 `TASK` 及所属步骤，由 `parentId` 或 `SPAWNED` 构建任务层次。`DEPENDS_ON` 只用于显示等待关系。只取显示所需字段。 |
-| 启动时知道正在跑哪些任务 | `TaskEntry` 已纳管启动恢复的句柄 | 加一个对本进程活动任务的只读摘要查询，返回任务及当前运行身份、允许显示的标题和阶段。复用现有活动句柄信息，界面不用持有内部领取凭据。 |
-| 查某一次运行的历史 | `StoredTaskRecords.readEvents(taskId, rootRunId, afterEventId, limit)` 读取已确认事实。`TaskLogHistory.read(ArchiveRef)` 读取结束归档的日志摘要，`RunArchivePort.readArchive` 可读取其中的固定图 | 交互层统一调用只读查询与安全摘要投影。已知两种 ID 时可直接打开详情。按 `taskId` 列运行的查询在记录侧补齐，以支持启动后打开最近历史。 |
+| 收实时过程 | `TaskLogPort.Listener.onEvent(Event)` | 桌面模式装配有界 `TaskLogBuffer`。日志线程写缓存，观察线程按序号回放各运行事件，应用日志同时保留。 |
+| 读取运行中的任务树 | `ExecutionTraceStore.findSnapshot(rootRunId)` | `DesktopTaskGraph` 从只读图投影节点层次和依赖关系。 |
+| 启动时知道正在跑哪些任务 | `TaskEntry.activeHandles()` 含启动恢复接管的句柄 | 观察线程合并活动句柄和实时回放，按任务、运行身份关联气泡。 |
+| 查某一次运行的历史 | `RunArchivePort.readArchive(ArchiveRef)` 提供已结束归档和固定图 | 点击本会话已收尾的任务，按已知身份后台读取归档。手工按 ID 查询目前由终端提供。 |
 
 桌面端沿用已有日志投影及归档完整性标记。查看可直接调用的接口及当前边界，可对照源码和模块合同。 [任务提交](../../../src/main/java/com/example/myhelper/interaction/TaskEntry.java) · [任务日志](../tasklog/任务日志开发文档.md) · [执行图](../../../src/main/java/com/example/myhelper/orchestration/ExecutionTraceStore.java) · [持久事件读取和最终归档](../records/28-执行记录与恢复端口开发文档.md#134-运行期间读取与最终归档)
 
@@ -54,14 +54,15 @@ sequenceDiagram
 
 ## 4. 打开界面、重连和切换历史
 
-1. 打开界面前，后台监听器已经接收日志。界面附着时先建立接收队列，再后台读活动任务摘要及选中运行的快照。合并读到的状态与这段时间收到的事件，发布到 EDT。先启动恢复后才打开窗口的任务用同样流程加入气泡。
-2. 桌面缓存按接收顺序编号。界面暂停订阅时记下最后读到的编号，重新订阅优先读缓存中后续事件。实时事实与持久事实按同一执行 `eventId` 去重，实际模型事件另用调用身份与类型区分。
-3. 桌面缓存过期或 `AsyncTaskLog.droppedCount()` 增加时，展示「部分实时事件缺失」，后台刷新活动摘要和图。平时合并同一运行的刷新请求，对正在查看的运行定期补读，以覆盖末条通知丢失的情况。持久记录可用时，从该运行最后一条已应用的事件 ID 起分页读取。使用 `EventPage.nextCursor` 翻页，即使读到当前末尾也保留最后一条事实 ID。桌面编号仅供自身缓存使用，事实的提交顺序由持久游标给出。上游丢弃的实时专属阶段保持缺口。 [异步投递](../../../src/main/java/com/example/myhelper/tasklog/AsyncTaskLog.java) · [分页实现](../../../src/main/java/com/example/myhelper/records/StoredTaskRecords.java)
-4. 运行真实结束后，`TaskEntry` 可能已回收内存图。界面先保留最后的只读摘要，详细数据转读固定归档或持久事件。归档不存在或证据不完整时展示相应提示。切换气泡或历史运行后，仅应用与当前详情身份匹配的后台查询结果。用户在前一次运行的详情上可以继续看历史，同一个任务的新运行单独显示实时状态。
+1. 桌面模式在 Spring 装配时建立日志缓存。打开窗口后，观察线程回放已收到的事件并合并活动句柄、当前运行的只读图，再把视图交给 EDT。
+2. 缓存按接收顺序分配序号。缓存发生缺口或上游丢弃计数增加时，界面提示实时事件缺失，并通过当前活动句柄与任务树更新可用状态。
+3. 运行真实结束后先保留最后一份只读摘要。用户查看本会话中已经结束的任务时，有归档端口就按该任务的已知运行身份读取固定归档。归档缺失或读取失败时显示提示。 [桌面会话](../../../src/main/java/com/example/myhelper/interaction/desktop/DesktopSession.java)
 
-首版可以手工输入已知的 `taskId` 和 `rootRunId` 打开历史，和现有终端查询能力一致。后续增加按任务列运行的分页入口，供重启后直接选择以前的任务。实时展示可以在记录关闭时调试，历史能力在记录与启动恢复装配成功后验收。
+跨重启列出旧任务、手工输入 ID 打开旧历史，以及运行中的持久事件分页补读，属于后续桌面工作。存储模块已有分页入口，终端也已有指定任务和运行的归档查询。 [持久事件分页](../../../src/main/java/com/example/myhelper/records/StoredTaskRecords.java) · [终端历史查询](20-交互与语音开发文档.md#已实现的文字入口)
 
 ## 5. 实施顺序与验收
+
+下表保留最初的验收计划。已验证项及其环境见第 6、7 节。持久历史串接仍按第 4 节推进。
 
 | 顺序 | 交付 | 可观察的验收结果 |
 | --- | --- | --- |
@@ -78,9 +79,9 @@ sequenceDiagram
 - 角色使用透明 PNG，资源紧贴图像边界。AWT `Window.setShape` 按缩放后的可见像素生成角色命中区域。任务泡和悬停预览分别使用独立椭圆窗口。点击角色轮廓外、气泡外角和间隙时，桌面接收鼠标事件。详情和对话采用浅紫圆角面板。 [角色轮廓](../../../src/main/java/com/example/myhelper/interaction/desktop/DesktopMascot.java) · [气泡](../../../src/main/java/com/example/myhelper/interaction/desktop/DesktopBubble.java)
 - 任务提交、图读取和归档查询在 EDT 外运行。按 `taskId` 合并气泡，以 `rootRunId` 维护本次与近期运行的时间线。结果来自 `result()`，收尾以 `settled()` 为准。启动时合并已受理句柄与实时回放。桌面保留 24 个已收尾任务，短任务的最终图在释放前投影到最多 32 个运行的缓存。 [桌面会话](../../../src/main/java/com/example/myhelper/interaction/desktop/DesktopSession.java) · [任务入口](../../../src/main/java/com/example/myhelper/interaction/TaskEntry.java)
 - 日志缓冲从 Spring 装配时接收事件并分配递增序号，默认保留最近 512 条。读到缺口时显示提示并读取当前活动句柄和任务树。模型过程展示实际请求与结构化公开结果的摘要，工具返回和验收分别显示。点击当前会话已收尾任务可按已知身份读取固定归档。 [实时日志缓冲](../../../src/main/java/com/example/myhelper/tasklog/TaskLogBuffer.java)
-- Windows 本机验证了空闲时的手捧对话泡、任务泡的椭圆区域、悬停放大、详情筛选、Esc 收起和拖动。用回环 OpenAI 兼容替身通过正式入口提交两个并发任务，核对两枚头顶任务泡、两条等待状态、回复归属、收尾后图可见和正常退出。最终源码的桌面与日志专项 13 项 JUnit 通过。同一产物复跑全量，229 项 JUnit 和 4 组存储检查通过。首跑有一项启动恢复等待超时。 [检查记录](../../../checks/README.md)
-- 雷姆版本在 Windows 上复验角色透明角、小泡与展开预览的椭圆外角及气泡间隙，鼠标事件落到后面的测试窗口。点击实际包身可以打开对话。最终源码重新编译后通过 229 项 JUnit 和 4 组存储检查，使用回环模型复验两个并发任务的回复、任务树与正常退出。 [检查记录](../../../checks/README.md)
-- 后续工作包括跨重启浏览旧任务、按 ID 手工查询历史、运行中的持久事件分页补读、关联回答 `NEEDS_INPUT`、多屏和高 DPI 验收。真实模型和 Neo4j 联调单独验收。
+- 2026-11-17 早期窗口版本在 Windows 本机验证了手捧对话泡、悬停、详情筛选、Esc 收起和拖动。回环模型验证两个并发任务的回复归属、收尾后图可见与退出。该快照的桌面与日志专项 13 项 JUnit 通过，复跑全量 229 项 JUnit 和 4 组存储检查通过。首跑有一项启动恢复等待超时，该检查的等待时序在后续恢复整改中修正。 [检查记录](../../../checks/README.md) · [恢复整改](../records/28-执行记录与恢复端口开发文档.md#15-2026-11-17-恢复策略边界与可读性整改)
+- 2026-11-17 雷姆手提包版本在 Windows 上复验角色透明角、小泡与预览外角及气泡间隙，鼠标事件落到后面的测试窗口。点击包身可打开对话。该快照通过 229 项 JUnit 和 4 组存储检查，并用回环模型复验两个并发任务的回复、任务树与退出。 [检查记录](../../../checks/README.md)
+- 除第 4 节记录的历史查询接线外，关联回答 `NEEDS_INPUT`、多屏和高 DPI 验收仍待完成。真实模型和 Neo4j 联调单独验收。
 - 雷姆的空闲行为和本地道具由独立行为模块驱动。提交、运行和实际收尾期间显示固定状态。 [32 短期行为规划器](32-短期行为规划器设计.md#6-首版实现)
 
 ## 7. 雷姆基础动作

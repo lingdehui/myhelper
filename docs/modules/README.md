@@ -1,6 +1,6 @@
 # 模块、源码与任务窗口
 
-更新于 2026-11-17。目录名优先对应当前代码包。第 13、14 篇主要对应 `orchestration` 包。逐包的实际逻辑、检查与已知问题见[全量实现与代码复核](../completed/全量实现与代码复核.md)。
+更新于 2026-11-18。目录名优先对应当前代码包。第 13、14 篇主要对应 `orchestration` 包。分模块状态以本文及各模块正文为准，历次检查见[交付索引](../completed/README.md)。
 
 | 模块 | 维护窗口 | 当前源码或接入点 | 文档 |
 | --- | --- | --- | --- |
@@ -16,12 +16,12 @@
 | `persistence` 数据库读写 | 数据库双写；统一承担全部数据库查询和保存 | [DualWriteStore](../../src/main/java/com/example/myhelper/persistence/DualWriteStore.java) · [StorageQuery](../../src/main/java/com/example/myhelper/persistence/StorageQuery.java) | [10 双库读写、查询与补偿](persistence/10-统一双写模块分析.md) |
 | `capability` 固化检索 | 循环窗口负责检索、意图多链展开和选择接线；发布及链分实现归技能窗口 | [capability 包](../../src/main/java/com/example/myhelper/capability/) | [19 固化检索与缓存](capability/19-固化检索与缓存开发文档.md#2026-11-17-一意图多链的展开与可靠度选择) |
 | `gate` 门禁与验收 | 已接运行策略、设备电源只读门禁和固化写入校验，正式任务授权及证据接线待联调 | [RuntimeGate](../../src/main/java/com/example/myhelper/gate/RuntimeGate.java) · [DeviceReadGate](../../src/main/java/com/example/myhelper/gate/DeviceReadGate.java) · [SkillWriteGate](../../src/main/java/com/example/myhelper/gate/SkillWriteGate.java) | [15 门禁与验收](gate/15-门禁与验收开发文档.md) |
-| `skill` 技能固化 | 固化技能窗口，数据库窗口补仓储与接线检查 | [skill 包](../../src/main/java/com/example/myhelper/skill/) 已有生产候选/审核/双库发布、参数仓储、模型范围查询及装配；实际执行自动记账和归档消费待完成 | [16 技能固化](skill/16-技能固化开发文档.md) |
+| `skill` 技能固化 | 固化技能逻辑 | [skill 包](../../src/main/java/com/example/myhelper/skill/) 已有候选审核、单链及意图归组发布、归档参数事实和链级评分组件。正式启动尚未导入技能装配，自动子图提取、业务审核和分流仍待接 | [16 技能固化](skill/16-技能固化开发文档.md) |
 | `exploration` 自主探索 | 设计待接续 | 开发设计 | [17 自主探索](exploration/17-自主探索开发文档.md) |
-| `tools` 工具管理 | 工具生成管理 | [tools 包](../../src/main/java/com/example/myhelper/tools/)已有来源目录和范围先验配置。动态发布、隔离、公共变量待实现 | [25 工具管理与隔离运行](tools/25-工具管理与隔离运行设计.md) |
+| `tools` 工具管理 | 工具生成管理 | [tools 包](../../src/main/java/com/example/myhelper/tools/)已有来源目录、范围先验和默认关闭的 HA 设备状态工具。动态发布、隔离、公共变量待实现 | [25 工具管理与隔离运行](tools/25-工具管理与隔离运行设计.md) |
 | `interaction` 交互与语音 | 应用入口 | [MyHelperApplication.main](../../src/main/java/com/example/myhelper/MyHelperApplication.java) 启动应用，[interaction 包](../../src/main/java/com/example/myhelper/interaction/) 接收文字、提交任务并显示结果 | [20 应用启动链路](interaction/20-交互与语音开发文档.md#应用启动链路) · [29 桌面交互设计](../planned/29-桌面助手调试界面设计.md) · [31 Swing 开发接线](interaction/31-Swing桌面调试界面开发文档.md) |
 | `interaction.desktop.behavior` 桌面短期行为 | 32 短期行为规划器 | [行为模块](../../src/main/java/com/example/myhelper/interaction/desktop/behavior/) · [Swing 执行](../../src/main/java/com/example/myhelper/interaction/desktop/DesktopBehaviorView.java) · [运行活动仲裁](../../src/main/java/com/example/myhelper/application/TaskActivity.java) | [32 实现与验证](interaction/32-短期行为规划器设计.md#6-首版实现) |
-| `deployment` 应用装配 | 总 | [MyHelperApplication](../../src/main/java/com/example/myhelper/MyHelperApplication.java) 已提供命令行应用启动；生产业务装配与外部服务联调按模块接续 | [21 装配部署与集成验收](deployment/21-装配部署与集成验收.md) |
+| `deployment` 应用装配 | 总 | [MyHelperApplication](../../src/main/java/com/example/myhelper/MyHelperApplication.java) 已提供终端及 Swing 启动，默认启用记录与恢复。业务 Matcher 和真实服务接入按模块接续 | [21 装配部署与集成验收](deployment/21-装配部署与集成验收.md) |
 | `extensions` 旧扩展 | 设计待接续 | 按场景恢复 | [22 扩展模块边界](extensions/22-扩展模块开发边界.md) |
 
 跨模块的验收、任务进度及恢复设计在 [26 任务验收、进度与断点恢复](../planned/26-任务验收进度与断点恢复设计.md)。总窗口的入口为[项目总文档](../00-重构项目总文档.md)与[接续记录](../重写架构与进度.md)。

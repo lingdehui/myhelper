@@ -2,11 +2,11 @@
 
 > 共同开发规则（2026-11-11 用户确认）：固定 LLM 文本集中到 LlmTexts；不用 Lambda，以可读性选择循环、方法和 switch，允许 `case ... ->`；所有测试与检查资料统一放入 `checks`。所有任务继续前阅读[24-LLM文本与代码可读性规范](docs/24-LLM文本与代码可读性规范.md)。
 
-更新：2026-11-17。这里是旧 MyHelper 的模块化重构项目。当前提供终端与 Swing 桌面调试入口，使用同一套递归并发编排执行任务。
+更新：2026-11-18。这里是旧 MyHelper 的模块化重构项目。当前提供终端与 Swing 桌面调试入口，使用同一套递归并发编排执行任务。
 
 ## 阅读入口
 
-**[应用入口怎么启动](docs/modules/interaction/20-交互与语音开发文档.md#应用启动链路)** · [文档总目录](docs/README.md) · [任务窗口、模块与源码](docs/modules/README.md) · [待做与设计](docs/planned/README.md) · [已完成与验证](docs/completed/README.md)
+**[应用入口怎么启动](docs/modules/interaction/20-交互与语音开发文档.md#应用启动链路)** · [入口与循环思维导图](docs/completed/已实现架构图.md#一次任务的思维导图) · [文档总目录](docs/README.md) · [模块索引](docs/modules/README.md) · [待做与设计](docs/planned/README.md) · [已完成与验证](docs/completed/README.md)
 
 ## 启动命令行
 
@@ -25,7 +25,7 @@ java -jar target/desktop-brain-1.0.0.jar
 
 默认输出任务实时进度。启用正式归档后，可在终端输入 `/history <taskId> <rootRunId>` 查看已结束运行的日志。两个 ID 对应进度日志的 `task=` 和 `root=`。 [任务日志](docs/modules/tasklog/任务日志开发文档.md)
 
-终端默认可运行模型任务。业务工具、固化检索与记录服务按装配提供。语音扩展可在运行中向同一个 [TaskEntry](src/main/java/com/example/myhelper/interaction/TaskEntry.java) 提交最终转写。 [交互与语音](docs/modules/interaction/20-交互与语音开发文档.md)
+默认启用任务记录和启动恢复，需可连接的 Neo4j。只试普通文字任务时，可用 `--myhelper.records.enabled=false` 跳过这部分。默认没有活动业务工具，固化检索默认关闭。设备只读工具需服务配置、任务授权、资源解析及设备映射。 [交互与语音](docs/modules/interaction/20-交互与语音开发文档.md) · [设备接线](docs/modules/tools/25-工具管理与隔离运行设计.md#8-设备状态查询与感知接线)
 
 ## 启动桌面调试界面
 
@@ -56,14 +56,16 @@ java -jar target/desktop-brain-1.0.0.jar --myhelper.ui=desktop
 
 | 模块 | 实际内容 | 文档 |
 | --- | --- | --- |
-| [world/model](src/main/java/com/example/myhelper/world/model/) | WorldEntity、四个独立类型枚举、引用/向量、ChainPosition 及执行统计/归因，共十二类 | [09](docs/modules/world/09-统一世界模型.md) |
+| [world](src/main/java/com/example/myhelper/world/) | 统一实体与引用、状态和独立观测、可信裁决、设备查询、引用展开和按授权组装规划上下文 | [09](docs/modules/world/09-统一世界模型.md) · [23](docs/modules/world/23-世界模型查询与上下文开发文档.md) |
 | [llm](src/main/java/com/example/myhelper/llm/) | LlmTexts 固定文本、ModelAdapter 接口及 ConfiguredModelAdapter 的分支分配、会话绑定和客户端解析 | [24](docs/24-LLM文本与代码可读性规范.md)、[27](docs/modules/llm/27-模型适配器开发文档.md) |
 | [agent](src/main/java/com/example/myhelper/agent/) | AgentCaller 单次模型调用及可选工具执行，已有本地检查记录，未真实 LLM 联调 | [11](docs/modules/agent/11-单次模型调用模块.md) |
 | [persistence](src/main/java/com/example/myhelper/persistence/) | 显式来源/目标读写、Neo4j/Qdrant 适配、同步补偿及配置装配，未真实数据库联调 | [10](docs/modules/persistence/10-统一双写模块分析.md) |
 | [orchestration](src/main/java/com/example/myhelper/orchestration/) | 递归 DAG 调度、分支拓扑、工具执行、内存执行图及外部模型会话生命周期接线；不内置模型分配器 | [12](docs/modules/orchestration/12-并行分支循环编排设计.md)、[13](docs/modules/orchestration/13-执行链路记录开发文档.md)、[14](docs/modules/orchestration/14-工具与能力执行开发文档.md) |
-| [capability](src/main/java/com/example/myhelper/capability/) | 根入口一次检索、每次 PLAN 后查询、整条/子节点匹配端口、有界内容缓存与 Qdrant HTTP 适配 | [19](docs/modules/capability/19-固化检索与缓存开发文档.md) |
+| [capability](src/main/java/com/example/myhelper/capability/) | 根入口和规划后检索、一意图多链展开、按范围和可靠度排序、固定版本缓存。正式入口待接业务 Matcher | [19](docs/modules/capability/19-固化检索与缓存开发文档.md) |
+| [skill](src/main/java/com/example/myhelper/skill/) | 候选审核、单链与意图归组发布、归档参数事实、链级可靠度；尚待正式启动装配和完整自动分流 | [16](docs/modules/skill/16-技能固化开发文档.md) |
+| [records](src/main/java/com/example/myhelper/records/) | Neo4j 任务与指令记录、事实、固定运行归档和恢复处置；正式启动默认启用 | [28](docs/modules/records/28-执行记录与恢复端口开发文档.md) |
 
-终端已复用现有模型适配器和编排器。真实 LLM 和数据库尚待联调。生产能力匹配、业务验收、任务归档与跨重启恢复见各模块接续记录。
+已有本地应用启动、回环模型协议和组件检查。真实模型、数据库和设备联调的范围见[待做索引](docs/planned/README.md)，历次本地验证见[检查记录](checks/README.md)。
 
 ## 历史资料
 
